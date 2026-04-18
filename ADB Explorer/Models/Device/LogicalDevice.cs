@@ -90,6 +90,17 @@ public class LogicalDevice : Device
             Data.RuntimeSettings.IsRootActive = Root is RootStatus.Enabled;
     }
 
+    public void RefreshConnection(LogicalDevice other)
+    {
+        if (other is null)
+            return;
+
+        Name = other.Name;
+        Type = other.Type;
+        IpAddress = other.IpAddress;
+        DeviceData = other.DeviceData;
+    }
+
     public void UpdateBattery()
     {
         Battery.Update(ADBService.AdbDevice.GetBatteryInfo(this));

@@ -679,7 +679,7 @@ internal static class FileActionLogic
 
     public static void RefreshDrives(bool asyncClassify = false)
     {
-        if (Data.DevicesObject.Current is null)
+        if (Data.DevicesObject.Current is null || Data.DevicesObject.Current.Status is not AbstractDevice.DeviceStatus.Ok)
             return;
 
         if (!asyncClassify && Data.DevicesObject.Current.Drives?.Count > 0 && !Data.FileActions.IsExplorerVisible)
@@ -687,7 +687,7 @@ internal static class FileActionLogic
 
         var driveTask = Task.Run(() =>
         {
-            if (Data.CurrentADBDevice is null)
+            if (Data.CurrentADBDevice is null || Data.CurrentADBDevice.Status is not AbstractDevice.DeviceStatus.Ok)
                 return null;
 
             var drives = Data.CurrentADBDevice.GetDrives();

@@ -184,7 +184,12 @@ public class LogicalDeviceViewModel : DeviceViewModel
 
     public void UpdateDevice(LogicalDevice other)
     {
-        Device.Name = other.Name;
+        Device.RefreshConnection(other);
+        OnPropertyChanged(nameof(Name));
+        OnPropertyChanged(nameof(Tooltip));
+        OnPropertyChanged(nameof(TypeIcon));
+        OnPropertyChanged(nameof(StatusIcon));
+        OnPropertyChanged(nameof(IpAddress));
         SetStatus(other.Status);
     }
 

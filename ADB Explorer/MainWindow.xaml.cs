@@ -28,6 +28,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly DispatcherTimer DiskUsageTimer = new() { Interval = DISK_USAGE_INTERVAL_ACTIVE };
 
     private readonly Mutex DiskUsageMutex = new();
+    private readonly Mutex DeviceRefreshMutex = new();
     private readonly Mutex ConnectTimerMutex = new();
     private readonly ThemeService ThemeService = new();
 
@@ -1003,39 +1004,57 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (ConnectTimer.Interval == CONNECT_TIMER_INIT)
             ConnectTimer.Interval = CONNECT_TIMER_INTERVAL;
 
-        Task.Run(() =>
+        if (Settings.PollDevices && !RuntimeSettings.IsPollingStopped && DeviceRefreshMutex.WaitOne(0))
         {
-            if (RuntimeSettings.IsPollingStopped || !ConnectTimerMutex.WaitOne(0))
-                return;
-
-            if (Settings.PollDevices)
-            {
-                RefreshDevices();
-            }
-
-            if (Settings.PollBattery)
-            {
-                DeviceHelper.UpdateDevicesBatInfo();
-            }
-
-            if (FileActions.IsDriveViewVisible && Settings.PollDrives)
+            Task.Run(() =>
             {
                 try
                 {
-                    Dispatcher.Invoke(() => FileActionLogic.RefreshDrives(true));
+                    RefreshDevices();
                 }
-                catch
-                { }
-            }
+                finally
+                {
+                    DeviceRefreshMutex.ReleaseMutex();
+                }
+            });
+        }
 
-            if (RuntimeSettings.IsDevicesPaneOpen)
+        Task.Run(() =>
+        {
+            if (!ConnectTimerMutex.WaitOne(0))
+                return;
+
+            try
             {
-                DeviceHelper.UpdateDevicesRootAccess();
+                if (RuntimeSettings.IsPollingStopped)
+                    return;
 
-                DeviceHelper.UpdateWsaPkgStatus();
+                if (Settings.PollBattery)
+                {
+                    DeviceHelper.UpdateDevicesBatInfo();
+                }
+
+                if (FileActions.IsDriveViewVisible && Settings.PollDrives)
+                {
+                    try
+                    {
+                        Dispatcher.Invoke(() => FileActionLogic.RefreshDrives(true));
+                    }
+                    catch
+                    { }
+                }
+
+                if (RuntimeSettings.IsDevicesPaneOpen)
+                {
+                    DeviceHelper.UpdateDevicesRootAccess();
+
+                    DeviceHelper.UpdateWsaPkgStatus();
+                }
             }
-
-            ConnectTimerMutex.ReleaseMutex();
+            finally
+            {
+                ConnectTimerMutex.ReleaseMutex();
+            }
         });
     }
 

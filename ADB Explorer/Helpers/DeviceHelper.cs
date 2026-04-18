@@ -339,12 +339,13 @@ public static class DeviceHelper
 
     public static void UpdateDevicesBatInfo()
     {
-        Data.DevicesObject.Current?.UpdateBattery();
+        if (Data.DevicesObject.Current?.Status is DeviceStatus.Ok)
+            Data.DevicesObject.Current.UpdateBattery();
 
         if (DateTime.Now - Data.DevicesObject.LastUpdate <= AdbExplorerConst.BATTERY_UPDATE_INTERVAL && !Data.RuntimeSettings.IsDevicesPaneOpen)
             return;
 
-        var items = Data.DevicesObject.LogicalDeviceViewModels.Where(device => !device.IsOpen);
+        var items = Data.DevicesObject.LogicalDeviceViewModels.Where(device => !device.IsOpen && device.Status is DeviceStatus.Ok);
         foreach (var item in items)
         {
             item.UpdateBattery();
