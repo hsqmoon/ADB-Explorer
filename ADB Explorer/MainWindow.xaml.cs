@@ -22,17 +22,24 @@ namespace ADB_Explorer;
 /// </summary>
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
+    private const int MAX_LOG_TEXT_LENGTH = 200_000;
+
     private readonly DispatcherTimer ServerWatchdogTimer = new() { Interval = RESPONSE_TIMER_INTERVAL };
     private readonly DispatcherTimer ConnectTimer = new() { Interval = CONNECT_TIMER_INIT };
     private readonly DispatcherTimer SelectionTimer = new() { Interval = SELECTION_CHANGED_DELAY };
     private readonly DispatcherTimer DiskUsageTimer = new() { Interval = DISK_USAGE_INTERVAL_ACTIVE };
 
-    private readonly Mutex DiskUsageMutex = new();
-    private readonly Mutex DeviceRefreshMutex = new();
-    private readonly Mutex ConnectTimerMutex = new();
+    private readonly SemaphoreSlim DiskUsageMutex = new(1, 1);
+    private readonly SemaphoreSlim DeviceRefreshMutex = new(1, 1);
+    private readonly SemaphoreSlim ConnectTimerMutex = new(1, 1);
     private readonly ThemeService ThemeService = new();
 
     private static Point NullPoint => new(-1, -1);
+    private bool HasSavedWindowBounds =>
+        TryGetStoredDouble(AppSettings.SystemVals.windowLeft, out _)
+        && TryGetStoredDouble(AppSettings.SystemVals.windowTop, out _)
+        && TryGetStoredDouble(AppSettings.SystemVals.windowWidth, out _)
+        && TryGetStoredDouble(AppSettings.SystemVals.windowHeight, out _);
 
     private double? RowHeight { get; set; }
     private double ColumnHeaderHeight => (double)FindResource("DataGridColumnHeaderHeight") + ScrollContentPresenterMargin;
@@ -165,9 +172,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void DiskUsageTimer_Tick(object sender, EventArgs e)
     {
-        DiskUsageMutex.WaitOne(0);
-        Task.Run(DiskUsageHelper.GetAdbDiskUsage).ContinueWith(
-            (t) => Dispatcher.Invoke(DiskUsageMutex.ReleaseMutex));
+        if (!DiskUsageMutex.Wait(0))
+            return;
+
+        Task.Run(DiskUsageHelper.GetAdbDiskUsage).ContinueWith(t =>
+        {
+            DiskUsageMutex.Release();
+        });
 
         DiskUsageTimer.Interval = FileOpQ.IsActive
             ? DISK_USAGE_INTERVAL_ACTIVE
@@ -562,24 +573,54 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void CommandLog_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
     {
-        if (e.NewItems is null || Dispatcher.HasShutdownStarted)
+        if (Dispatcher.HasShutdownStarted)
             return;
 
-        if (e.OldItems is null || e.OldItems.Count < 1)
-            Dispatcher.Invoke(LogControlsPanel.Items.Refresh);
-
-        foreach (Log item in e.NewItems)
+        Dispatcher.Invoke(() =>
         {
-            if (Dispatcher.HasShutdownStarted || RuntimeSettings.IsLogPaused)
+            if (Dispatcher.HasShutdownStarted)
                 return;
 
-            Dispatcher.Invoke(() =>
+            LogControlsPanel.Items.Refresh();
+
+            if (e.Action is NotifyCollectionChangedAction.Add && e.NewItems is not null && !RuntimeSettings.IsLogPaused)
             {
-                LogTextBox.Text += $"{item}\n";
+                string text = string.Join(Environment.NewLine, e.NewItems.Cast<Log>().Select(item => item.ToString()));
+                if (!string.IsNullOrEmpty(text))
+                    LogTextBox.AppendText($"{text}{Environment.NewLine}");
+
+                TrimLogTextBox();
                 LogTextBox.CaretIndex = LogTextBox.Text.Length;
                 LogTextBox.ScrollToEnd();
-            });
-        }
+            }
+            else
+                RebuildLogTextBox();
+        });
+    }
+
+    private void TrimLogTextBox()
+    {
+        if (LogTextBox.Text.Length <= MAX_LOG_TEXT_LENGTH)
+            return;
+
+        int startIndex = LogTextBox.Text.Length - MAX_LOG_TEXT_LENGTH;
+        int lineStart = LogTextBox.Text.IndexOf(Environment.NewLine, startIndex, StringComparison.Ordinal);
+
+        LogTextBox.Text = lineStart >= 0
+            ? LogTextBox.Text[(lineStart + Environment.NewLine.Length)..]
+            : LogTextBox.Text[startIndex..];
+    }
+
+    private void RebuildLogTextBox()
+    {
+        LogTextBox.Text = string.Join(Environment.NewLine, CommandLog.Select(log => log.ToString()));
+
+        if (LogTextBox.Text.Length > 0)
+            LogTextBox.AppendText(Environment.NewLine);
+
+        TrimLogTextBox();
+        LogTextBox.CaretIndex = LogTextBox.Text.Length;
+        LogTextBox.ScrollToEnd();
     }
 
     private void Settings_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -709,10 +750,87 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         Storage.StoreValue(AppSettings.SystemVals.windowMaximized, WindowState == WindowState.Maximized);
 
+        var bounds = GetWindowBoundsToStore();
+        Storage.StoreValue(AppSettings.SystemVals.windowLeft, bounds.Left);
+        Storage.StoreValue(AppSettings.SystemVals.windowTop, bounds.Top);
+        Storage.StoreValue(AppSettings.SystemVals.windowWidth, bounds.Width);
+        Storage.StoreValue(AppSettings.SystemVals.windowHeight, bounds.Height);
+
         var detailedVisible = RuntimeSettings.IsOperationsViewOpen && Settings.EnableCompactView;
         Storage.StoreValue(AppSettings.SystemVals.detailedVisible, detailedVisible);
         if (detailedVisible)
             Storage.StoreValue(AppSettings.SystemVals.detailedHeight, FileOpDetailedGrid.Height);
+    }
+
+    private Rect GetWindowBoundsToStore()
+    {
+        var bounds = WindowState is WindowState.Normal
+            ? new Rect(Left, Top, Width, Height)
+            : RestoreBounds;
+
+        var width = Math.Max(MinWidth, bounds.Width);
+        var height = Math.Max(MinHeight, bounds.Height);
+
+        return new(bounds.Left, bounds.Top, width, height);
+    }
+
+    private static bool TryGetStoredDouble(AppSettings.SystemVals key, out double value)
+    {
+        value = Storage.RetrieveValue(key) switch
+        {
+            double doubleValue when double.IsFinite(doubleValue) => doubleValue,
+            float floatValue when float.IsFinite(floatValue) => floatValue,
+            decimal decimalValue => (double)decimalValue,
+            long longValue => longValue,
+            int intValue => intValue,
+            string stringValue when double.TryParse(stringValue, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedValue) => parsedValue,
+            string stringValue when double.TryParse(stringValue, out var parsedValue) => parsedValue,
+            _ => double.NaN,
+        };
+
+        return double.IsFinite(value);
+    }
+
+    private bool TryRestoreWindowBounds()
+    {
+        if (!TryGetStoredDouble(AppSettings.SystemVals.windowLeft, out var left)
+            || !TryGetStoredDouble(AppSettings.SystemVals.windowTop, out var top)
+            || !TryGetStoredDouble(AppSettings.SystemVals.windowWidth, out var width)
+            || !TryGetStoredDouble(AppSettings.SystemVals.windowHeight, out var height))
+        {
+            return false;
+        }
+
+        var minWidth = Math.Max(MinWidth, 1);
+        var minHeight = Math.Max(MinHeight, 1);
+        var screenLeft = SystemParameters.VirtualScreenLeft;
+        var screenTop = SystemParameters.VirtualScreenTop;
+        var screenWidth = Math.Max(SystemParameters.VirtualScreenWidth, minWidth);
+        var screenHeight = Math.Max(SystemParameters.VirtualScreenHeight, minHeight);
+
+        width = Math.Clamp(width, minWidth, screenWidth);
+        height = Math.Clamp(height, minHeight, screenHeight);
+
+        var maxLeft = screenLeft + screenWidth - width;
+        var maxTop = screenTop + screenHeight - height;
+
+        left = Math.Clamp(left, screenLeft, maxLeft);
+        top = Math.Clamp(top, screenTop, maxTop);
+
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = left;
+        Top = top;
+        Width = width;
+        Height = height;
+
+        return true;
+    }
+
+    private void ApplyDefaultLaunchSize()
+    {
+        var height = Math.Max(MinHeight, SystemParameters.PrimaryScreenHeight * WINDOW_HEIGHT_RATIO);
+        Height = height;
+        Width = Math.Max(MinWidth, Height / WINDOW_WIDTH_RATIO);
     }
 
     private void SetTheme() => SetTheme(Settings.Theme);
@@ -858,12 +976,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void LaunchSequence()
     {
-        var height = SystemParameters.PrimaryScreenHeight;
-        Dispatcher.BeginInvoke(() =>
-        {
-            Height = height * WINDOW_HEIGHT_RATIO;
-            Width = Height / WINDOW_WIDTH_RATIO;
-        });
+        if (!HasSavedWindowBounds)
+            Dispatcher.BeginInvoke(ApplyDefaultLaunchSize);
 
         LoadSettings();
         InitFileOpColumns();
@@ -1004,7 +1118,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (ConnectTimer.Interval == CONNECT_TIMER_INIT)
             ConnectTimer.Interval = CONNECT_TIMER_INTERVAL;
 
-        if (Settings.PollDevices && !RuntimeSettings.IsPollingStopped && DeviceRefreshMutex.WaitOne(0))
+        if (Settings.PollDevices && !RuntimeSettings.IsPollingStopped && DeviceRefreshMutex.Wait(0))
         {
             Task.Run(() =>
             {
@@ -1014,14 +1128,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 }
                 finally
                 {
-                    DeviceRefreshMutex.ReleaseMutex();
+                    DeviceRefreshMutex.Release();
                 }
             });
         }
 
         Task.Run(() =>
         {
-            if (!ConnectTimerMutex.WaitOne(0))
+            if (!ConnectTimerMutex.Wait(0))
                 return;
 
             try
@@ -1053,7 +1167,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
             finally
             {
-                ConnectTimerMutex.ReleaseMutex();
+                ConnectTimerMutex.Release();
             }
         });
     }
@@ -1663,6 +1777,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void Window_SourceInitialized(object sender, EventArgs e)
     {
+        _ = TryRestoreWindowBounds();
+
         if (Storage.RetrieveBool(AppSettings.SystemVals.windowMaximized) == true)
             WindowState = WindowState.Maximized;
 

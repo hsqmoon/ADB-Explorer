@@ -9,6 +9,10 @@ public class AppSettings : ViewModelBase
     public enum SystemVals
     {
         windowMaximized,
+        windowLeft,
+        windowTop,
+        windowWidth,
+        windowHeight,
         detailedVisible,
         detailedHeight,
     }

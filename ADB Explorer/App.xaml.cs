@@ -10,12 +10,16 @@ namespace ADB_Explorer;
 public partial class App : Application
 {
     private static string SettingsFilePath;
+    private static string CrashLogPath => Path.Combine(Data.AppDataPath, "crash.log");
     private static readonly JsonSerializerSettings JsonSettings = new() { TypeNameHandling = TypeNameHandling.None };
 
     private void Application_Startup(object sender, StartupEventArgs e)
     {
         // Read to force it to be set to Windows' culture
         _ = Data.Settings.OriginalCulture;
+
+        AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+        TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
 
         // Similar to %LocalAppData%\ADB Explorer (but avoids virtualization for Store versions)
         Data.AppDataPath = Path.Combine(Environment.GetEnvironmentVariable("USERPROFILE"), "AppData", "Local", AdbExplorerConst.APP_DATA_FOLDER);
@@ -190,10 +194,53 @@ public partial class App : Application
     {
         // Handle error 0x800401D0 (CLIPBRD_E_CANT_OPEN) - global WPF issue
         if (e.Exception is COMException comException && comException.ErrorCode == -2147221040)
+        {
             e.Handled = true;
+            return;
+        }
+
+        WriteCrashLog(e.Exception, nameof(Application_DispatcherUnhandledException));
 
         // If application shutdown has started, do not throw exceptions
         if (App.Current is null || App.Current.Dispatcher is null)
             e.Handled = true;
+    }
+
+    private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        if (e.ExceptionObject is Exception ex)
+            WriteCrashLog(ex, nameof(CurrentDomain_UnhandledException));
+        else
+            WriteCrashLog(new Exception(e.ExceptionObject?.ToString() ?? "Unknown unhandled exception"), nameof(CurrentDomain_UnhandledException));
+    }
+
+    private static void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
+    {
+        WriteCrashLog(e.Exception, nameof(TaskScheduler_UnobservedTaskException));
+        e.SetObserved();
+    }
+
+    private static void WriteCrashLog(Exception exception, string source)
+    {
+        try
+        {
+            if (!Directory.Exists(Data.AppDataPath))
+                Directory.CreateDirectory(Data.AppDataPath);
+
+            StringBuilder message = new();
+            message.AppendLine(new string('=', 80));
+            message.AppendLine($"Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
+            message.AppendLine($"Source: {source}");
+            message.AppendLine($"Exception: {exception.GetType().FullName}");
+            message.AppendLine($"Message: {exception.Message}");
+            message.AppendLine($"WorkingSetMB: {Environment.WorkingSet / 1024 / 1024}");
+            message.AppendLine($"ManagedHeapMB: {GC.GetTotalMemory(false) / 1024 / 1024}");
+            message.AppendLine(exception.ToString());
+            message.AppendLine();
+
+            File.AppendAllText(CrashLogPath, message.ToString());
+        }
+        catch
+        { }
     }
 }

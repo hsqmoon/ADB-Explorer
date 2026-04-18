@@ -55,7 +55,16 @@ public static partial class NativeMethods
         {
             if ((ClipboardNotificationMessage)msg is ClipboardNotificationMessage.WM_CLIPBOARDUPDATE)
             {
-                _externalClipAction();
+                try
+                {
+                    _externalClipAction();
+                }
+                catch (Exception ex) when (ex is COMException or ExternalException or OutOfMemoryException)
+                {
+#if !DEPLOY
+                    DebugLog.PrintLine($"Clipboard hook failed: {ex.GetType().Name}: {ex.Message}");
+#endif
+                }
                 handled = true;
             }
             else if ((WindowMessages)msg is WindowMessages.WM_COPYDATA)

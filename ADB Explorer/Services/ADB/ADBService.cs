@@ -64,8 +64,7 @@ public partial class ADBService
         
         cmdProcess.Start();
 
-        if (Settings.EnableLog && !RuntimeSettings.IsLogPaused)
-            CommandLog.Add(new($"{file} {arguments}"));
+        Data.AddCommandLog($"{file} {arguments}");
 
         return cmdProcess;
     }

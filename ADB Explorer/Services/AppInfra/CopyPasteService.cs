@@ -278,39 +278,66 @@ public class CopyPasteService : ViewModelBase
 
     public void GetClipboardPasteItems()
     {
-        var CPDO = Clipboard.GetDataObject();
+        try
+        {
+            var CPDO = Clipboard.GetDataObject();
+            if (CPDO is null)
+            {
+                ClearClipboardPasteItems();
+                return;
+            }
 
 #if !DEPLOY
-        DebugLog.PrintLine($"Clipboard formats: {string.Join(", ", CPDO.GetFormats())}");
+            try
+            {
+                DebugLog.PrintLine($"Clipboard formats: {string.Join(", ", CPDO.GetFormats())}");
+            }
+            catch (Exception ex) when (ex is COMException or ExternalException or OutOfMemoryException)
+            {
+                DebugLog.PrintLine($"Clipboard formats unavailable: {ex.GetType().Name}: {ex.Message}");
+            }
 #endif
 
-        var allowedEffect = GetAllowedDragEffects(CPDO);
-        if (allowedEffect is DragDropEffects.None)
-        {
-            PasteState = DragDropEffects.None;
-            PasteSource = DataSource.None;
-            Files = [];
-            _currentFiles = [];
+            var allowedEffect = GetAllowedDragEffects(CPDO);
+            if (allowedEffect is DragDropEffects.None)
+            {
+                ClearClipboardPasteItems();
+                return;
+            }
+
+            var prefDropEffect = VirtualFileDataObject.GetPreferredDropEffect(CPDO);
+
+            // Link is only allowed depending on the target
+            if (prefDropEffect.HasFlag(DragDropEffects.Copy) && allowedEffect.HasFlag(DragDropEffects.Copy))
+                PasteState = DragDropEffects.Copy;
+            else if (prefDropEffect.HasFlag(DragDropEffects.Move) && allowedEffect.HasFlag(DragDropEffects.Move))
+                PasteState = DragDropEffects.Move;
+            else if (prefDropEffect is DragDropEffects.Move && allowedEffect is DragDropEffects.Copy)
+                PasteState = DragDropEffects.Copy; // fallback to copy
+            else
+                PasteState = DragDropEffects.None;
+
+            Files = DragFiles;
+            ParentFolder = DragParent;
 
             UpdateUI();
-            return;
         }
+        catch (Exception ex) when (ex is COMException or ExternalException or OutOfMemoryException)
+        {
+#if !DEPLOY
+            DebugLog.PrintLine($"Clipboard inspection failed: {ex.GetType().Name}: {ex.Message}");
+#endif
+            ClearClipboardPasteItems();
+        }
+    }
 
-        var prefDropEffect = VirtualFileDataObject.GetPreferredDropEffect(CPDO);
-
-        // Link is only allowed depending on the target
-        if (prefDropEffect.HasFlag(DragDropEffects.Copy) && allowedEffect.HasFlag(DragDropEffects.Copy))
-            PasteState = DragDropEffects.Copy;
-        else if (prefDropEffect.HasFlag(DragDropEffects.Move) && allowedEffect.HasFlag(DragDropEffects.Move))
-            PasteState = DragDropEffects.Move;
-        else if (prefDropEffect is DragDropEffects.Move && allowedEffect is DragDropEffects.Copy)
-            PasteState = DragDropEffects.Copy; // fallback to copy
-        else
-            PasteState = DragDropEffects.None;
-
-        Files = DragFiles;
-        ParentFolder = DragParent;
-
+    private void ClearClipboardPasteItems()
+    {
+        PasteState = DragDropEffects.None;
+        PasteSource = DataSource.None;
+        Files = [];
+        _currentFiles = [];
+        ParentFolder = "";
         UpdateUI();
     }
 

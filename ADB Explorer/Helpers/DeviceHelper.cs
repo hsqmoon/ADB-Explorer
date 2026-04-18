@@ -753,9 +753,26 @@ public static class DeviceHelper
     public static int? GetWsaPid() =>
         Process.GetProcessesByName(AdbExplorerConst.WSA_PROCESS_NAME).FirstOrDefault()?.Id;
 
-    private static bool IsWsaInstalled() =>
-        new PackageManager().FindPackagesForUser("")?.Any(pkg => pkg.DisplayName.Contains(AdbExplorerConst.WSA_PACKAGE_NAME))
-        is true;
+    private static bool IsWsaInstalled()
+    {
+        try
+        {
+            foreach (var pkg in new PackageManager().FindPackagesForUser("") ?? [])
+            {
+                try
+                {
+                    if (pkg.DisplayName?.Contains(AdbExplorerConst.WSA_PACKAGE_NAME, StringComparison.OrdinalIgnoreCase) is true)
+                        return true;
+                }
+                catch (COMException)
+                { }
+            }
+        }
+        catch
+        { }
+
+        return false;
+    }
 
     public static void UpdateWsaPkgStatus()
     {

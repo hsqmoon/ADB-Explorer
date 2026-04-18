@@ -2,9 +2,13 @@
 
 编译
 dotnet build "ADB Explorer\ADB Explorer.csproj" -c Debug
+dotnet build "ADB Explorer\ADB Explorer.csproj" -c Release
+
 
 运行
 dotnet run --project "ADB Explorer\ADB Explorer.csproj"
+dotnet run --project "ADB Explorer\ADB Explorer.csproj" -c Release
+explorer.exe "E:\adb_gui\ADB-Explorer\ADB Explorer\bin\Release\net9.0-windows10.0.22621.0\ADB Explorer.exe"
 
 资源管理器去运行
 explorer.exe "E:\adb_gui\ADB-Explorer\ADB Explorer\bin\Debug\net9.0-windows10.0.22621.0\ADB Explorer.exe"
