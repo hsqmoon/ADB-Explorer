@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ADB Explorer Terminal</title>
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #111111;
+            color: #f5f5f5;
+            font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+        }
+
+        body {
+            display: flex;
+            flex-direction: column;
+        }
+
+        #status {
+            padding: 8px 10px;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #d6d6d6;
+            background: #1b1b1b;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            white-space: pre-wrap;
+        }
+
+        #status.hidden {
+            display: none;
+        }
+
+        #workspace {
+            position: relative;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        #terminal {
+            width: 100%;
+            height: 100%;
+            padding: 6px 8px;
+            box-sizing: border-box;
+        }
+
+        #search-panel {
+            position: absolute;
+            top: 12px;
+            right: 14px;
+            z-index: 50;
+            display: none;
+            align-items: center;
+            gap: 6px;
+            max-width: calc(100% - 28px);
+            padding: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            background: rgba(26, 26, 26, 0.96);
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(8px);
+        }
+
+        #search-panel.visible {
+            display: flex;
+        }
+
+        #search-input {
+            width: 240px;
+            max-width: 45vw;
+            padding: 6px 8px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 6px;
+            background: #151515;
+            color: #f5f5f5;
+            outline: none;
+            font: inherit;
+        }
+
+        #search-input:focus {
+            border-color: rgba(59, 142, 234, 0.9);
+            box-shadow: 0 0 0 1px rgba(59, 142, 234, 0.35);
+        }
+
+        #search-count {
+            min-width: 56px;
+            color: rgba(255, 255, 255, 0.72);
+            font-size: 12px;
+            text-align: center;
+            user-select: none;
+        }
+
+        .terminal-action {
+            padding: 6px 9px;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px;
+            background: #202020;
+            color: #f5f5f5;
+            cursor: pointer;
+            font: inherit;
+            line-height: 1;
+        }
+
+        .terminal-action:hover {
+            background: #2b2b2b;
+        }
+
+        .terminal-action:active {
+            background: #343434;
+        }
+
+        #toast {
+            position: absolute;
+            right: 14px;
+            bottom: 14px;
+            z-index: 45;
+            max-width: min(360px, calc(100% - 28px));
+            padding: 8px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            background: rgba(26, 26, 26, 0.94);
+            color: rgba(255, 255, 255, 0.92);
+            font-size: 12px;
+            line-height: 1.4;
+            opacity: 0;
+            transform: translateY(10px);
+            pointer-events: none;
+            transition: opacity 0.16s ease, transform 0.16s ease;
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.32);
+        }
+
+        #toast.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .xterm-viewport::-webkit-scrollbar {
+            width: 12px;
+            height: 12px;
+        }
+
+        .xterm-viewport::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.22);
+            border-radius: 999px;
+        }
+
+        .xterm-viewport::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">Loading terminal...</div>
+    <div id="workspace">
+        <div id="terminal"></div>
+        <div id="search-panel" aria-label="Terminal search">
+            <input id="search-input" type="text" placeholder="Find in terminal" spellcheck="false" />
+            <span id="search-count">0/0</span>
+            <button id="search-prev" class="terminal-action" type="button" title="Previous match (Shift+Enter)">↑</button>
+            <button id="search-next" class="terminal-action" type="button" title="Next match (Enter)">↓</button>
+            <button id="search-close" class="terminal-action" type="button" title="Close (Esc)">✕</button>
+        </div>
+        <div id="toast" aria-live="polite"></div>
+    </div>
+
+    <script>
+        const host = window.chrome && window.chrome.webview;
+        const statusElement = document.getElementById('status');
+        const workspaceElement = document.getElementById('workspace');
+        const terminalElement = document.getElementById('terminal');
+        const searchPanel = document.getElementById('search-panel');
+        const searchInput = document.getElementById('search-input');
+        const searchCount = document.getElementById('search-count');
+        const searchPrevButton = document.getElementById('search-prev');
+        const searchNextButton = document.getElementById('search-next');
+        const searchCloseButton = document.getElementById('search-close');
+        const toastElement = document.getElementById('toast');
+        const DEFAULT_FONT_SIZE = 13;
+        const MIN_FONT_SIZE = 11;
+        const MAX_FONT_SIZE = 28;
+        const URL_REGEX = /\b((?:https?|ftp):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+)/gi;
+        let toastTimer = 0;
+        let searchRefreshTimer = 0;
+
+        function post(message) {
+            try {
+                host && host.postMessage(message);
+            } catch {
+            }
+        }
+
+        function setStatus(message, keepVisible = true) {
+            statusElement.textContent = message;
+            statusElement.classList.toggle('hidden', !keepVisible);
+            post({ type: 'log', data: message });
+        }
+
+        function showToast(message, timeout = 1400) {
+            if (!message)
+                return;
+
+            toastElement.textContent = message;
+            toastElement.classList.add('visible');
+            clearTimeout(toastTimer);
+            toastTimer = window.setTimeout(() => toastElement.classList.remove('visible'), timeout);
+        }
+
+        function normalizeSelectionForCopy(text) {
+            if (!text)
+                return '';
+
+            return text
+                .replace(/\r\n/g, '\n')
+                .replace(/\r/g, '\n')
+                .replace(/[ \t]+$/gm, '')
+                .replace(/(?:\n[ \t]*)+$/g, '')
+                .replace(/^[ \t]*\n+/g, '');
+        }
+
+        function normalizeLineEndings(text) {
+            return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        }
+
+        function clamp(value, min, max) {
+            return Math.max(min, Math.min(max, value));
+        }
+
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = resolve;
+                script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+                document.head.appendChild(script);
+            });
+        }
+
+        function loadStyle(href) {
+            return new Promise((resolve, reject) => {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = href;
+                link.onload = resolve;
+                link.onerror = () => reject(new Error(`Failed to load style: ${href}`));
+                document.head.appendChild(link);
+            });
+        }
+
+        async function loadFirstAvailable(paths, loader) {
+            let lastError = null;
+
+            for (const path of paths) {
+                try {
+                    await loader(path);
+                    return path;
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+
+            throw lastError ?? new Error(`No resource could be loaded: ${paths.join(', ')}`);
+        }
+
+        window.addEventListener('focus', () => post({ type: 'focus_state', focused: true }), true);
+        window.addEventListener('blur', () => post({ type: 'focus_state', focused: false }), true);
+        document.addEventListener('visibilitychange', () => {
+            post({ type: 'focus_state', focused: document.visibilityState === 'visible' && document.hasFocus() });
+        });
+
+        window.addEventListener('error', event => {
+            setStatus(`Terminal page error: ${event.message}`, true);
+        });
+
+        window.addEventListener('unhandledrejection', event => {
+            const message = event.reason && event.reason.message
+                ? event.reason.message
+                : String(event.reason ?? 'unknown');
+            setStatus(`Terminal page rejection: ${message}`, true);
+        });
+
+        async function bootstrap() {
+            if (!host) {
+                setStatus('window.chrome.webview is unavailable.', true);
+                return;
+            }
+
+            setStatus('Loading local xterm.js resources...', true);
+
+            await loadFirstAvailable([
+                './node_modules/@xterm/xterm/css/xterm.css',
+                './node_modules/xterm/css/xterm.css'
+            ], loadStyle);
+
+            await loadFirstAvailable([
+                './node_modules/@xterm/xterm/lib/xterm.js',
+                './node_modules/xterm/lib/xterm.js'
+            ], loadScript);
+
+            await loadFirstAvailable([
+                './node_modules/@xterm/addon-fit/lib/addon-fit.js',
+                './node_modules/@xterm/addon-fit/lib/addon-fit.umd.js',
+                './node_modules/xterm-addon-fit/lib/xterm-addon-fit.js'
+            ], loadScript);
+
+            if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
+                throw new Error('xterm.js loaded but Terminal/FitAddon is missing.');
+            }
+
+            let currentFontSize = DEFAULT_FONT_SIZE;
+            const defaultTheme = {
+                background: '#111111',
+                foreground: '#f5f5f5',
+                cursor: '#ffffff',
+                selectionBackground: 'rgba(255,255,255,0.25)',
+                selectionInactiveBackground: 'rgba(255,255,255,0.18)',
+                black: '#111111',
+                red: '#f14c4c',
+                green: '#23d18b',
+                yellow: '#f5f543',
+                blue: '#3b8eea',
+                magenta: '#d670d6',
+                cyan: '#29b8db',
+                white: '#e5e5e5',
+                brightBlack: '#666666',
+                brightRed: '#f14c4c',
+                brightGreen: '#23d18b',
+                brightYellow: '#f5f543',
+                brightBlue: '#3b8eea',
+                brightMagenta: '#d670d6',
+                brightCyan: '#29b8db',
+                brightWhite: '#ffffff'
+            };
+            const searchTheme = {
+                ...defaultTheme,
+                selectionBackground: 'rgba(255, 196, 0, 0.48)',
+                selectionInactiveBackground: 'rgba(255, 196, 0, 0.36)'
+            };
+            const searchState = {
+                query: '',
+                matches: [],
+                index: -1
+            };
+
+            const term = new Terminal({
+                allowTransparency: false,
+                convertEol: false,
+                cursorBlink: true,
+                cursorStyle: 'block',
+                drawBoldTextInBrightColors: true,
+                fontFamily: '"Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
+                fontSize: currentFontSize,
+                minimumContrastRatio: 1,
+                scrollback: 5000,
+                theme: defaultTheme
+            });
+            const fitAddon = new FitAddon.FitAddon();
+
+            function applyTheme(theme) {
+                term.options.theme = theme;
+            }
+
+            function fitTerminal() {
+                fitAddon.fit();
+                post({ type: 'resize', cols: term.cols, rows: term.rows });
+            }
+
+            function refocusTerminal() {
+                requestAnimationFrame(() => {
+                    try {
+                        term.focus();
+                        post({ type: 'focus_state', focused: true });
+                    } catch {
+                    }
+                });
+            }
+
+            function setSearchCountText() {
+                let current = 0;
+                let total = 0;
+
+                if (!searchState.query) {
+                    searchCount.textContent = '0/0';
+                    post({ type: 'search_results', current, total });
+                    return;
+                }
+
+                total = searchState.matches.length;
+                if (!searchState.matches.length) {
+                    searchCount.textContent = '0/0';
+                    post({ type: 'search_results', current, total });
+                    return;
+                }
+
+                current = searchState.index + 1;
+                searchCount.textContent = `${current}/${total}`;
+                post({ type: 'search_results', current, total });
+            }
+
+            function clearSearchSelection() {
+                try {
+                    term.clearSelection();
+                } catch {
+                }
+            }
+
+            function getBufferLineText(lineIndex) {
+                const line = term.buffer.active.getLine(lineIndex);
+                return line ? line.translateToString(true) : '';
+            }
+
+            function buildSearchMatches(query) {
+                if (!query)
+                    return [];
+
+                const matches = [];
+                const lowerQuery = query.toLocaleLowerCase();
+                const buffer = term.buffer.active;
+
+                for (let lineIndex = 0; lineIndex < buffer.length; lineIndex++) {
+                    const text = getBufferLineText(lineIndex);
+                    if (!text)
+                        continue;
+
+                    const lowerText = text.toLocaleLowerCase();
+                    let startIndex = 0;
+                    while (startIndex <= lowerText.length) {
+                        const matchIndex = lowerText.indexOf(lowerQuery, startIndex);
+                        if (matchIndex < 0)
+                            break;
+
+                        matches.push({
+                            bufferRow: lineIndex,
+                            column: matchIndex,
+                            length: query.length
+                        });
+
+                        startIndex = matchIndex + Math.max(query.length, 1);
+                    }
+                }
+
+                return matches;
+            }
+
+            function revealSearchMatch(match) {
+                if (!match)
+                    return;
+
+                term.scrollToLine(match.bufferRow);
+                term.select(match.column, match.bufferRow, match.length);
+                setSearchCountText();
+            }
+
+            function refreshSearchSelection(revealCurrent = true) {
+                searchState.query = searchInput.value || '';
+                applyTheme(searchState.query ? searchTheme : defaultTheme);
+
+                if (!searchState.query) {
+                    searchState.matches = [];
+                    searchState.index = -1;
+                    clearSearchSelection();
+                    setSearchCountText();
+                    return;
+                }
+
+                searchState.matches = buildSearchMatches(searchState.query);
+                if (!searchState.matches.length) {
+                    searchState.index = -1;
+                    clearSearchSelection();
+                    setSearchCountText();
+                    return;
+                }
+
+                searchState.index = clamp(searchState.index < 0 ? 0 : searchState.index, 0, searchState.matches.length - 1);
+                if (revealCurrent)
+                    revealSearchMatch(searchState.matches[searchState.index]);
+                else
+                    setSearchCountText();
+            }
+
+            function scheduleSearchRefresh() {
+                if (!searchState.query)
+                    return;
+
+                clearTimeout(searchRefreshTimer);
+                searchRefreshTimer = window.setTimeout(() => refreshSearchSelection(false), 80);
+            }
+
+            function openSearch(prefill = '') {
+                post({ type: 'request_search', data: prefill });
+            }
+
+            function closeSearch() {
+                applyTheme(defaultTheme);
+                searchInput.value = '';
+                searchState.query = '';
+                searchState.matches = [];
+                searchState.index = -1;
+                clearSearchSelection();
+                setSearchCountText();
+            }
+
+            function navigateSearch(direction) {
+                if (!searchState.query) {
+                    post({ type: 'request_search' });
+                    return;
+                }
+
+                if (!searchState.matches.length) {
+                    refreshSearchSelection(true);
+                    return;
+                }
+
+                const total = searchState.matches.length;
+                searchState.index = (searchState.index + direction + total) % total;
+                revealSearchMatch(searchState.matches[searchState.index]);
+            }
+
+            function setSearchQuery(query, revealCurrent = true) {
+                searchInput.value = query || '';
+                if (query && searchState.query !== query)
+                    searchState.index = 0;
+
+                refreshSearchSelection(revealCurrent);
+            }
+
+            function applyFontSize(nextSize, announce = true) {
+                const clamped = clamp(nextSize, MIN_FONT_SIZE, MAX_FONT_SIZE);
+                if (clamped === currentFontSize)
+                    return;
+
+                currentFontSize = clamped;
+                term.options.fontSize = currentFontSize;
+                fitTerminal();
+                if (announce)
+                    showToast(`Font ${currentFontSize}px`);
+            }
+
+            function resetFontSize() {
+                currentFontSize = DEFAULT_FONT_SIZE;
+                term.options.fontSize = currentFontSize;
+                fitTerminal();
+                showToast(`Font ${currentFontSize}px`);
+            }
+
+            function normalizeUrl(text) {
+                const trimmed = (text || '').replace(/[)\],.:;!?]+$/g, '');
+                if (!trimmed)
+                    return '';
+
+                return /^www\./i.test(trimmed)
+                    ? `https://${trimmed}`
+                    : trimmed;
+            }
+
+            function registerUrlLinks() {
+                term.registerLinkProvider({
+                    provideLinks(bufferLineNumber, callback) {
+                        const lineText = getBufferLineText(bufferLineNumber - 1);
+                        if (!lineText) {
+                            callback(undefined);
+                            return;
+                        }
+
+                        const links = [];
+                        URL_REGEX.lastIndex = 0;
+
+                        let match;
+                        while ((match = URL_REGEX.exec(lineText)) !== null) {
+                            const displayText = (match[0] || '').replace(/[)\],.:;!?]+$/g, '');
+                            if (!displayText)
+                                continue;
+
+                            const url = normalizeUrl(displayText);
+                            if (!url)
+                                continue;
+
+                            const startX = match.index + 1;
+                            const endX = startX + displayText.length;
+                            links.push({
+                                range: {
+                                    start: { x: startX, y: bufferLineNumber },
+                                    end: { x: endX, y: bufferLineNumber }
+                                },
+                                text: displayText,
+                                activate: () => post({ type: 'open_external', data: url }),
+                                decorations: {
+                                    pointerCursor: true,
+                                    underline: true
+                                }
+                            });
+                        }
+
+                        callback(links.length ? links : undefined);
+                    }
+                });
+            }
+
+            function handleShortcut(event) {
+                const key = event.key && event.key.toLowerCase ? event.key.toLowerCase() : '';
+                const searchInputFocused = document.activeElement === searchInput;
+
+                if (searchInputFocused
+                    && key !== 'escape'
+                    && key !== 'f3'
+                    && !(event.ctrlKey && !event.shiftKey && !event.altKey && key === 'f')
+                    && !(event.ctrlKey && !event.altKey && (key === '0' || key === '=' || key === '+' || key === '-' || key === '_'))) {
+                    return false;
+                }
+
+                if (event.ctrlKey && !event.altKey && key === '0') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    resetFontSize();
+                    return true;
+                }
+
+                if (event.ctrlKey && !event.altKey && (key === '=' || key === '+')) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    applyFontSize(currentFontSize + 1);
+                    return true;
+                }
+
+                if (event.ctrlKey && !event.altKey && (key === '-' || key === '_')) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    applyFontSize(currentFontSize - 1);
+                    return true;
+                }
+
+                if ((event.ctrlKey && !event.shiftKey && !event.altKey && key === 'f') || key === 'f3') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (key === 'f3' && searchState.query)
+                        navigateSearch(event.shiftKey ? -1 : 1);
+                    else
+                        openSearch(normalizeSelectionForCopy(term.getSelection() || ''));
+
+                    return true;
+                }
+
+                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'c') {
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    if (term.hasSelection()) {
+                        const selection = normalizeSelectionForCopy(term.getSelection() || '');
+                        post({ type: 'copy', data: selection });
+
+                        if (navigator.clipboard && navigator.clipboard.writeText)
+                            navigator.clipboard.writeText(selection).catch(() => { });
+                    } else {
+                        post({ type: 'interrupt' });
+                    }
+
+                    return true;
+                }
+
+                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'v') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    post({ type: 'paste' });
+                    return true;
+                }
+
+                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'l') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    post({ type: 'clear' });
+                    return true;
+                }
+
+                return false;
+            }
+
+            window.adbTerminal = {
+                getSelection: () => normalizeSelectionForCopy(term.getSelection() || ''),
+                getSelectionJson: () => JSON.stringify(normalizeSelectionForCopy(term.getSelection() || '')),
+                openSearch: () => openSearch(normalizeSelectionForCopy(term.getSelection() || '')),
+                resetZoom: () => resetFontSize()
+            };
+
+            term.loadAddon(fitAddon);
+            term.open(terminalElement);
+            registerUrlLinks();
+
+            term.onData(data => post({ type: 'input', data }));
+            term.onBinary(data => post({ type: 'inputBinary', data }));
+            term.onSelectionChange(() => {
+                post({ type: 'selection', data: normalizeSelectionForCopy(term.getSelection() || '') });
+            });
+            term.onWriteParsed(() => scheduleSearchRefresh());
+
+            term.attachCustomKeyEventHandler(event => {
+                if (event.type !== 'keydown')
+                    return true;
+
+                if (searchPanel.classList.contains('visible') && document.activeElement === searchInput)
+                    return true;
+
+                return !handleShortcut(event);
+            });
+
+            term.attachCustomWheelEventHandler(event => {
+                if (!event.ctrlKey)
+                    return true;
+
+                event.preventDefault();
+                applyFontSize(currentFontSize + (event.deltaY < 0 ? 1 : -1));
+                return false;
+            });
+
+            window.addEventListener('keydown', event => {
+                handleShortcut(event);
+            }, true);
+
+            window.addEventListener('copy', event => {
+                if (!term.hasSelection())
+                    return;
+
+                const selection = normalizeSelectionForCopy(term.getSelection() || '');
+                if (event.clipboardData) {
+                    event.clipboardData.setData('text/plain', selection);
+                    event.preventDefault();
+                }
+
+                post({ type: 'copy', data: selection });
+            }, true);
+
+            window.addEventListener('paste', event => {
+                const clipboardText = normalizeLineEndings(event.clipboardData?.getData('text/plain') || '');
+                if (!clipboardText)
+                    return;
+
+                event.preventDefault();
+                event.stopPropagation();
+                post({ type: 'paste_data', data: clipboardText });
+            }, true);
+
+            searchInput.addEventListener('input', () => {
+                searchState.index = 0;
+                refreshSearchSelection(true);
+            });
+            searchInput.addEventListener('keydown', event => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    navigateSearch(event.shiftKey ? -1 : 1);
+                    return;
+                }
+
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    closeSearch();
+                    return;
+                }
+
+                event.stopPropagation();
+            });
+
+            searchPrevButton.addEventListener('click', () => navigateSearch(-1));
+            searchNextButton.addEventListener('click', () => navigateSearch(1));
+            searchCloseButton.addEventListener('click', closeSearch);
+            searchPanel.addEventListener('mousedown', event => event.stopPropagation(), true);
+
+            terminalElement.addEventListener('mouseup', () => refocusTerminal(), true);
+            terminalElement.addEventListener('click', () => refocusTerminal(), true);
+
+            const resizeObserver = new ResizeObserver(() => fitTerminal());
+            resizeObserver.observe(workspaceElement);
+            window.addEventListener('resize', fitTerminal);
+
+            host.addEventListener('message', event => {
+                const message = event.data || {};
+
+                switch (message.type) {
+                    case 'write':
+                        term.write(message.data || '');
+                        break;
+
+                    case 'clear':
+                        term.clear();
+                        if (searchState.query)
+                            refreshSearchSelection(false);
+                        break;
+
+                    case 'reset':
+                        term.reset();
+                        fitTerminal();
+                        break;
+
+                    case 'focus':
+                        term.focus();
+                        break;
+
+                    case 'search.set':
+                        setSearchQuery(message.data || '', true);
+                        break;
+
+                    case 'search.next':
+                        navigateSearch(1);
+                        break;
+
+                    case 'search.prev':
+                        navigateSearch(-1);
+                        break;
+
+                    case 'search.close':
+                        closeSearch();
+                        break;
+
+                    case 'show_search':
+                        openSearch(normalizeSelectionForCopy(term.getSelection() || ''));
+                        break;
+
+                    case 'reset_zoom':
+                        resetFontSize();
+                        break;
+                }
+            });
+
+            fitTerminal();
+            term.focus();
+            statusElement.classList.add('hidden');
+            post({ type: 'focus_state', focused: true });
+            post({ type: 'ready' });
+        }
+
+        bootstrap().catch(error => {
+            const message = error && error.message ? error.message : String(error);
+            setStatus(`Terminal bootstrap failed:\n${message}`, true);
+        });
+    </script>
+</body>
+</html>

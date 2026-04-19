@@ -26,6 +26,8 @@ internal static class Data
 
     public static CopyPasteService CopyPaste { get; } = new();
 
+    public static AdbShellSession Terminal { get; } = new();
+
     public static ObservableCollection<Log> CommandLog { get; set; } = [];
 
     public static void AddCommandLog(string content)

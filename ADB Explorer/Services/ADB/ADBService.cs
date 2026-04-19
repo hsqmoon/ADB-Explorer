@@ -10,6 +10,7 @@ public partial class ADBService
 {
     private const string GET_DEVICES = "devices";
     private const string ENABLE_MDNS = "ADB_MDNS_OPENSCREEN";
+    private const string INTERACTIVE_TERMINAL_COMMAND = "env TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 CLICOLOR_FORCE=1 TERM_PROGRAM=ADBExplorer sh -i";
 
     // find /sdcard/.Trash-AdbExplorer/ -maxdepth 1 -mindepth 1 \( -iname "\*" ! -iname ".RecycleIndex" ! -iname ".RecycleIndex.bak" \) 2>/dev/null | wc -l
     // Exclude the recycle folder, exclude content of sub-folders, include all files (including hidden), exclude the recycle index file, discard errors, count lines
@@ -68,6 +69,41 @@ public partial class ADBService
 
         return cmdProcess;
     }
+
+    public static Process StartInteractiveAdbShellProcess(string deviceId)
+    {
+        Process process = new()
+        {
+            StartInfo = new()
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardInputEncoding = Encoding.UTF8,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+                FileName = RuntimeSettings.AdbPath,
+            },
+            EnableRaisingEvents = true,
+        };
+
+        process.StartInfo.ArgumentList.Add("-s");
+        process.StartInfo.ArgumentList.Add(deviceId);
+        process.StartInfo.ArgumentList.Add("shell");
+        process.StartInfo.ArgumentList.Add("-tt");
+        process.StartInfo.ArgumentList.Add(INTERACTIVE_TERMINAL_COMMAND);
+
+        if (IsMdnsEnabled)
+            process.StartInfo.EnvironmentVariables[ENABLE_MDNS] = "1";
+
+        process.Start();
+        Data.AddCommandLog($"{RuntimeSettings.AdbPath} -s {deviceId} shell -tt {EscapeAdbString(INTERACTIVE_TERMINAL_COMMAND)}");
+
+        return process;
+    }
+
     public static int ExecuteCommand(
         string file, string cmd, out string stdout, out string stderr, Encoding encoding, CancellationToken cancellationToken, params string[] args)
     {

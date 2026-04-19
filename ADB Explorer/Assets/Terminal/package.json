@@ -1,0 +1,10 @@
+{
+  "name": "adb-explorer-terminal",
+  "private": true,
+  "description": "Local terminal frontend assets for ADB Explorer",
+  "license": "MIT",
+  "dependencies": {
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0"
+  }
+}

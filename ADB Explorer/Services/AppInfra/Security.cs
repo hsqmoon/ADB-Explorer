@@ -22,7 +22,9 @@ public static class Security
             if (!NativeMethods.WinTrust.VerifyEmbeddedSignature(filePath))
                 return false;
 
+#pragma warning disable SYSLIB0057 // No X509CertificateLoader API extracts the signer cert from an Authenticode-signed PE file.
             using var cert = X509Certificate2.CreateFromSignedFile(filePath);
+#pragma warning restore SYSLIB0057
 
             return cert.Subject.Contains($"O={owner}", StringComparison.OrdinalIgnoreCase);
         }

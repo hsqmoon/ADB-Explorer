@@ -5,7 +5,7 @@ public static class DictionaryHelper
     public static Dictionary<TKey, TElement> TryToDictionary<TSource, TKey, TElement>(this IEnumerable<TSource> source, Func<TSource, TKey> keySelector, Func<TSource, TElement> elementSelector) where TKey : notnull =>
             TryToDictionary(source, keySelector, elementSelector, null);
 
-    public static Dictionary<TKey, TElement> TryToDictionary<TSource, TKey, TElement>(this IEnumerable<TSource> source, Func<TSource, TKey> keySelector, Func<TSource, TElement> elementSelector, IEqualityComparer<TKey>? comparer) where TKey : notnull
+    public static Dictionary<TKey, TElement> TryToDictionary<TSource, TKey, TElement>(this IEnumerable<TSource> source, Func<TSource, TKey> keySelector, Func<TSource, TElement> elementSelector, IEqualityComparer<TKey> comparer) where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(source);
 
