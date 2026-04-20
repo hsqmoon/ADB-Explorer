@@ -8,7 +8,6 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
     private const int MAX_TERMINAL_TEXT_LENGTH = 200_000;
     private const int MAX_COMMAND_HISTORY = 100;
     private const int TAB_WIDTH = 4;
-    private static readonly Lock TerminalLogLock = new();
 
     private enum ParserState
     {
@@ -39,11 +38,13 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
     private ParserState parserState;
     private string outputText = "";
     private string pendingInput = "";
-    private string statusText = "Terminal idle";
+    private string statusText = "Waiting for a device from the main view...";
     private string connectedDeviceId = "";
     private bool isConnected;
     private bool isStarting;
     private bool isShuttingDown;
+    private bool followMainDevice;
+    private bool suppressAutoReconnect;
     private bool pendingCarriageReturn;
     private int historyIndex;
     private ShellState shellState = ShellState.Unknown;
@@ -117,14 +118,27 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
     public bool CanDisconnect => IsConnected || IsStarting;
     public bool CanInterrupt => IsConnected;
     public bool IsCommandRunning => shellState is ShellState.Running;
+    public bool IsFollowingMainDevice => followMainDevice;
+
+    public void EnableMainDeviceFollow()
+    {
+        followMainDevice = true;
+    }
 
     public async Task EnsureConnectedToCurrentDeviceAsync()
     {
-        var deviceId = Data.CurrentADBDevice?.ID;
+        if (!followMainDevice)
+            return;
+
+        var currentDevice = Data.DevicesObject.Current;
+        var deviceId = currentDevice?.Status is AbstractDevice.DeviceStatus.Ok
+            ? currentDevice.ID
+            : null;
+
         if (string.IsNullOrWhiteSpace(deviceId))
         {
             await CloseAsync();
-            UpdateStatus("Open a device to start a shell session.");
+            UpdateStatus("Waiting for a device from the main view...");
             return;
         }
 
@@ -138,17 +152,18 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
     {
         if (string.IsNullOrWhiteSpace(deviceId))
         {
-            UpdateStatus("Open a device to start a shell session.");
+            UpdateStatus("Waiting for a device from the main view...");
             return;
         }
 
         await sessionMutex.WaitAsync();
         try
         {
+            suppressAutoReconnect = false;
             CloseCore(updateStatus: false);
 
             IsStarting = true;
-            UpdateStatus($"Connecting to {deviceId}...");
+            UpdateStatus($"Attaching terminal to {deviceId}...");
             LogDiagnostic("connect.begin", $"device={deviceId}");
 
             var process = ADBService.StartInteractiveAdbShellProcess(deviceId);
@@ -159,7 +174,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             ConnectedDeviceId = deviceId;
             IsConnected = true;
             historyIndex = commandHistory.Count;
-            UpdateStatus($"Connected to {deviceId}");
+            UpdateStatus($"Attached to {deviceId}");
             LogDiagnostic("connect.ok", $"device={deviceId}; pid={SafeGetPid(process)}; state={DescribeProcess(process)}");
 
             _ = PumpReaderAsync(process, process.StandardOutput, isError: false, sessionCts.Token);
@@ -299,6 +314,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         await sessionMutex.WaitAsync();
         try
         {
+            suppressAutoReconnect = true;
             CloseCore();
         }
         finally
@@ -310,6 +326,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
     public void Shutdown()
     {
         isShuttingDown = true;
+        suppressAutoReconnect = true;
 
         bool lockTaken = false;
         try
@@ -391,7 +408,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         cts?.Dispose();
 
         if (updateStatus)
-            UpdateStatus("Terminal disconnected.");
+            UpdateStatus("Terminal detached.");
     }
 
     private async Task ObserveExitAsync(Process process, string deviceId, CancellationToken cancellationToken)
@@ -425,6 +442,13 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
 
             var exitCode = process.ExitCode;
             LogDiagnostic("process.exit", $"device={deviceId}; pid={SafeGetPid(process)}; exitCode={exitCode}");
+            if (ShouldAutoReconnect(deviceId))
+            {
+                UpdateStatus($"Shell on {deviceId} closed. Reattaching...");
+                _ = ScheduleReconnectAsync(deviceId);
+                return;
+            }
+
             UpdateStatus(exitCode == 0
                 ? $"Shell session on {deviceId} closed."
                 : $"Shell session on {deviceId} ended ({exitCode}).");
@@ -720,6 +744,40 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             currentLineBuffer.Append(text);
     }
 
+    private bool ShouldAutoReconnect(string deviceId)
+    {
+        if (isShuttingDown || suppressAutoReconnect)
+            return false;
+
+        if (!followMainDevice)
+            return false;
+
+        var currentDevice = Data.DevicesObject.Current;
+        if (currentDevice?.Status is not AbstractDevice.DeviceStatus.Ok)
+            return false;
+
+        var currentDeviceId = currentDevice.ID;
+        return string.Equals(currentDeviceId, deviceId, StringComparison.Ordinal);
+    }
+
+    private async Task ScheduleReconnectAsync(string deviceId)
+    {
+        try
+        {
+            await Task.Delay(1200);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (!ShouldAutoReconnect(deviceId))
+            return;
+
+        LogDiagnostic("reconnect.begin", $"device={deviceId}");
+        await EnsureConnectedToCurrentDeviceAsync();
+    }
+
     private static void Dispatch(Action action)
     {
         if (App.Current?.Dispatcher is not Dispatcher dispatcher || dispatcher.CheckAccess())
@@ -727,8 +785,6 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         else
             dispatcher.BeginInvoke(action);
     }
-
-    private static string TerminalLogPath => Path.Combine(Data.AppDataPath, "terminal.log");
 
     private static int SafeGetPid(Process process)
     {
@@ -765,23 +821,8 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
 
     private static void LogDiagnostic(string eventName, string details)
     {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(Data.AppDataPath))
-                return;
-
-            if (!Directory.Exists(Data.AppDataPath))
-                Directory.CreateDirectory(Data.AppDataPath);
-
-            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [TERMINAL] {eventName} | {details}{Environment.NewLine}";
-
-            lock (TerminalLogLock)
-            {
-                File.AppendAllText(TerminalLogPath, line, Encoding.UTF8);
-            }
-        }
-        catch
-        { }
+        _ = eventName;
+        _ = details;
     }
 }
 

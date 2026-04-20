@@ -86,22 +86,10 @@
                         <ColumnDefinition />
                     </Grid.ColumnDefinitions>
                     <ui:FontIcon Glyph="&#xE774;" ToolTip="{Binding Source={x:Static Member=strings:Resources.S_PLACEHOLDER_HOST}}" />
-                    <TextBox
+                    <controls:MaskedTextBox
                         Grid.Column="1"
-                        Padding="4,5,0,6"
                         d:Background="LightGray"
-                        IsReadOnly="True">
-                        <TextBox.Style>
-                            <Style BasedOn="{StaticResource NumericTextBoxStyle}" TargetType="TextBox">
-                                <Setter Property="Text" Value="{Binding IpAddress}" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding IsIpAddressValid}" Value="False">
-                                        <Setter Property="Text" Value="{Binding HostName}" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </TextBox.Style>
-                    </TextBox>
+                        Style="{StaticResource NewDeviceIpBoxStyle}" />
                 </Grid>
                 <Grid>
                     <Grid.ColumnDefinitions>

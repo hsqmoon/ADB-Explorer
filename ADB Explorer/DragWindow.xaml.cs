@@ -24,7 +24,7 @@ public partial class DragWindow : INotifyPropertyChanged
 
         DragTimer.Tick += DragTimer_Tick;
 
-#if !DEPLOY
+#if DEBUG
         MainBorder.BorderThickness = new Thickness(1);
         MainBorder.BorderBrush = Brushes.OrangeRed;
 #endif
@@ -203,6 +203,9 @@ public partial class DragWindow : INotifyPropertyChanged
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        DragImage.Width = SystemParameters.IconWidth;
+        DragImage.Height = SystemParameters.IconHeight;
+
         Data.CopyPaste.PropertyChanged += (s, e) =>
         {
             if ((e.PropertyName == nameof(Data.CopyPaste.DragFiles)

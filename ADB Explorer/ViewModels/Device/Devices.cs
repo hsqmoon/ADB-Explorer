@@ -296,11 +296,16 @@ public class Devices : AbstractDevice
 
     public bool SetOpenDevice(LogicalDeviceViewModel device)
     {
-        if (Data.RuntimeSettings.DeviceToOpen is null && device is null)
+        if (Data.RuntimeSettings.DeviceToOpen is null
+            && Data.RuntimeSettings.CurrentDevice is null
+            && device is null)
             return false;
 
         if (Data.RuntimeSettings.DeviceToOpen?.Equals(device) is not true)
             Data.RuntimeSettings.DeviceToOpen = device;
+
+        if (Data.RuntimeSettings.CurrentDevice?.Equals(device) is not true)
+            Data.RuntimeSettings.CurrentDevice = device;
 
         Data.RuntimeSettings.IsRootActive = device?.Root is RootStatus.Enabled;
 

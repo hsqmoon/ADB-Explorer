@@ -449,19 +449,9 @@
                                 Orientation="Horizontal">
                                 <Button
                                     Margin="0,0,6,0"
-                                    Click="TerminalConnect_Click"
-                                    Content="Connect"
-                                    IsEnabled="{Binding Source={x:Static Member=models:Data.Terminal}, Path=CanConnect}" />
-                                <Button
-                                    Margin="0,0,6,0"
                                     Click="TerminalInterrupt_Click"
                                     Content="Ctrl+C"
                                     IsEnabled="{Binding Source={x:Static Member=models:Data.Terminal}, Path=CanInterrupt}" />
-                                  <Button
-                                      Margin="0,0,6,0"
-                                      Click="TerminalDisconnect_Click"
-                                      Content="Disconnect"
-                                      IsEnabled="{Binding Source={x:Static Member=models:Data.Terminal}, Path=CanDisconnect}" />
                                   <Button
                                       Margin="0,0,6,0"
                                       Click="TerminalFind_Click"
@@ -730,6 +720,23 @@
                             <Run Text=")" />
                         </TextBlock>
                     </StackPanel>
+                    <Button
+                        Margin="8,0,0,0"
+                        Padding="10,2"
+                        Click="DisconnectCurrentDeviceButton_Click"
+                        Content="{Binding Source={x:Static strings:Resources.S_REM_DEV}}"
+                        ToolTip="{Binding Source={x:Static strings:Resources.S_REM_DEVICE}}">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Visibility" Value="Visible" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding}" Value="{x:Null}">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
                     <Menu Margin="6,0,-5,0" Style="{StaticResource LogToggleStyle}" />
                 </StackPanel>
             </Grid>

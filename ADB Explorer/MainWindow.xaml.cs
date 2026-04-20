@@ -475,14 +475,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 case nameof(AppRuntimeSettings.IsTerminalOpen):
                     if (RuntimeSettings.IsTerminalOpen)
                     {
+                        Terminal.EnableMainDeviceFollow();
                         _ = EnsureTerminalWebViewReadyAsync();
                         _ = Terminal.EnsureConnectedToCurrentDeviceAsync();
                         Dispatcher.BeginInvoke(FocusTerminalInput);
                     }
+                    else
+                    {
+                        CloseTerminalSearch(clearQuery: false, focusTerminal: false);
+                    }
                     break;
 
                 case nameof(AppRuntimeSettings.CurrentDevice):
-                    if (RuntimeSettings.IsTerminalOpen)
+                    if (Terminal.IsFollowingMainDevice)
                         _ = Terminal.EnsureConnectedToCurrentDeviceAsync();
                     break;
 
@@ -2227,7 +2232,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 if (vfdo is not null)
                 {
                     CopyPaste.UpdateSelfVFDO(true);
-                    RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(selectedItems.First());
+                    RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(selectedItems.First(), GetDragPreviewIconSize());
 
                     vfdo.SendObjectToShell(VirtualFileDataObject.DataObjectMethod.DragDrop, cell, vfdo.PreferredDropEffect.Value);
                 }
@@ -2340,6 +2345,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void KillAdbButton_Click(object sender, RoutedEventArgs e)
     {
         ADBService.KillAdbProcess();
+    }
+
+    private async void DisconnectCurrentDeviceButton_Click(object sender, RoutedEventArgs e)
+    {
+        await DeviceHelper.DisconnectCurrentDeviceAsync();
     }
 
     private void Grid_MouseEnter(object sender, MouseEventArgs e)
@@ -2527,7 +2537,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         CopyPaste.CurrentDropEffect = e.Effects;
 
         if (CopyPaste.CurrentFiles.Any())
-            RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(CopyPaste.CurrentFiles.First());
+            RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(CopyPaste.CurrentFiles.First(), GetDragPreviewIconSize());
 
         e.Handled = true;
     }
@@ -2536,6 +2546,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (!RuntimeSettings.IsWindowLoaded)
             return;
+    }
+
+    private int GetDragPreviewIconSize()
+    {
+        double logicalSize = Math.Max(SystemParameters.IconWidth, SystemParameters.IconHeight);
+        double dpiScale = RuntimeSettings.DpiScalingFactor > 0
+            ? 1d / RuntimeSettings.DpiScalingFactor
+            : 1d;
+
+        return (int)Math.Clamp(Math.Round(logicalSize * dpiScale), 32, 64);
     }
 
     private void MainWin_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -2630,20 +2650,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private static void LogTerminalUiDiagnostic(string eventName, string details)
     {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(Data.AppDataPath))
-                return;
-
-            if (!Directory.Exists(Data.AppDataPath))
-                Directory.CreateDirectory(Data.AppDataPath);
-
-            var path = Path.Combine(Data.AppDataPath, "terminal.log");
-            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [TERMINAL_UI] {eventName} | {details}{Environment.NewLine}";
-            File.AppendAllText(path, line, Encoding.UTF8);
-        }
-        catch
-        { }
+        _ = eventName;
+        _ = details;
     }
 
     private void EnqueuePendingTerminalChunk(string chunk)
@@ -3124,22 +3132,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private async void TerminalConnect_Click(object sender, RoutedEventArgs e)
-    {
-        await EnsureTerminalWebViewReadyAsync();
-        await Terminal.EnsureConnectedToCurrentDeviceAsync();
-        FocusTerminalInput();
-    }
-
     private async void TerminalInterrupt_Click(object sender, RoutedEventArgs e)
     {
         await Terminal.InterruptAsync();
         FocusTerminalInput();
-    }
-
-    private async void TerminalDisconnect_Click(object sender, RoutedEventArgs e)
-    {
-        await Terminal.CloseAsync();
     }
 
     private async void TerminalFind_Click(object sender, RoutedEventArgs e)
@@ -3246,15 +3242,19 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PostTerminalMessage(new { type = previous ? "search.prev" : "search.next" });
     }
 
-    private void CloseTerminalSearch()
+    private void CloseTerminalSearch(bool clearQuery = true, bool focusTerminal = true)
     {
         IsTerminalSearchVisible = false;
         TerminalSearchCountText = "0/0";
 
+        if (clearQuery)
+            TerminalSearchQuery = "";
+
         if (isTerminalPageReady)
             PostTerminalMessage(new { type = "search.close" });
 
-        FocusTerminalInput();
+        if (focusTerminal)
+            FocusTerminalInput();
     }
 
     private void OpenTerminalExternalLink(string url)

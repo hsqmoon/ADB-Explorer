@@ -328,6 +328,26 @@ public class FileToIconConverter
     public static Bitmap GetBitmap(FilePath file)
         => GetImage<Bitmap>(file);
 
+    public static BitmapSource GetBitmapSource(FilePath file, int iconSize)
+    {
+        var specialType = file.SpecialType;
+        IconSize size = iconSize switch
+        {
+            <= 16 => IconSize.Small,
+            <= 32 => IconSize.Large,
+            <= 48 => IconSize.ExtraLarge,
+            _ => IconSize.Jumbo,
+        };
+
+        if (specialType.HasFlag(AbstractFile.SpecialFileType.Apk))
+        {
+            Icon apkIcon = new(Properties.AppGlobal.APK_icon, IconToSize(size));
+            return AddToDic<BitmapSource>(apkIcon, size, AbstractFile.SpecialFileType.Apk);
+        }
+
+        return AddToDic<BitmapSource>(file.FullName, size, iconSize, specialType & ~AbstractFile.SpecialFileType.LinkOverlay);
+    }
+
     public static BitmapSource GetBitmapSource(FilePath file)
         => GetImage<BitmapSource>(file);
 }

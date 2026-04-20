@@ -99,6 +99,77 @@ public static class DeviceHelper
         Data.RuntimeSettings.DeviceToOpen = device;
     }
 
+    public static void CloseCurrentDevice()
+    {
+        Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
+        DriveHelper.ClearDrives();
+        FileActionLogic.ClearExplorer();
+        NavHistory.Reset();
+        Data.FileActions.IsExplorerVisible = false;
+        Data.CurrentADBDevice = null;
+        Data.DirList = null;
+    }
+
+    public static async Task DisconnectCurrentDeviceAsync()
+    {
+        var device = Data.DevicesObject.Current;
+        if (device is null)
+            return;
+
+        try
+        {
+            switch (device.Type)
+            {
+                case DeviceType.Remote:
+                    await Task.Run(() => ADBService.DisconnectNetworkDevice(device.ID));
+                    EnsureHistoryDevice(device);
+                    RemoveDevice(device);
+                    return;
+
+                case DeviceType.Emulator:
+                    await Task.Run(() => ADBService.KillEmulator(device.ID));
+                    RemoveDevice(device);
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            DialogService.ShowMessage(ex.Message, Strings.Resources.S_DISCONN_FAILED_TITLE, DialogService.DialogIcon.Critical, copyToClipboard: true);
+            return;
+        }
+
+        CloseCurrentDevice();
+    }
+
+    private static void EnsureHistoryDevice(LogicalDeviceViewModel device)
+    {
+        if (device.Type is not DeviceType.Remote)
+            return;
+
+        string address = device.IsIpAddressValid ? device.IpAddress : device.ID.Split(':')[0];
+        string port = device.ID.Contains(':') ? device.ID.Split(':')[1] : "5555";
+        var existing = Data.DevicesObject.HistoryDeviceViewModels.FirstOrDefault(hist =>
+            hist.IpAddress == address && hist.ConnectPort == port);
+
+        if (existing is not null)
+        {
+            if (string.IsNullOrEmpty(existing.DeviceName) && !string.IsNullOrEmpty(device.Name))
+            {
+                existing.SetDeviceName(device.Name);
+                if (Data.Settings.SaveDevices)
+                    Data.DevicesObject.StoreHistoryDevices();
+            }
+
+            return;
+        }
+
+        HistoryDeviceViewModel history = new(new HistoryDevice(address, port, device.Name));
+        Data.DevicesObject.UIList.Add(history);
+
+        if (Data.Settings.SaveDevices)
+            Data.DevicesObject.StoreHistoryDevices();
+    }
+
     public static void SideloadDeviceAction(LogicalDeviceViewModel device)
     {
         OpenFileDialog dialog = new()
@@ -157,6 +228,7 @@ public static class DeviceHelper
             try
             {
                 ADBService.DisconnectNetworkDevice(device.ID);
+                EnsureHistoryDevice((LogicalDeviceViewModel)device);
             }
             catch (Exception ex)
             {
@@ -274,7 +346,7 @@ public static class DeviceHelper
         if (device is HistoryDeviceViewModel hist)
         {
             // if there's any device with the IP of a history device - hide the history device
-            return Data.Settings.SaveDevices && !Data.DevicesObject.LogicalDeviceViewModels.Any(logical => logical.IpAddress == hist.IpAddress || logical.IpAddress == hist.HostName)
+            return !Data.DevicesObject.LogicalDeviceViewModels.Any(logical => logical.IpAddress == hist.IpAddress || logical.IpAddress == hist.HostName)
                     && !Data.DevicesObject.ServiceDeviceViewModels.Any(service => service.IpAddress == hist.IpAddress || service.IpAddress == hist.HostName);
         }
 
@@ -339,13 +411,19 @@ public static class DeviceHelper
 
     public static void UpdateDevicesBatInfo()
     {
-        if (Data.DevicesObject.Current?.Status is DeviceStatus.Ok)
-            Data.DevicesObject.Current.UpdateBattery();
+        var currentDevice = App.Current?.Dispatcher.Invoke(() => Data.DevicesObject.Current);
+        if (currentDevice?.Status is DeviceStatus.Ok)
+            currentDevice.UpdateBattery();
 
         if (DateTime.Now - Data.DevicesObject.LastUpdate <= AdbExplorerConst.BATTERY_UPDATE_INTERVAL && !Data.RuntimeSettings.IsDevicesPaneOpen)
             return;
 
-        var items = Data.DevicesObject.LogicalDeviceViewModels.Where(device => !device.IsOpen && device.Status is DeviceStatus.Ok);
+        var items = App.Current?.Dispatcher.Invoke(() =>
+            Data.DevicesObject.LogicalDeviceViewModels
+                .Where(device => !device.IsOpen && device.Status is DeviceStatus.Ok)
+                .ToList())
+            ?? [];
+
         foreach (var item in items)
         {
             item.UpdateBattery();
@@ -546,6 +624,9 @@ public static class DeviceHelper
         {
             DriveHelper.ClearDrives();
             Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
+            Data.CurrentADBDevice = null;
+            Data.RuntimeSettings.CurrentDevice = null;
+            Data.DirList = null;
         }
 
         if (Data.DevicesObject.DevicesAvailable(true))
@@ -554,6 +635,9 @@ public static class DeviceHelper
         CollapseDevices();
 
         Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
+        Data.CurrentADBDevice = null;
+        Data.RuntimeSettings.CurrentDevice = null;
+        Data.DirList = null;
 
         Data.CopyPaste.GetClipboardPasteItems();
 
@@ -674,13 +758,7 @@ public static class DeviceHelper
             case LogicalDeviceViewModel logical:
                 if (logical.IsOpen)
                 {
-                    DriveHelper.ClearDrives();
-                    FileActionLogic.ClearExplorer();
-                    NavHistory.Reset();
-                    Data.FileActions.IsExplorerVisible = false;
-                    Data.CurrentADBDevice = null;
-                    Data.DirList = null;
-                    Data.RuntimeSettings.DeviceToOpen = null;
+                    CloseCurrentDevice();
                 }
 
                 Data.DevicesObject.UIList.Remove(device);

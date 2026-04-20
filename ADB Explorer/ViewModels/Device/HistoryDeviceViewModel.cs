@@ -31,6 +31,7 @@ public class HistoryDeviceViewModel : NewDeviceViewModel
         Device = device;
 
         RemoveCommand = DeviceHelper.RemoveDeviceCommand(this);
+        PropertyChanged += HistoryDeviceViewModel_PropertyChanged;
     }
 
     public static HistoryDeviceViewModel New(NewDeviceViewModel device)
@@ -72,6 +73,15 @@ public class HistoryDeviceViewModel : NewDeviceViewModel
         }
 
         return false;
+    }
+
+    private void HistoryDeviceViewModel_PropertyChanged(object sender, PropertyChangedEventArgs e)
+    {
+        if (!Data.Settings.SaveDevices)
+            return;
+
+        if (e.PropertyName is nameof(IpAddress) or nameof(HostName) or nameof(ConnectPort) or nameof(DeviceName))
+            Data.DevicesObject?.StoreHistoryDevices();
     }
 }
 

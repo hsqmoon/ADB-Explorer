@@ -679,35 +679,44 @@ internal static class FileActionLogic
 
     public static void RefreshDrives(bool asyncClassify = false)
     {
-        if (Data.DevicesObject.Current is null || Data.DevicesObject.Current.Status is not AbstractDevice.DeviceStatus.Ok)
+        var currentDevice = Data.DevicesObject.Current;
+        var currentAdbDevice = Data.CurrentADBDevice;
+
+        if (currentDevice is null || currentAdbDevice is null || currentDevice.Status is not AbstractDevice.DeviceStatus.Ok || currentAdbDevice.Status is not AbstractDevice.DeviceStatus.Ok)
             return;
 
-        if (!asyncClassify && Data.DevicesObject.Current.Drives?.Count > 0 && !Data.FileActions.IsExplorerVisible)
+        if (!asyncClassify && currentDevice.Drives?.Count > 0 && !Data.FileActions.IsExplorerVisible)
             asyncClassify = true;
+
+        string deviceId = currentDevice.ID;
+        bool isRecovery = currentDevice.Type is AbstractDevice.DeviceType.Recovery;
+        bool hasTrashDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Trash) == true;
+        bool hasTempDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Temp) == true;
+        bool hasPackageDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Package) == true;
 
         var driveTask = Task.Run(() =>
         {
-            if (Data.CurrentADBDevice is null || Data.CurrentADBDevice.Status is not AbstractDevice.DeviceStatus.Ok)
+            if (currentAdbDevice.Status is not AbstractDevice.DeviceStatus.Ok)
                 return null;
 
-            var drives = Data.CurrentADBDevice.GetDrives();
+            var drives = currentAdbDevice.GetDrives();
 
-            if (Data.DevicesObject.Current.Type is AbstractDevice.DeviceType.Recovery)
+            if (isRecovery)
             {
-                foreach (var item in Data.DevicesObject.Current.Drives.OfType<VirtualDriveViewModel>())
+                foreach (var item in currentDevice.Drives?.OfType<VirtualDriveViewModel>() ?? [])
                 {
                     item.SetItemsCount(item.Type is AbstractDrive.DriveType.Package ? -1 : null);
                 }
             }
             else
             {
-                if (Data.Settings.EnableRecycle && Data.DevicesObject.Current.Drives.Any(d => d.Type is AbstractDrive.DriveType.Trash))
+                if (Data.Settings.EnableRecycle && hasTrashDrive)
                     TrashHelper.UpdateRecycledItemsCount();
 
-                if (Data.Settings.EnableApk && Data.DevicesObject.Current.Drives.Any(d => d.Type is AbstractDrive.DriveType.Temp))
+                if (Data.Settings.EnableApk && hasTempDrive)
                     UpdateInstallersCount();
 
-                if (Data.Settings.EnableApk && Data.DevicesObject.Current.Drives.Any(d => d.Type is AbstractDrive.DriveType.Package))
+                if (Data.Settings.EnableApk && hasPackageDrive)
                     UpdatePackagesCount();
             }
 
@@ -715,12 +724,16 @@ internal static class FileActionLogic
         });
         driveTask.ContinueWith((t) =>
         {
-            if (t.IsCanceled || t.Result is null)
+            if (t.IsCanceled || t.IsFaulted || t.Result is null)
                 return;
 
             App.Current?.Dispatcher.Invoke(async () =>
             {
-                if (await Data.DevicesObject.Current?.UpdateDrives(await t, App.Current.Dispatcher, asyncClassify))
+                var activeDevice = Data.DevicesObject.Current;
+                if (activeDevice?.ID != deviceId)
+                    return;
+
+                if (await activeDevice.UpdateDrives(t.Result, App.Current.Dispatcher, asyncClassify))
                 {
                     Data.RuntimeSettings.FilterDrives = true;
                     FolderHelper.CombineDisplayNames();
@@ -731,10 +744,15 @@ internal static class FileActionLogic
 
     public static void UpdateInstallersCount()
     {
-        var countTask = Task.Run(() => ADBService.CountPackages(Data.DevicesObject.Current.ID));
+        var currentDevice = Data.DevicesObject.Current;
+        if (currentDevice is null)
+            return;
+
+        string deviceId = currentDevice.ID;
+        var countTask = Task.Run(() => ADBService.CountPackages(deviceId));
         countTask.ContinueWith((t) => App.Current?.Dispatcher.Invoke(() =>
         {
-            if (!t.IsCanceled && Data.DevicesObject.Current is not null)
+            if (!t.IsCanceled && !t.IsFaulted && Data.DevicesObject.Current?.ID == deviceId)
             {
                 var temp = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Temp);
                 ((VirtualDriveViewModel)temp)?.SetItemsCount((long)t.Result);
@@ -744,11 +762,17 @@ internal static class FileActionLogic
 
     public static void UpdatePackagesCount()
     {
-        var packageTask = Task.Run(() => ShellFileOperation.GetPackagesCount(Data.CurrentADBDevice));
+        var currentDevice = Data.DevicesObject.Current;
+        var currentAdbDevice = Data.CurrentADBDevice;
+        if (currentDevice is null || currentAdbDevice is null)
+            return;
+
+        string deviceId = currentDevice.ID;
+        var packageTask = Task.Run(() => ShellFileOperation.GetPackagesCount(currentAdbDevice));
 
         packageTask.ContinueWith((t) =>
         {
-            if (t.IsCanceled || t.Result is null || Data.DevicesObject.Current is null)
+            if (t.IsCanceled || t.IsFaulted || t.Result is null || Data.DevicesObject.Current?.ID != deviceId)
                 return;
 
             App.Current.Dispatcher.Invoke(() =>
