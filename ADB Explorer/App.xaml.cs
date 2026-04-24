@@ -67,10 +67,7 @@ public partial class App : Application
             }
             
 #if !DEPLOY
-            if (!File.Exists(ADB_Explorer.Properties.AppGlobal.DragDropLogPath))
-            {
-                File.WriteAllText(ADB_Explorer.Properties.AppGlobal.DragDropLogPath, "");
-            }
+            DebugLog.Initialize();
 #endif
 
         }

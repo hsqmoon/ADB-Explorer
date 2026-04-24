@@ -44,13 +44,15 @@ public static class DeviceHelper
         if (drives is null)
             return null;
 
+        var currentDevice = Data.CurrentADBDevice;
+
         // Try to find the MMC in the props
-        if (Data.CurrentADBDevice.MmcProp is string mmcId)
+        if (currentDevice?.ID == deviceID && currentDevice.MmcProp is string mmcId)
         {
             return drives.FirstOrDefault(d => d.ID == mmcId);
         }
         // If OTG exists, but no MMC ID - there is no MMC
-        else if (Data.CurrentADBDevice.OtgProp is not null)
+        else if (currentDevice?.ID == deviceID && currentDevice.OtgProp is not null)
             return null;
 
         var externalDrives = drives.Where(d => d.Type is AbstractDrive.DriveType.Unknown);

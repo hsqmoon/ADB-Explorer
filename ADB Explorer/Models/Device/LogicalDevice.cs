@@ -147,7 +147,7 @@ public class LogicalDevice : Device
         var mmcTask = Task.Run(() => DeviceHelper.GetMmcDrive(drives.OfType<LogicalDrive>(), ID));
         mmcTask.ContinueWith((t) =>
         {
-            if (t.IsCanceled)
+            if (t.IsCanceled || t.IsFaulted)
                 return;
 
             dispatcher.BeginInvoke(() =>
