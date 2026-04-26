@@ -1,8 +1,6 @@
-using ADB_Explorer.Models;
-
 namespace ADB_Explorer.Services;
 
-public static class DebugLog
+public static class TerminalLog
 {
     private static readonly Mutex mutex = new();
     private static string resolvedLogPath;
@@ -14,6 +12,21 @@ public static class DebugLog
 
     public static void PrintLine(string message)
     {
+        Write("INFO", message);
+    }
+
+    public static void PrintInput(string message)
+    {
+        Write("IN", message);
+    }
+
+    public static void PrintOutput(string message, bool isError = false)
+    {
+        Write(isError ? "ERR" : "OUT", message);
+    }
+
+    private static void Write(string kind, string message)
+    {
         mutex.WaitOne();
 
         try
@@ -21,24 +34,19 @@ public static class DebugLog
             if (LogPath is not string logPath)
                 return;
 
-            File.AppendAllText(logPath, $"{DateTime.Now:HH:mm:ss:fff} | {message}\n");
+            message ??= "";
+            message = message.Replace("\r", "\\r").Replace("\n", "\\n");
+            File.AppendAllText(logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{kind}] {message}{Environment.NewLine}");
         }
         catch
-        {
-            // Logging must never crash the app.
-        }
+        { }
         finally
         {
             mutex.ReleaseMutex();
         }
     }
 
-    private static string LogPath => resolvedLogPath ??= ResolveLogPath();
-
-    private static string ResolveLogPath()
-    {
-        return PrepareLogPath(Path.Combine(AppContext.BaseDirectory, "log", "dragdrop.log"));
-    }
+    private static string LogPath => resolvedLogPath ??= PrepareLogPath(Path.Combine(AppContext.BaseDirectory, "log", "terminal.log"));
 
     private static string PrepareLogPath(string path)
     {
@@ -48,11 +56,8 @@ public static class DebugLog
         try
         {
             var fullPath = Path.GetFullPath(path);
-            var root = Path.GetPathRoot(fullPath);
-            if (!string.IsNullOrEmpty(root) && !Directory.Exists(root))
-                return null;
-
-            if (Path.GetDirectoryName(fullPath) is not string directory || string.IsNullOrWhiteSpace(directory))
+            var directory = Path.GetDirectoryName(fullPath);
+            if (string.IsNullOrWhiteSpace(directory))
                 return null;
 
             Directory.CreateDirectory(directory);

@@ -127,7 +127,4 @@
   <data name="AppVersion" xml:space="preserve">
     <value>0.9.26030</value>
   </data>
-  <data name="DragDropLogPath" xml:space="preserve">
-    <value>E:\Log\log.txt</value>
-  </data>
 </root>

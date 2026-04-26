@@ -55,6 +55,9 @@ public class FileOperationQueue : ViewModelBase
         is FileOperation.OperationStatus.Waiting
         or FileOperation.OperationStatus.InProgress);
 
+    public bool HasRunningSyncOperations => Operations.Any(op => op is FileSyncOperation
+        && op.Status is FileOperation.OperationStatus.InProgress);
+
     public int TotalCount => Operations.Count(op => !op.IsPastOp);
 
     public string StringProgress => $"{Operations.Count(op => op.Status is FileOperation.OperationStatus.Completed)} / {TotalCount}";
@@ -236,17 +239,6 @@ public class FileOperationQueue : ViewModelBase
                             continue;
                         }
                     }
-                    else
-                    {
-                        // AdvancedAdbSharp allows (and boosts performance with) simultaneous sync operations
-                        if (item.First().OperationName
-                            is FileOperation.OperationType.Push
-                            or FileOperation.OperationType.Pull)
-                        {
-                            operations = [.. item];
-                        }
-                    }
-
                     foreach (var op in operations)
                     {
                         op.PropertyChanged += CurrentOperation_PropertyChanged;
@@ -289,8 +281,7 @@ public class FileOperationQueue : ViewModelBase
         
         if (e.PropertyName is nameof(FileOperation.Status))
         {
-            Data.RuntimeSettings.IsPollingStopped = Data.Settings.StopPollingOnSync
-                && Operations.Any(op => op is FileSyncOperation && op.Status is FileOperation.OperationStatus.InProgress);
+            Data.RuntimeSettings.IsPollingStopped = Data.Settings.StopPollingOnSync && HasRunningSyncOperations;
 
             if (op.Status
                 is not FileOperation.OperationStatus.Waiting

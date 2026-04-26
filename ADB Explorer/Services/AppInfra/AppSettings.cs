@@ -375,6 +375,56 @@ public class AppSettings : ViewModelBase
         set => Set(ref lastDevice, value);
     }
 
+    private string lastDeviceId = null;
+    public string LastDeviceId
+    {
+        get => Get(ref lastDeviceId, null);
+        set => Set(ref lastDeviceId, value);
+    }
+
+    private string lastDevicePath = null;
+    public string LastDevicePath
+    {
+        get => Get(ref lastDevicePath, null);
+        set => Set(ref lastDevicePath, value);
+    }
+
+    private string[] lastDevicePaths = null;
+    public string[] LastDevicePaths
+    {
+        get => Get(ref lastDevicePaths, null);
+        set => Set(ref lastDevicePaths, value);
+    }
+
+    public string GetLastDevicePath(string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId) || LastDevicePaths is null)
+            return null;
+
+        return LastDevicePaths
+            .Select(entry => entry?.Split('|', 2))
+            .FirstOrDefault(parts => parts?.Length == 2 && parts[0] == deviceId)?[1];
+    }
+
+    public void SetLastDevicePath(string deviceId, string path)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+            return;
+
+        var entries = (LastDevicePaths ?? [])
+            .Select(entry => entry?.Split('|', 2))
+            .Where(parts => parts?.Length == 2 && !string.IsNullOrWhiteSpace(parts[0]))
+            .GroupBy(parts => parts[0])
+            .ToDictionary(group => group.Key, group => group.Last()[1]);
+
+        if (string.IsNullOrWhiteSpace(path))
+            entries.Remove(deviceId);
+        else
+            entries[deviceId] = path;
+
+        LastDevicePaths = [.. entries.Select(kv => $"{kv.Key}|{kv.Value}")];
+    }
+
     private CultureInfo uiCulture;
     public CultureInfo UICulture
     {

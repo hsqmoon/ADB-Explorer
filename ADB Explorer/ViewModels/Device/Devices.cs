@@ -312,6 +312,7 @@ public class Devices : AbstractDevice
         if (device is not null)
         {
             Data.Settings.LastDevice = device.Name;
+            Data.Settings.LastDeviceId = device.ID;
             return true;
         }
 

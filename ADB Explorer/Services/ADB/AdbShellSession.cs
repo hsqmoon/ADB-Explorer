@@ -164,6 +164,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
 
             IsStarting = true;
             UpdateStatus($"Attaching terminal to {deviceId}...");
+            TerminalLog.PrintLine($"connect.begin device={deviceId}");
             LogDiagnostic("connect.begin", $"device={deviceId}");
 
             var process = ADBService.StartInteractiveAdbShellProcess(deviceId);
@@ -175,6 +176,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             IsConnected = true;
             historyIndex = commandHistory.Count;
             UpdateStatus($"Attached to {deviceId}");
+            TerminalLog.PrintLine($"connect.ok device={deviceId}; pid={SafeGetPid(process)}");
             LogDiagnostic("connect.ok", $"device={deviceId}; pid={SafeGetPid(process)}; state={DescribeProcess(process)}");
 
             _ = PumpReaderAsync(process, process.StandardOutput, isError: false, sessionCts.Token);
@@ -186,6 +188,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             CloseCore(updateStatus: false);
             AppendOutput($"\n[terminal] {ex.Message}\n");
             UpdateStatus($"Failed to connect to {deviceId}");
+            TerminalLog.PrintLine($"connect.fail device={deviceId}; ex={ex.GetType().Name}; msg={ex.Message}");
             LogDiagnostic("connect.fail", $"device={deviceId}; ex={ex.GetType().Name}; msg={ex.Message}");
         }
         finally
@@ -221,6 +224,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
 
         historyIndex = commandHistory.Count;
         Data.AddCommandLog($"shell[{ConnectedDeviceId}]> {input}");
+        TerminalLog.PrintInput(input);
 
         await shellInput.WriteLineAsync(input);
         await shellInput.FlushAsync();
@@ -238,6 +242,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             return;
 
         Data.AddCommandLog($"shell[{ConnectedDeviceId}]> <literal:{input.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t")}>");
+        TerminalLog.PrintInput($"<literal:{input.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t")}>");
         if (input.Contains('\u0003'))
             LogDiagnostic("input.ctrl_c.literal", $"device={ConnectedDeviceId}; state.before={DescribeProcess(shellProcess)}");
 
@@ -254,6 +259,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         if (IsCommandRunning)
         {
             Data.AddCommandLog($"shell[{ConnectedDeviceId}]> <Ctrl+C>");
+            TerminalLog.PrintInput("<Ctrl+C>");
             LogDiagnostic("interrupt.send", $"device={ConnectedDeviceId}; pid={SafeGetPid(shellProcess)}; state.before={DescribeProcess(shellProcess)}; shellState={shellState}");
 
             await shellInput.WriteAsync("\u0003");
@@ -275,6 +281,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         else
         {
             Data.AddCommandLog($"shell[{ConnectedDeviceId}]> <Ctrl+C translated>");
+            TerminalLog.PrintInput("<Ctrl+C translated>");
             LogDiagnostic("interrupt.translated", $"device={ConnectedDeviceId}; pid={SafeGetPid(shellProcess)}; shellState={shellState}");
 
             // In piped adb shell sessions, sending ETX at the prompt exits the shell.
@@ -441,6 +448,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
             ConnectedDeviceId = "";
 
             var exitCode = process.ExitCode;
+            TerminalLog.PrintLine($"process.exit device={deviceId}; pid={SafeGetPid(process)}; exitCode={exitCode}");
             LogDiagnostic("process.exit", $"device={deviceId}; pid={SafeGetPid(process)}; exitCode={exitCode}");
             if (ShouldAutoReconnect(deviceId))
             {
@@ -474,6 +482,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
                         return;
 
                     OutputChunkReceived?.Invoke(chunk, isError);
+                    TerminalLog.PrintOutput(chunk, isError);
                     AppendOutput(chunk, isError);
                     Data.RuntimeSettings.LastServerResponse = DateTime.Now;
                 });

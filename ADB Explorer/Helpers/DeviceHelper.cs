@@ -668,10 +668,9 @@ public static class DeviceHelper
 
         if (Data.DevicesObject.Current is null)
         {
-            if (string.IsNullOrEmpty(Data.Settings.LastDevice))
-                device = devices.First();
-            else
-                device = devices.FirstOrDefault(d => d.Name == Data.Settings.LastDevice);
+            device = devices.FirstOrDefault(d => d.ID == Data.Settings.LastDeviceId)
+                ?? devices.FirstOrDefault(d => d.Name == Data.Settings.LastDevice)
+                ?? devices.FirstOrDefault();
         }
         else
             device = Data.DevicesObject.Current;
@@ -702,12 +701,13 @@ public static class DeviceHelper
 
     public static void InitDevice()
     {
+        string reopenPath = GetAutoOpenPath(Data.DevicesObject.Current);
+
         SetAndroidVersion();
         FileActionLogic.RefreshDrives(true);
 
         FolderHelper.CombineDisplayNames();
         Data.RuntimeSettings.DriveViewNav = true;
-        NavHistory.Navigate(Navigation.SpecialLocation.DriveView);
 
         Data.CopyPaste.GetClipboardPasteItems();
         Data.RuntimeSettings.FilterDrives = true;
@@ -717,6 +717,13 @@ public static class DeviceHelper
 
         Data.FileOpQ.MoveOperationsToPast();
         FileActionLogic.UpdateFileActions();
+
+        if (!string.IsNullOrEmpty(reopenPath))
+        {
+            Data.Settings.LastDevicePath = reopenPath;
+            Data.Settings.SetLastDevicePath(Data.DevicesObject.Current?.ID, reopenPath);
+            ScheduleAutoOpenRestore(Data.DevicesObject.Current, reopenPath);
+        }
     }
 
     public static void TestDevices()
@@ -785,6 +792,50 @@ public static class DeviceHelper
         InitDevice();
 
         Data.RuntimeSettings.IsDevicesPaneOpen = false;
+    }
+
+    private static string GetAutoOpenPath(LogicalDeviceViewModel device)
+    {
+        if (!Data.Settings.AutoOpen || device is null)
+            return null;
+
+        string path = Data.Settings.GetLastDevicePath(device.ID);
+        if (!string.IsNullOrWhiteSpace(path))
+            return path;
+
+        return string.Equals(Data.Settings.LastDevice, device.Name, StringComparison.Ordinal)
+            ? Data.Settings.LastDevicePath
+            : null;
+    }
+
+    private static void ScheduleAutoOpenRestore(LogicalDeviceViewModel device, string path)
+    {
+        if (device is null || string.IsNullOrWhiteSpace(path))
+            return;
+
+        string deviceId = device.ID;
+
+        Task.Run(async () =>
+        {
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                if (!Data.Settings.AutoOpen || Data.DevicesObject.Current?.ID != deviceId)
+                    return;
+
+                string realPath = FolderHelper.FolderExists(path, showError: false);
+                if (!string.IsNullOrEmpty(realPath))
+                {
+                    App.Current?.Dispatcher.Invoke(() =>
+                    {
+                        if (Data.DevicesObject.Current?.ID == deviceId)
+                            Data.RuntimeSettings.LocationToNavigate = new(realPath);
+                    });
+                    return;
+                }
+
+                await Task.Delay(1000);
+            }
+        });
     }
 
     public static void ConnectWsaDevice()

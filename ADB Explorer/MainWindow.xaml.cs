@@ -1198,11 +1198,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         FileActionLogic.ClearExplorer(false);
         FileActions.IsDriveViewVisible = true;
+        FileActions.IsExplorerVisible = false;
         UpdateFileOp();
 
         NavigationBox.Mode = NavigationBox.ViewMode.Breadcrumbs;
         NavigationBox.Path = AdbLocation.StringFromLocation(Navigation.SpecialLocation.DriveView);
         NavHistory.Navigate(Navigation.SpecialLocation.DriveView);
+        Settings.LastDevicePath = "";
+        Settings.SetLastDevicePath(DevicesObject.Current?.ID, null);
 
         DriveList.ItemsSource = DevicesObject.Current.Drives;
         CurrentDrive = null;
@@ -1262,7 +1265,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (ConnectTimer.Interval == CONNECT_TIMER_INIT)
             ConnectTimer.Interval = CONNECT_TIMER_INTERVAL;
 
-        if (Settings.PollDevices && !RuntimeSettings.IsPollingStopped && DeviceRefreshMutex.Wait(0))
+        bool deferBackgroundPolling = RuntimeSettings.IsPollingStopped || FileOpQ.HasRunningSyncOperations;
+
+        if (Settings.PollDevices && !deferBackgroundPolling && DeviceRefreshMutex.Wait(0))
         {
             Task.Run(() =>
             {
@@ -1284,7 +1289,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             try
             {
-                if (RuntimeSettings.IsPollingStopped)
+                if (deferBackgroundPolling)
                     return;
 
                 if (Settings.PollBattery)
@@ -1371,6 +1376,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         ExplorerGrid.Focus();
         CurrentPath = realPath;
+        if (DevicesObject.Current is not null)
+        {
+            Settings.LastDevicePath = realPath;
+            Settings.SetLastDevicePath(DevicesObject.Current.ID, realPath);
+        }
 
         NavigationBox.Path = realPath == RECYCLE_PATH ? AdbLocation.StringFromLocation(Navigation.SpecialLocation.RecycleBin) : realPath;
         ParentPath = FileHelper.GetParentPath(CurrentPath);

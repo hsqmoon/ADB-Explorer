@@ -88,13 +88,5 @@ namespace ADB_Explorer.Properties {
             }
         }
         
-        /// <summary>
-        ///   Looks up a localized string similar to E:\Log\log.txt.
-        /// </summary>
-        public static string DragDropLogPath {
-            get {
-                return ResourceManager.GetString("DragDropLogPath", resourceCulture);
-            }
-        }
     }
 }

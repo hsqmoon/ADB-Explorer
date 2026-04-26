@@ -10,7 +10,10 @@ namespace ADB_Explorer;
 public partial class App : Application
 {
     private static string SettingsFilePath;
-    private static string CrashLogPath => Path.Combine(Data.AppDataPath, "crash.log");
+    private static string AppRootPath => AppContext.BaseDirectory;
+    private static string ConfigDirectoryPath => Path.Combine(AppRootPath, "config");
+    private static string LogDirectoryPath => Path.Combine(AppRootPath, "log");
+    private static string CrashLogPath => Path.Combine(LogDirectoryPath, "crash.log");
     private static readonly JsonSerializerSettings JsonSettings = new() { TypeNameHandling = TypeNameHandling.None };
 
     private void Application_Startup(object sender, StartupEventArgs e)
@@ -21,7 +24,7 @@ public partial class App : Application
         AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
         TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
 
-        // Similar to %LocalAppData%\ADB Explorer (but avoids virtualization for Store versions)
+        // Runtime app data used for transient cleanup only.
         Data.AppDataPath = Path.Combine(Environment.GetEnvironmentVariable("USERPROFILE"), "AppData", "Local", AdbExplorerConst.APP_DATA_FOLDER);
 
         if (e.Args.Length > 0)
@@ -38,7 +41,7 @@ public partial class App : Application
             SettingsFilePath = Path.GetFullPath(e.Args[0]);
         }
         else
-            SettingsFilePath = FileHelper.ConcatPaths(Data.AppDataPath, AdbExplorerConst.APP_SETTINGS_FILE, '\\');
+            SettingsFilePath = Path.Combine(ConfigDirectoryPath, AdbExplorerConst.APP_SETTINGS_FILE);
         
         try
         {
@@ -50,8 +53,7 @@ public partial class App : Application
             }
             else
             {
-                if (!Directory.Exists(Data.AppDataPath))
-                    Directory.CreateDirectory(Data.AppDataPath);
+                EnsurePersistenceDirectories();
 
                 using IsolatedStorageFileStream stream = new(AdbExplorerConst.APP_SETTINGS_FILE,
                                                              FileMode.Open,
@@ -69,6 +71,7 @@ public partial class App : Application
 #if !DEPLOY
             DebugLog.Initialize();
 #endif
+            TerminalLog.Initialize();
 
         }
         catch
@@ -148,6 +151,10 @@ public partial class App : Application
 
         try
         {
+            var settingsDirectory = Path.GetDirectoryName(SettingsFilePath);
+            if (!string.IsNullOrWhiteSpace(settingsDirectory))
+                Directory.CreateDirectory(settingsDirectory);
+
             using StreamWriter writer = new(SettingsFilePath);
 
             foreach (string key in from string key in Properties.Keys
@@ -221,8 +228,7 @@ public partial class App : Application
     {
         try
         {
-            if (!Directory.Exists(Data.AppDataPath))
-                Directory.CreateDirectory(Data.AppDataPath);
+            EnsurePersistenceDirectories();
 
             StringBuilder message = new();
             message.AppendLine(new string('=', 80));
@@ -239,5 +245,11 @@ public partial class App : Application
         }
         catch
         { }
+    }
+
+    private static void EnsurePersistenceDirectories()
+    {
+        Directory.CreateDirectory(ConfigDirectoryPath);
+        Directory.CreateDirectory(LogDirectoryPath);
     }
 }

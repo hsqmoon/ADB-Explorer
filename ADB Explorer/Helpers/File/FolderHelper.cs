@@ -42,7 +42,7 @@ public static class FolderHelper
         Data.RuntimeSettings.RefreshBreadcrumbs = true;
     }
 
-    public static string FolderExists(string path)
+    public static string FolderExists(string path, bool showError = true)
     {
         if (path == AdbLocation.StringFromLocation(Navigation.SpecialLocation.PackageDrive))
             return path;
@@ -56,7 +56,7 @@ public static class FolderHelper
         }
         catch (Exception e)
         {
-            if (path != AdbExplorerConst.RECYCLE_PATH)
+            if (showError && path != AdbExplorerConst.RECYCLE_PATH)
                 DialogService.ShowMessage(e.Message, Strings.Resources.S_NAV_ERR_TITLE, DialogService.DialogIcon.Critical, copyToClipboard: true);
 
             return null;
