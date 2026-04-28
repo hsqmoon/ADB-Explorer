@@ -117,12 +117,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private FileToIconConverter FileToIcon;
     private DateTime appDataClick;
     private readonly DragWindow dw = new();
+    private readonly Queue<Log> pendingLogEntries = new();
     private readonly Queue<string> pendingTerminalChunks = new();
     private readonly HashSet<Key> activeTerminalShortcutKeys = [];
+    private readonly object pendingLogEntriesLock = new();
     private const string TERMINAL_HOST_NAME = "terminal.adb-explorer.invalid";
     private bool isTerminalWebViewInitialized;
     private bool isTerminalPageReady;
     private bool isTerminalFocused;
+    private bool isDeviceFilterRefreshScheduled;
+    private bool isExplorerContextMenuRefreshScheduled;
+    private bool isFileOpControlsRefreshScheduled;
+    private bool isLogRefreshScheduled;
+    private bool isMainToolBarRefreshScheduled;
+    private bool rebuildLogRequested;
+    private bool isSettingsControlsRefreshScheduled;
     private bool terminalShortcutArmed;
     private string terminalSelectionCache = "";
     private string TerminalHostFolder => Path.Combine(AppContext.BaseDirectory, "Assets", "Terminal");
@@ -342,13 +351,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void UIList_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
     {
-        FilterDevices();
+        ScheduleFilterDevices();
     }
 
     private void DevicesObject_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(DevicesObject.UIList))
-            FilterDevices();
+            ScheduleFilterDevices();
     }
 
     private void ServerWatchdogTimer_Tick(object sender, EventArgs e)
@@ -366,7 +375,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        Dispatcher.Invoke(() =>
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        void HandlePropertyChange()
         {
             switch (e.PropertyName)
             {
@@ -478,7 +490,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                         Terminal.EnableMainDeviceFollow();
                         _ = EnsureTerminalWebViewReadyAsync();
                         _ = Terminal.EnsureConnectedToCurrentDeviceAsync();
-                        Dispatcher.BeginInvoke(FocusTerminalInput);
+                        _ = Dispatcher.BeginInvoke(FocusTerminalInput);
                     }
                     else
                     {
@@ -509,20 +521,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     break;
 
                 case nameof(AppRuntimeSettings.FilterDevices):
-                    FilterDevices();
+                    ScheduleFilterDevices();
                     break;
 
                 case nameof(AppRuntimeSettings.FilterActions):
-                    Task.Run(() =>
-                    {
-                        if (FileActions.IsAppDrive || FileActions.IsRecycleBin || DevicesObject.Current is null)
-                            FilterFileActions();
-                    });
-                    Task.Run(() =>
-                    {
-                        FilterExplorerContextMenu();
-                        ExplorerContextMenu.UpdateSeparators();
-                    });
+                    if (FileActions.IsAppDrive || FileActions.IsRecycleBin || DevicesObject.Current is null)
+                        FilterFileActions();
+                    ScheduleExplorerContextMenuRefresh();
                     break;
 
                 case nameof(AppRuntimeSettings.ClearNavBox):
@@ -542,7 +547,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     break;
 
                 case nameof(AppRuntimeSettings.RefreshFileOpControls):
-                    FileOpControlsMenu.Items.Refresh();
+                    ScheduleFileOpControlsRefresh();
                     break;
 
                 case nameof(AppRuntimeSettings.ClearLogs):
@@ -550,7 +555,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     break;
 
                 case nameof(AppRuntimeSettings.RefreshSettingsControls):
-                    SettingsControlsMenu.Items.Refresh();
+                    ScheduleSettingsControlsRefresh();
                     break;
 
                 case nameof(AppRuntimeSettings.SortFileOps):
@@ -573,13 +578,102 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     NavigationBox.Refresh();
                     break;
             }
-        });
+        }
+
+        if (Dispatcher.CheckAccess())
+            HandlePropertyChange();
+        else
+            _ = Dispatcher.BeginInvoke((Action)HandlePropertyChange, DispatcherPriority.Background);
     }
 
     private void ClearNavBox()
     {
         NavigationBox.Path = null;
         NavigationBox.Mode = NavigationBox.ViewMode.None;
+    }
+
+    private void ScheduleFileOpControlsRefresh()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleFileOpControlsRefresh), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isFileOpControlsRefreshScheduled)
+            return;
+
+        isFileOpControlsRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                FileOpControlsMenu.Items.Refresh();
+            }
+            finally
+            {
+                isFileOpControlsRefreshScheduled = false;
+            }
+        }), DispatcherPriority.Background);
+    }
+
+    private void ScheduleSettingsControlsRefresh()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleSettingsControlsRefresh), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isSettingsControlsRefreshScheduled)
+            return;
+
+        isSettingsControlsRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                SettingsControlsMenu.Items.Refresh();
+            }
+            finally
+            {
+                isSettingsControlsRefreshScheduled = false;
+            }
+        }), DispatcherPriority.Background);
+    }
+
+    private void ScheduleMainToolBarRefresh()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleMainToolBarRefresh), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isMainToolBarRefreshScheduled)
+            return;
+
+        isMainToolBarRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                MainToolBar.Items?.Refresh();
+            }
+            finally
+            {
+                isMainToolBarRefreshScheduled = false;
+            }
+        }), DispatcherPriority.Background);
     }
 
     private void SettingsSearchBox_FocusChanged(object sender, RoutedEventArgs e)
@@ -598,7 +692,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             case nameof(FileActionsEnable.RefreshPackages) when FileActions.RefreshPackages:
                 if (FileActions.IsAppDrive)
                 {
-                    Dispatcher.Invoke(() => _navigateToPath(CurrentPath));
+                    if (Dispatcher.CheckAccess())
+                        _navigateToPath(CurrentPath);
+                    else
+                        _ = Dispatcher.BeginInvoke(new Action(() => _navigateToPath(CurrentPath)));
+
                     FileActions.RefreshPackages = false;
                 }
 
@@ -622,7 +720,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             case nameof(FileActionsEnable.PasteEnabled):
                 FilterFileActions();
-                FilterExplorerContextMenu();
+                ScheduleExplorerContextMenuRefresh();
 
                 break;
         }
@@ -645,7 +743,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (e.PropertyName is nameof(FileOperationQueue.CurrentChanged))
         {
             SortFileOps();
-            Task.Run(FileActionLogic.UpdateFileOpControls);
+            FileActionLogic.UpdateFileOpControls();
         }
 
         if (!FileOpQ.IsActive)
@@ -683,7 +781,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void UpdateFileOp(bool onlyProgress = true)
     {
         if (!onlyProgress)
-            Task.Run(FileActionLogic.UpdateFileOpControls);
+            FileActionLogic.UpdateFileOpControls();
 
         if (FileOpQ.AnyFailedOperations)
             TaskbarItemInfo.ProgressState = TaskbarItemProgressState.Error;
@@ -703,26 +801,88 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (Dispatcher.HasShutdownStarted)
             return;
 
-        Dispatcher.Invoke(() =>
+        lock (pendingLogEntriesLock)
         {
-            if (Dispatcher.HasShutdownStarted)
-                return;
-
-            LogControlsPanel.Items.Refresh();
-
             if (e.Action is NotifyCollectionChangedAction.Add && e.NewItems is not null && !RuntimeSettings.IsLogPaused)
             {
-                string text = string.Join(Environment.NewLine, e.NewItems.Cast<Log>().Select(item => item.ToString()));
-                if (!string.IsNullOrEmpty(text))
-                    LogTextBox.AppendText($"{text}{Environment.NewLine}");
-
-                TrimLogTextBox();
-                LogTextBox.CaretIndex = LogTextBox.Text.Length;
-                LogTextBox.ScrollToEnd();
+                foreach (var item in e.NewItems.Cast<Log>())
+                {
+                    pendingLogEntries.Enqueue(item);
+                }
             }
             else
-                RebuildLogTextBox();
-        });
+            {
+                pendingLogEntries.Clear();
+                rebuildLogRequested = true;
+            }
+        }
+
+        ScheduleLogUiUpdate();
+    }
+
+    private void ScheduleLogUiUpdate()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleLogUiUpdate), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isLogRefreshScheduled)
+            return;
+
+        isLogRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(ProcessPendingLogUiUpdates), DispatcherPriority.Background);
+    }
+
+    private void ProcessPendingLogUiUpdates()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        Queue<Log> logBatch = new();
+        bool shouldRebuild;
+
+        lock (pendingLogEntriesLock)
+        {
+            while (pendingLogEntries.Count > 0)
+            {
+                logBatch.Enqueue(pendingLogEntries.Dequeue());
+            }
+
+            shouldRebuild = rebuildLogRequested;
+            rebuildLogRequested = false;
+            isLogRefreshScheduled = false;
+        }
+
+        LogControlsPanel.Items.Refresh();
+
+        if (shouldRebuild)
+        {
+            RebuildLogTextBox();
+        }
+        else if (logBatch.Count > 0)
+        {
+            string text = string.Join(Environment.NewLine, logBatch.Select(item => item.ToString()));
+            if (!string.IsNullOrEmpty(text))
+                LogTextBox.AppendText($"{text}{Environment.NewLine}");
+
+            TrimLogTextBox();
+            LogTextBox.CaretIndex = LogTextBox.Text.Length;
+            LogTextBox.ScrollToEnd();
+        }
+
+        bool shouldScheduleAnotherPass;
+        lock (pendingLogEntriesLock)
+        {
+            shouldScheduleAnotherPass = !isLogRefreshScheduled && (rebuildLogRequested || pendingLogEntries.Count > 0);
+        }
+
+        if (shouldScheduleAnotherPass)
+            ScheduleLogUiUpdate();
     }
 
     private void TrimLogTextBox()
@@ -806,56 +966,68 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 if (Settings.SaveDevices && !DevicesObject.HistoryDeviceViewModels.Any())
                     DevicesObject.RetrieveHistoryDevices();
 
-                FilterDevices();
+                ScheduleFilterDevices();
                 break;
         }
     }
 
-    private void DirectoryLister_PropertyChanged(object sender, PropertyChangedEventArgs e) => Dispatcher.Invoke(() =>
+    private void DirectoryLister_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        switch (e.PropertyName)
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        void HandlePropertyChange()
         {
-            case nameof(DirectoryLister.IsProgressVisible):
-                UnfinishedBlock.Visible(DirList.IsProgressVisible);
-                NavigationBox.IsLoadingProgressVisible = DirList.IsProgressVisible;
-                break;
-
-            case nameof(DirectoryLister.InProgress):
+            switch (e.PropertyName)
             {
-                Task.Run(() =>
+                case nameof(DirectoryLister.IsProgressVisible):
+                    UnfinishedBlock.Visible(DirList.IsProgressVisible);
+                    NavigationBox.IsLoadingProgressVisible = DirList.IsProgressVisible;
+                    break;
+
+                case nameof(DirectoryLister.InProgress):
                 {
-                    if (!DirList.InProgress)
-                        Task.Delay(EMPTY_FOLDER_NOTICE_DELAY);
+                    bool inProgress = DirList.InProgress;
+                    _ = Task.Run(async () =>
+                    {
+                        if (!inProgress)
+                            await Task.Delay(EMPTY_FOLDER_NOTICE_DELAY);
 
-                    Dispatcher.Invoke(() => FileActions.ListingInProgress = DirList.InProgress);
-                });
+                        _ = Dispatcher.BeginInvoke(new Action(() => FileActions.ListingInProgress = inProgress));
+                    });
 
-                if (DirList.InProgress)
+                    if (inProgress)
+                        return;
+
+                    if (FileActions.IsRecycleBin)
+                    {
+                        TrashHelper.EnableRecycleButtons();
+                    }
+
+                    break;
+                }
+                case nameof(DirectoryLister.IsLinkListingFinished) when ExplorerGrid.Items.Count < 1 || !DirList.IsLinkListingFinished:
                     return;
 
-                if (FileActions.IsRecycleBin)
+                case nameof(DirectoryLister.IsLinkListingFinished) when bfNavigation
+                    && !string.IsNullOrEmpty(prevPath) && DirList.FileList.FirstOrDefault(item => item.FullPath == prevPath) is var prevItem and not null:
+                    FileActions.ItemToSelect = prevItem;
+                    break;
+
+                case nameof(DirectoryLister.IsLinkListingFinished):
                 {
-                    TrashHelper.EnableRecycleButtons();
+                    if (ExplorerGrid.Items.Count > 0)
+                        ExplorerGrid.ScrollIntoView(ExplorerGrid.Items[0]);
+                    break;
                 }
-
-                break;
-            }
-            case nameof(DirectoryLister.IsLinkListingFinished) when ExplorerGrid.Items.Count < 1 || !DirList.IsLinkListingFinished:
-                return;
-
-            case nameof(DirectoryLister.IsLinkListingFinished) when bfNavigation
-                && !string.IsNullOrEmpty(prevPath) && DirList.FileList.FirstOrDefault(item => item.FullPath == prevPath) is var prevItem and not null:
-                FileActions.ItemToSelect = prevItem;
-                break;
-
-            case nameof(DirectoryLister.IsLinkListingFinished):
-            {
-                if (ExplorerGrid.Items.Count > 0)
-                    ExplorerGrid.ScrollIntoView(ExplorerGrid.Items[0]);
-                break;
             }
         }
-    });
+
+        if (Dispatcher.CheckAccess())
+            HandlePropertyChange();
+        else
+            _ = Dispatcher.BeginInvoke((Action)HandlePropertyChange, DispatcherPriority.Background);
+    }
 
     private void ThemeService_PropertyChanged(object sender, PropertyChangedEventArgs e) =>
         Dispatcher.Invoke(SetTheme);
@@ -1083,7 +1255,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FileActions.SelectedItemsCount = FileActions.IsAppDrive ? SelectedPackages.Count() : SelectedFiles.Count();
 
         FileActionLogic.UpdateFileActions();
-        MainToolBar.Items?.Refresh();
+        ScheduleMainToolBarRefresh();
         PasteGrid.Visibility = Visibility.Visible;
 
         SelectionTimer.Stop();
@@ -1092,9 +1264,38 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     /// <summary>
     /// Refresh file actions menu to update their ToolTips
     /// </summary>
-    private void FilterFileActions() => Dispatcher.Invoke(() => MainToolBar.Items?.Refresh());
+    private void FilterFileActions() => ScheduleMainToolBarRefresh();
 
-    private void FilterExplorerContextMenu() => Dispatcher.Invoke(() =>
+    private void ScheduleExplorerContextMenuRefresh()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleExplorerContextMenuRefresh), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isExplorerContextMenuRefreshScheduled)
+            return;
+
+        isExplorerContextMenuRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                FilterExplorerContextMenu();
+                ExplorerContextMenu.UpdateSeparators();
+            }
+            finally
+            {
+                isExplorerContextMenuRefreshScheduled = false;
+            }
+        }), DispatcherPriority.Background);
+    }
+
+    private void FilterExplorerContextMenu()
     {
         var collectionView = CollectionViewSource.GetDefaultView(ExplorerGrid.ContextMenu.ItemsSource);
         if (collectionView is null)
@@ -1111,7 +1312,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         };
 
         collectionView.Filter = predicate;
-    });
+    }
 
     private void Window_MouseDown(object sender, MouseButtonEventArgs e)
     {
@@ -1121,7 +1322,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void LaunchSequence()
     {
         if (!HasSavedWindowBounds)
-            Dispatcher.BeginInvoke(ApplyDefaultLaunchSize);
+            _ = Dispatcher.BeginInvoke(ApplyDefaultLaunchSize);
 
         LoadSettings();
         InitFileOpColumns();
@@ -1131,6 +1332,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateFileOpFilterCheck();
 
         FileToIcon = new();
+    }
+
+    private void ScheduleFilterDevices()
+    {
+        if (Dispatcher.HasShutdownStarted)
+            return;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(ScheduleFilterDevices), DispatcherPriority.Background);
+            return;
+        }
+
+        if (isDeviceFilterRefreshScheduled)
+            return;
+
+        isDeviceFilterRefreshScheduled = true;
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            isDeviceFilterRefreshScheduled = false;
+            FilterDevices();
+        }), DispatcherPriority.Background);
     }
 
     private void FilterDevices() => DeviceHelper.FilterDevices(CollectionViewSource.GetDefaultView(DevicesList.ItemsSource));
@@ -1161,7 +1384,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             MainToolBar.ItemsSource = Services.MainToolBar.List;
             FileActionLogic.UpdateFileActions();
 
-            FilterDevices();
+            ScheduleFilterDevices();
 
             FileActions.IsLogToggleVisible.Value = Settings.EnableLog;
         });
@@ -1234,7 +1457,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         UpdateFileOp();
 
-        Task.Delay(EXPLORER_NAV_DELAY).ContinueWith(_ => Dispatcher.Invoke(() => RuntimeSettings.IsExplorerLoaded = true));
+        Task.Delay(EXPLORER_NAV_DELAY).ContinueWith(task =>
+        {
+            _ = Dispatcher.BeginInvoke(new Action(() => RuntimeSettings.IsExplorerLoaded = true));
+        });
 
         return _navigateToPath(realPath);
     }
@@ -1266,9 +1492,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ConnectTimer.Interval = CONNECT_TIMER_INTERVAL;
 
         bool deferBackgroundPolling = RuntimeSettings.IsPollingStopped || FileOpQ.HasRunningSyncOperations;
+        bool startedDeviceRefresh = false;
 
         if (Settings.PollDevices && !deferBackgroundPolling && DeviceRefreshMutex.Wait(0))
         {
+            startedDeviceRefresh = true;
             Task.Run(() =>
             {
                 try
@@ -1289,7 +1517,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             try
             {
-                if (deferBackgroundPolling)
+                if (deferBackgroundPolling || startedDeviceRefresh || DeviceRefreshMutex.CurrentCount == 0)
                     return;
 
                 if (Settings.PollBattery)
@@ -1299,12 +1527,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
                 if (FileActions.IsDriveViewVisible && Settings.PollDrives)
                 {
-                    try
-                    {
-                        Dispatcher.Invoke(() => FileActionLogic.RefreshDrives(true));
-                    }
-                    catch
-                    { }
+                    _ = Dispatcher.BeginInvoke(new Action(() => FileActionLogic.RefreshDrives(true)));
                 }
 
                 if (RuntimeSettings.IsDevicesPaneOpen)
@@ -1323,17 +1546,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void RefreshDevices()
     {
-        Dispatcher.BeginInvoke(new Action<IEnumerable<LogicalDevice>>(ListDevices), ADBService.GetDevices()).Wait();
+        var devices = ADBService.GetDevices();
+        _ = Dispatcher.BeginInvoke(new Action<IEnumerable<LogicalDevice>>(ListDevices), devices);
 
         Task.Run(DeviceHelper.ConnectWsaDevice);
 
         if (!RuntimeSettings.IsDevicesPaneOpen)
             return;
 
-        Dispatcher.Invoke(DevicesObject.UpdateLogicalIp);
+        _ = Dispatcher.BeginInvoke(new Action(DevicesObject.UpdateLogicalIp));
 
         if (MdnsService.State is MDNS.MdnsState.Running)
-            Dispatcher.BeginInvoke(new Action<IEnumerable<ServiceDevice>>(DeviceHelper.ListServices), WiFiPairingService.GetServices()).Wait();
+        {
+            var services = WiFiPairingService.GetServices();
+            _ = Dispatcher.BeginInvoke(new Action<IEnumerable<ServiceDevice>>(DeviceHelper.ListServices), services);
+        }
     }
 
     public bool NavigateToPath(FileClass file)
@@ -2446,23 +2673,23 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         if (ExplorerGrid.SelectedItems.Count == 1 && WasSelected && !WasEditing)
         {
-            Task.Run(() =>
+            _ = Task.Run(async () =>
             {
                 var start = DateTime.Now;
 
                 while (true)
                 {
-                    Task.Delay(100);
+                    await Task.Delay(100);
 
                     if (DateTime.Now - start > RENAME_CLICK_DELAY)
                         break;
 
-                    var currentPath = Dispatcher.Invoke(() => ((FileClass)ExplorerGrid.SelectedItem)?.FullPath);
+                    var currentPath = await Dispatcher.InvokeAsync(() => ((FileClass)ExplorerGrid.SelectedItem)?.FullPath);
                     if (ClickCount > 1 || currentPath != path)
                         return;
                 }
 
-                Dispatcher.Invoke(() =>
+                await Dispatcher.InvokeAsync(() =>
                 {
                     cell.IsEditing = true;
                     FileActions.IsExplorerEditing = true;
@@ -2846,7 +3073,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         LogTerminalUiDiagnostic("mouse.up", $"focused={IsTerminalFocused()}; armed={terminalShortcutArmed}; searchVisible={IsTerminalSearchVisible}; searchBoxFocused={TerminalSearchTextBox?.IsKeyboardFocusWithin == true}");
 
         if (!(TerminalSearchTextBox?.IsKeyboardFocusWithin ?? false))
-            Dispatcher.BeginInvoke(async () => await FocusTerminalInputAsync(), DispatcherPriority.Input);
+            _ = Dispatcher.BeginInvoke(async () => await FocusTerminalInputAsync(), DispatcherPriority.Input);
     }
 
     private void TerminalWebView_NavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)

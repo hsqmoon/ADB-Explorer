@@ -47,13 +47,16 @@ public static class ShellFileOperation
 
     public static void DeleteItems(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
     {
+        List<FileOperation> operations = [];
+
         foreach (var item in items)
         {
             var fileOp = new FileDeleteOperation(dispatcher, device, item);
             fileOp.PropertyChanged += DeleteFileOp_PropertyChanged;
-
-            Data.FileOpQ.AddOperation(fileOp);
+            operations.Add(fileOp);
         }
+
+        Data.FileOpQ.AddOperations(operations);
     }
 
     private static void DeleteFileOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -78,7 +81,7 @@ public static class ShellFileOperation
             if (op.TargetPath.ParentPath == Data.CurrentPath)
             {
                 Data.DirList.FileList.Remove(op.FilePath);
-                FileActionLogic.UpdateFileActions();
+                FileActionLogic.ScheduleUpdateFileActions();
             }
         }
 
@@ -107,7 +110,10 @@ public static class ShellFileOperation
             var file = Data.DirList.FileList.Find(f => f.FullPath == op.FilePath.FullPath);
 
             // update UI when on current device and current path
-            op.Dispatcher.Invoke(() => file.UpdatePath(op.TargetPath.FullPath));
+            if (op.Dispatcher.CheckAccess())
+                file.UpdatePath(op.TargetPath.FullPath);
+            else
+                _ = op.Dispatcher.BeginInvoke(new Action(() => file.UpdatePath(op.TargetPath.FullPath)));
 
             if (Data.SelectedFiles.Count() == 1 && Data.SelectedFiles.First() == file)
                 Data.FileActions.ItemToSelect = null;
@@ -298,14 +304,14 @@ public static class ShellFileOperation
                             Data.FileActions.ItemToSelect = op.FilePath;
                     }
 
-                    FileActionLogic.UpdateFileActions();
+                    FileActionLogic.ScheduleUpdateFileActions();
                 }
 
                 // update UI when cut / restore / recycle source is current path
                 else if (op.FilePath.ParentPath == Data.CurrentPath && op.OperationName is not FileOperation.OperationType.Copy)
                 {
                     Data.DirList.FileList.Remove(op.FilePath);
-                    FileActionLogic.UpdateFileActions();
+                    FileActionLogic.ScheduleUpdateFileActions();
                 }
             }
 
@@ -397,35 +403,44 @@ public static class ShellFileOperation
 
     public static void InstallPackages(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
     {
+        List<FileOperation> operations = [];
+
         foreach (var item in items)
         {
             var op = new PackageInstallOperation(dispatcher, device, item);
             op.PropertyChanged += InstallOp_PropertyChanged;
-
-            Data.FileOpQ.AddOperation(op);
+            operations.Add(op);
         }
+
+        Data.FileOpQ.AddOperations(operations);
     }
 
     public static void PushPackages(ADBService.AdbDevice device, IEnumerable<ShellItem> items, Dispatcher dispatcher)
     {
+        List<FileOperation> operations = [];
+
         foreach (var item in items.Select(file => new FilePath(file)))
         {
             var op = new PackageInstallOperation(dispatcher, device, new(item), pushPackage: true);
             op.PropertyChanged += InstallOp_PropertyChanged;
-            
-            Data.FileOpQ.AddOperation(op);
+            operations.Add(op);
         }
+
+        Data.FileOpQ.AddOperations(operations);
     }
 
     public static void UninstallPackages(ADBService.AdbDevice device, IEnumerable<string> packages, Dispatcher dispatcher)
     {
+        List<FileOperation> operations = [];
+
         foreach (var item in packages)
         {
             var op = new PackageInstallOperation(dispatcher, device, packageName: item);
             op.PropertyChanged += InstallOp_PropertyChanged;
-
-            Data.FileOpQ.AddOperation(op);
+            operations.Add(op);
         }
+
+        Data.FileOpQ.AddOperations(operations);
     }
 
     private static void InstallOp_PropertyChanged(object sender, PropertyChangedEventArgs e)

@@ -9,6 +9,20 @@ namespace ADB_Explorer.Helpers;
 
 public static class DeviceHelper
 {
+    private static readonly TimeSpan WsaInstallCheckCacheDuration = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan RootStatusUpdateInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WsaStatusUpdateInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WsaConnectAttemptInterval = TimeSpan.FromSeconds(5);
+    private static readonly object WsaInstallCheckLock = new();
+    private static DateTime lastWsaInstallCheck = DateTime.MinValue;
+    private static DateTime lastRootStatusUpdate = DateTime.MinValue;
+    private static DateTime lastWsaStatusUpdate = DateTime.MinValue;
+    private static DateTime lastWsaConnectAttempt = DateTime.MinValue;
+    private static bool? cachedWsaInstalled;
+    private static int isRootStatusUpdateRunning;
+    private static int isWsaConnectRunning;
+    private static int isWsaStatusUpdateRunning;
+
     public static DeviceStatus GetStatus(string status) => status switch
     {
         "device" or "recovery" or "sideload" => DeviceStatus.Ok,
@@ -217,7 +231,7 @@ public static class DeviceHelper
         {
             try
             {
-                ADBService.KillEmulator(device.ID);
+                await Task.Run(() => ADBService.KillEmulator(device.ID));
             }
             catch (Exception ex)
             {
@@ -229,7 +243,7 @@ public static class DeviceHelper
         {
             try
             {
-                ADBService.DisconnectNetworkDevice(device.ID);
+                await Task.Run(() => ADBService.DisconnectNetworkDevice(device.ID));
                 EnsureHistoryDevice((LogicalDeviceViewModel)device);
             }
             catch (Exception ex)
@@ -413,18 +427,29 @@ public static class DeviceHelper
 
     public static void UpdateDevicesBatInfo()
     {
-        var currentDevice = App.Current?.Dispatcher.Invoke(() => Data.DevicesObject.Current);
+        LogicalDeviceViewModel currentDevice = null;
+        List<LogicalDeviceViewModel> items = [];
+        var dispatcher = App.Current?.Dispatcher;
+        if (dispatcher is not null)
+        {
+            void captureDevices()
+            {
+                currentDevice = Data.DevicesObject.Current;
+                items = [.. Data.DevicesObject.LogicalDeviceViewModels
+                    .Where(device => !device.IsOpen && device.Status is DeviceStatus.Ok)];
+            }
+
+            if (dispatcher.CheckAccess())
+                captureDevices();
+            else
+                dispatcher.Invoke(captureDevices);
+        }
+
         if (currentDevice?.Status is DeviceStatus.Ok)
             currentDevice.UpdateBattery();
 
         if (DateTime.Now - Data.DevicesObject.LastUpdate <= AdbExplorerConst.BATTERY_UPDATE_INTERVAL && !Data.RuntimeSettings.IsDevicesPaneOpen)
             return;
-
-        var items = App.Current?.Dispatcher.Invoke(() =>
-            Data.DevicesObject.LogicalDeviceViewModels
-                .Where(device => !device.IsOpen && device.Status is DeviceStatus.Ok)
-                .ToList())
-            ?? [];
 
         foreach (var item in items)
         {
@@ -489,18 +514,33 @@ public static class DeviceHelper
 
     public static void UpdateDevicesRootAccess()
     {
+        if (DateTime.Now - lastRootStatusUpdate < RootStatusUpdateInterval
+            || Interlocked.Exchange(ref isRootStatusUpdateRunning, 1) == 1)
+            return;
+
         var devices = Data.DevicesObject.LogicalDeviceViewModels.Where(d => d.Root is RootStatus.Unchecked).ToList();
-        foreach (var device in devices)
+        Task.Run(() =>
         {
-            bool root = ADBService.WhoAmI(device.ID);
-            bool rootDisabled = Data.DevicesObject.RootDevices.Contains(device.ID);
-            App.Current?.Dispatcher?.Invoke(() =>
+            try
             {
-                return device.SetRootStatus(root ? RootStatus.Enabled
-                    : rootDisabled ? RootStatus.Disabled
-                        : RootStatus.Unchecked);
-            });
-        }
+                foreach (var device in devices.Where(d => d.Status is DeviceStatus.Ok))
+                {
+                    bool? rootState = ADBService.TryGetRootState(device.ID);
+                    if (rootState is null)
+                        continue;
+
+                    _ = App.Current?.Dispatcher?.BeginInvoke(new Action(() => device.SetRootStatus(rootState.Value
+                        ? RootStatus.Enabled
+                        : RootStatus.Disabled)));
+                }
+
+                lastRootStatusUpdate = DateTime.Now;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref isRootStatusUpdateRunning, 0);
+            }
+        });
     }
 
     public static async void PairNewDevice()
@@ -613,7 +653,10 @@ public static class DeviceHelper
 
     public static void DeviceListSetup(string selectedAddress = "")
     {
-        Task.Run(ADBService.GetDevices).ContinueWith((t) => App.Current.Dispatcher.Invoke(() => DeviceListSetup(t.Result.Select(l => new LogicalDeviceViewModel(l)), selectedAddress)));
+        Task.Run(ADBService.GetDevices).ContinueWith((t) =>
+        {
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => DeviceListSetup(t.Result.Select(l => new LogicalDeviceViewModel(l)), selectedAddress)));
+        });
     }
 
     public static void DeviceListSetup(IEnumerable<LogicalDeviceViewModel> devices, string selectedAddress = "")
@@ -688,15 +731,18 @@ public static class DeviceHelper
                 Thread.Sleep(500);
             }
             return true;
-        }).ContinueWith(t => App.Current.Dispatcher.Invoke(() =>
+        }).ContinueWith(t =>
         {
-            if (!t.Result)
-                return;
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!t.Result)
+                    return;
 
-            Data.DevicesObject.SetOpenDevice(device);
-            Data.CurrentADBDevice = new(Data.DevicesObject.Current);
-            Data.RuntimeSettings.InitLister = true;
-        }));
+                Data.DevicesObject.SetOpenDevice(device);
+                Data.CurrentADBDevice = new(Data.DevicesObject.Current);
+                Data.RuntimeSettings.InitLister = true;
+            }));
+        });
     }
 
     public static void InitDevice()
@@ -742,10 +788,10 @@ public static class DeviceHelper
             if (t.IsCanceled)
                 return;
 
-            App.Current.Dispatcher.Invoke(() =>
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
             {
                 Data.DevicesObject.Current.SetAndroidVersion(t.Result);
-            });
+            }));
         });
     }
 
@@ -825,11 +871,11 @@ public static class DeviceHelper
                 string realPath = FolderHelper.FolderExists(path, showError: false);
                 if (!string.IsNullOrEmpty(realPath))
                 {
-                    App.Current?.Dispatcher.Invoke(() =>
+                    _ = App.Current?.Dispatcher.BeginInvoke(new Action(() =>
                     {
                         if (Data.DevicesObject.Current?.ID == deviceId)
                             Data.RuntimeSettings.LocationToNavigate = new(realPath);
-                    });
+                    }));
                     return;
                 }
 
@@ -840,45 +886,60 @@ public static class DeviceHelper
 
     public static void ConnectWsaDevice()
     {
-        if (Data.DevicesObject.UIList.OfType<WsaPkgDeviceViewModel>().Any(wsa => wsa.Status is not DeviceStatus.Unauthorized))
-            return;
-
-        if (Data.DevicesObject.LogicalDeviceViewModels.Any(dev => dev.Type is DeviceType.WSA && dev.Status is not DeviceStatus.Offline))
-            return;
-
-        var wsaPid = GetWsaPid();
-        if (wsaPid is null)
-            return;
-
-        var wsaIp = Network.GetWsaIp();
-        if (wsaIp is null)
-            return;
-
-        var retCode = ADBService.ExecuteCommand("cmd.exe",
-                                                "/C",
-                                                out string stdout,
-                                                out _,
-                                                Encoding.UTF8,
-                                                CancellationToken.None, "\"netstat", "-nao", "|", "findstr", $"{wsaPid.Value}\"");
-
-        if (retCode != 0)
-            return;
-
-        var match = AdbRegEx.RE_NETSTAT_TCP_SOCK().Match(stdout);
-        if (match.Groups?.Count < 2)
-            return;
-
-        var netstatIp = match.Groups["IP"].Value;
-        Data.DevicesObject.WsaPort = match.Groups["Port"].Value;
-        if (!AdbExplorerConst.LOOPBACK_ADDRESSES.Contains(netstatIp))
-            return;
-
-        Data.DevicesObject.CurrentNewDevice = new(new())
+        if (DateTime.Now - lastWsaConnectAttempt < WsaConnectAttemptInterval
+            || Interlocked.Exchange(ref isWsaConnectRunning, 1) == 1)
         {
-            IpAddress = AdbExplorerConst.WIN_LOOPBACK_ADDRESS,
-            ConnectPort = Data.DevicesObject.WsaPort,
-        };
-        Data.DevicesObject.CurrentNewDevice.ConnectCommand.Execute();
+            return;
+        }
+
+        lastWsaConnectAttempt = DateTime.Now;
+
+        try
+        {
+            if (Data.DevicesObject.UIList.OfType<WsaPkgDeviceViewModel>().Any(wsa => wsa.Status is not DeviceStatus.Unauthorized))
+                return;
+
+            if (Data.DevicesObject.LogicalDeviceViewModels.Any(dev => dev.Type is DeviceType.WSA && dev.Status is not DeviceStatus.Offline))
+                return;
+
+            var wsaPid = GetWsaPid();
+            if (wsaPid is null)
+                return;
+
+            var wsaIp = Network.GetWsaIp();
+            if (wsaIp is null)
+                return;
+
+            var retCode = ADBService.ExecuteCommand("cmd.exe",
+                                                    "/C",
+                                                    out string stdout,
+                                                    out _,
+                                                    Encoding.UTF8,
+                                                    CancellationToken.None, "\"netstat", "-nao", "|", "findstr", $"{wsaPid.Value}\"");
+
+            if (retCode != 0)
+                return;
+
+            var match = AdbRegEx.RE_NETSTAT_TCP_SOCK().Match(stdout);
+            if (match.Groups?.Count < 2)
+                return;
+
+            var netstatIp = match.Groups["IP"].Value;
+            Data.DevicesObject.WsaPort = match.Groups["Port"].Value;
+            if (!AdbExplorerConst.LOOPBACK_ADDRESSES.Contains(netstatIp))
+                return;
+
+            Data.DevicesObject.CurrentNewDevice = new(new())
+            {
+                IpAddress = AdbExplorerConst.WIN_LOOPBACK_ADDRESS,
+                ConnectPort = Data.DevicesObject.WsaPort,
+            };
+            Data.DevicesObject.CurrentNewDevice.ConnectCommand.Execute();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref isWsaConnectRunning, 0);
+        }
     }
 
     public static int? GetWsaPid() =>
@@ -886,6 +947,16 @@ public static class DeviceHelper
 
     private static bool IsWsaInstalled()
     {
+        lock (WsaInstallCheckLock)
+        {
+            if (cachedWsaInstalled is bool installed
+                && DateTime.Now - lastWsaInstallCheck < WsaInstallCheckCacheDuration)
+            {
+                return installed;
+            }
+        }
+
+        bool isInstalled = false;
         try
         {
             foreach (var pkg in new PackageManager().FindPackagesForUser("") ?? [])
@@ -893,7 +964,10 @@ public static class DeviceHelper
                 try
                 {
                     if (pkg.DisplayName?.Contains(AdbExplorerConst.WSA_PACKAGE_NAME, StringComparison.OrdinalIgnoreCase) is true)
-                        return true;
+                    {
+                        isInstalled = true;
+                        break;
+                    }
                 }
                 catch (COMException)
                 { }
@@ -902,49 +976,90 @@ public static class DeviceHelper
         catch
         { }
 
-        return false;
+        lock (WsaInstallCheckLock)
+        {
+            cachedWsaInstalled = isInstalled;
+            lastWsaInstallCheck = DateTime.Now;
+        }
+
+        return isInstalled;
     }
 
     public static void UpdateWsaPkgStatus()
     {
+        if (DateTime.Now - lastWsaStatusUpdate < WsaStatusUpdateInterval
+            || Interlocked.Exchange(ref isWsaStatusUpdateRunning, 1) == 1)
+            return;
+
         var wsa = Data.DevicesObject.UIList.OfType<WsaPkgDeviceViewModel>().FirstOrDefault();
         if (wsa is null)
+        {
+            Interlocked.Exchange(ref isWsaStatusUpdateRunning, 0);
             return;
+        }
 
         if (Data.DevicesObject.LogicalDeviceViewModels.Any(dev => dev.Type is DeviceType.WSA && dev.Status is not DeviceStatus.Offline))
+        {
+            Interlocked.Exchange(ref isWsaStatusUpdateRunning, 0);
             return;
+        }
 
         if (wsa.LastLaunch == DateTime.MaxValue || DateTime.Now - wsa.LastLaunch < AdbExplorerConst.WSA_LAUNCH_DELAY)
+        {
+            Interlocked.Exchange(ref isWsaStatusUpdateRunning, 0);
             return;
+        }
 
-        DeviceStatus newStatus;
         var oldStatus = wsa.Status;
-
-        if (oldStatus is DeviceStatus.Unauthorized && DateTime.Now - wsa.LastLaunch > AdbExplorerConst.WSA_CONNECT_TIMEOUT)
+        Task.Run(() =>
         {
-            if (wsa.LastLaunch == DateTime.MinValue)
+            try
             {
-                wsa.SetLastLaunch();
-                return;
+                DeviceStatus newStatus;
+                bool resetLaunchTime = false;
+
+                if (oldStatus is DeviceStatus.Unauthorized && DateTime.Now - wsa.LastLaunch > AdbExplorerConst.WSA_CONNECT_TIMEOUT)
+                {
+                    if (wsa.LastLaunch == DateTime.MinValue)
+                    {
+                        _ = App.Current?.Dispatcher?.BeginInvoke(new Action(() => wsa.SetLastLaunch()));
+                        return;
+                    }
+
+                    newStatus = DeviceStatus.Ok;
+                    resetLaunchTime = true;
+                }
+                else
+                {
+                    if (GetWsaPid() is not null)
+                        newStatus = DeviceStatus.Unauthorized;
+                    else if (IsWsaInstalled())
+                        newStatus = DeviceStatus.Ok;
+                    else
+                        newStatus = DeviceStatus.Offline;
+                }
+
+                lastWsaStatusUpdate = DateTime.Now;
+
+                if (newStatus != oldStatus || resetLaunchTime)
+                {
+                    _ = App.Current?.Dispatcher?.BeginInvoke(new Action(() =>
+                    {
+                        if (resetLaunchTime)
+                            wsa.SetLastLaunch(DateTime.MaxValue);
+
+                        if (newStatus != oldStatus)
+                        {
+                            wsa.SetStatus(newStatus);
+                            Data.RuntimeSettings.FilterDevices = true;
+                        }
+                    }));
+                }
             }
-
-            newStatus = DeviceStatus.Ok;
-            wsa.SetLastLaunch(DateTime.MaxValue);
-        }
-        else
-        {
-            if (GetWsaPid() is not null)
-                newStatus = DeviceStatus.Unauthorized;
-            else if (IsWsaInstalled())
-                newStatus = DeviceStatus.Ok;
-            else
-                newStatus = DeviceStatus.Offline;
-        }
-
-        if (newStatus != oldStatus)
-        {
-            App.Current.Dispatcher.Invoke(() => wsa.SetStatus(newStatus));
-            Data.RuntimeSettings.FilterDevices = true;
-        }
+            finally
+            {
+                Interlocked.Exchange(ref isWsaStatusUpdateRunning, 0);
+            }
+        });
     }
 }

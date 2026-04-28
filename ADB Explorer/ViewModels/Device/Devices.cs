@@ -7,6 +7,8 @@ namespace ADB_Explorer.ViewModels;
 
 public class Devices : AbstractDevice
 {
+    private int isLogicalIpUpdateRunning;
+
     #region Full properties
 
     private ObservableList<DeviceViewModel> uiDevices = new();
@@ -121,6 +123,7 @@ public class Devices : AbstractDevice
     {
         self.RemoveAll(thisDevice => thisDevice is ServiceDeviceViewModel && !other.Any(otherDevice => otherDevice.ID == thisDevice.ID));
 
+        List<ServiceDeviceViewModel> devicesToAdd = [];
         foreach (var item in other)
         {
             if (self?.Find(thisDevice => thisDevice.ID == item.ID) is ServiceDeviceViewModel service)
@@ -129,9 +132,11 @@ public class Devices : AbstractDevice
             }
             else
             {
-                self.Add(item);
+                devicesToAdd.Add(item);
             }
         }
+
+        self.AddRange(devicesToAdd);
     }
 
     public bool ServicesChanged(IEnumerable<ServiceDeviceViewModel> other)
@@ -180,6 +185,7 @@ public class Devices : AbstractDevice
         self.RemoveAll(devicesToRemove);
 
         // Then update existing devices' statuses and names
+        List<LogicalDeviceViewModel> devicesToAdd = [];
         foreach (var item in other)
         {
             if (self?.Find(thisDevice => thisDevice.ID == item.ID) is LogicalDeviceViewModel device)
@@ -195,10 +201,17 @@ public class Devices : AbstractDevice
             }
             else
             {
-                // And add the new devices
-                self.Add(item);
-                if (item.Status is DeviceStatus.Ok)
-                    Task.Run(() => ShellCommands.FindCommands(item.ID));
+                devicesToAdd.Add(item);
+            }
+        }
+
+        if (devicesToAdd.Count > 0)
+        {
+            self.AddRange(devicesToAdd);
+
+            foreach (var item in devicesToAdd.Where(item => item.Status is DeviceStatus.Ok))
+            {
+                Task.Run(() => ShellCommands.FindCommands(item.ID));
             }
         }
 
@@ -256,8 +269,18 @@ public class Devices : AbstractDevice
 
     public async void UpdateLogicalIp()
     {
-        if (await UpdateLogicalIp(UIList))
-            OnPropertyChanged(nameof(UIList));
+        if (Interlocked.Exchange(ref isLogicalIpUpdateRunning, 1) == 1)
+            return;
+
+        try
+        {
+            if (await UpdateLogicalIp(UIList))
+                OnPropertyChanged(nameof(UIList));
+        }
+        finally
+        {
+            Interlocked.Exchange(ref isLogicalIpUpdateRunning, 0);
+        }
     }
 
     public static async Task<bool> UpdateLogicalIp(ObservableList<DeviceViewModel> devices)

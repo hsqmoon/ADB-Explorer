@@ -24,7 +24,7 @@ internal static class AdbHelper
         {
             while (Data.MdnsService.State is MDNS.MdnsState.InProgress)
             {
-                App.Current.Dispatcher.Invoke(() => Data.MdnsService.UpdateProgress());
+                _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.MdnsService.UpdateProgress()));
 
                 await Task.Delay(AdbExplorerConst.MDNS_STATUS_UPDATE_INTERVAL);
             }

@@ -20,6 +20,16 @@ public partial class ADBService
 
     public static bool IsMdnsEnabled { get; set; }
 
+    private static void SetBackgroundPriority(Process process)
+    {
+        try
+        {
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+        }
+        catch
+        { }
+    }
+
     public class ProcessFailedException : Exception
     {
         public ProcessFailedException() { }
@@ -64,6 +74,7 @@ public partial class ADBService
             cmdProcess.StartInfo.EnvironmentVariables[ENABLE_MDNS] = "1";
         
         cmdProcess.Start();
+        SetBackgroundPriority(cmdProcess);
 
         Data.AddCommandLog($"{file} {arguments}");
 
@@ -124,6 +135,8 @@ public partial class ADBService
         }
         catch (OperationCanceledException)
         {
+            ProcessHandling.KillProcess(cmdProcess);
+
             processTask = null;
             stdoutTask = null;
             stderrTask = null;
@@ -276,7 +289,8 @@ public partial class ADBService
 
     public static IEnumerable<LogicalDevice> GetDevices()
     {
-        ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, CancellationToken.None, "-l");
+        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+        ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, cancellation.Token, "-l");
 
         return RE_DEVICE_NAME().Matches(stdout).Select(LogicalDevice.New).Where(d => d);
     }
@@ -391,13 +405,16 @@ public partial class ADBService
         return result;
     }
 
-    public static bool WhoAmI(string deviceId)
+    public static bool? TryGetRootState(string deviceId)
     {
-        if (ExecuteDeviceAdbShellCommand(deviceId, "whoami", out string stdout, out _, CancellationToken.None) != 0)
-            return false;
+        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+        if (ExecuteDeviceAdbShellCommand(deviceId, "whoami", out string stdout, out _, cancellation.Token) != 0)
+            return null;
 
         return stdout.Trim() == "root";
     }
+
+    public static bool WhoAmI(string deviceId) => TryGetRootState(deviceId) is true;
 
     public static ulong CountFiles(string deviceID, string path, IEnumerable<string> includeNames = null, IEnumerable<string> excludeNames = null)
     {

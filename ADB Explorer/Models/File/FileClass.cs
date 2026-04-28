@@ -356,7 +356,7 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
             Stream = () =>
             {
                 var isActive = App.Current.Dispatcher.Invoke(() => App.Current.MainWindow.IsActive);
-                var operations = vfdo.Operations.Where(op => op.Status is FileOperation.OperationStatus.None);
+                var operations = vfdo.Operations.Where(op => op.Status is FileOperation.OperationStatus.None).ToList();
 
                 // When a VFDO that does not contain folders is sent to the clipboard, the shell immediately requests the file contents.
                 // To prevent this, we refuse to give data when the app is focused.
@@ -371,10 +371,8 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
 
                 // Add all uninitiated operations to the queue.
                 // For all consecutive files this list will be empty.
-                foreach (var op in operations)
-                {
-                    App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperation(op));
-                }
+                if (operations.Count > 0)
+                    App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperations(operations));
 
                 // Wait for the operation to complete
                 while (fileOp.Status is not FileOperation.OperationStatus.Completed)
@@ -436,7 +434,7 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
                     op.Dispatcher.Invoke(() =>
                     {
                         Data.DirList.FileList.RemoveAll(f => f.FullPath == op.FilePath.FullPath);
-                        FileActionLogic.UpdateFileActions();
+                        FileActionLogic.ScheduleUpdateFileActions();
                     });
                 }
 

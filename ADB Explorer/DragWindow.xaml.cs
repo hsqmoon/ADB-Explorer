@@ -46,7 +46,7 @@ public partial class DragWindow : INotifyPropertyChanged
     private bool imageEmpty = false;
     private readonly SolidColorBrush blueBrush = new(Colors.DodgerBlue);
 
-    private void GetPathUnderMouse()
+    private async void GetPathUnderMouse()
     {
         if (waitingForUpdate)
             return;
@@ -54,12 +54,12 @@ public partial class DragWindow : INotifyPropertyChanged
         if (DateTime.Now - lastUpdate < TimeSpan.FromMilliseconds(50))
         {
             waitingForUpdate = true;
-            Task.Delay(50);
+            await Task.Delay(50);
             waitingForUpdate = false;
         }
         lastUpdate = DateTime.Now;
 
-        App.Current.Dispatcher.Invoke(() =>
+        void updateTooltip()
         {
             DragTooltip.Inlines.Clear();
             if (Data.CopyPaste.DragFiles.Length == 0 || Data.CopyPaste.CurrentDropEffect is DragDropEffects.None)
@@ -180,7 +180,12 @@ public partial class DragWindow : INotifyPropertyChanged
                 if (split.Length > 1)
                     DragTooltip.Inlines.Add(target);
             }
-        });
+        }
+
+        if (App.Current.Dispatcher.CheckAccess())
+            updateTooltip();
+        else
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(updateTooltip));
     }
 
     private bool mouseWithinApp = true;

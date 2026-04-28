@@ -792,7 +792,7 @@ public sealed class AdbShellSession : ViewModelBase, IDisposable
         if (App.Current?.Dispatcher is not Dispatcher dispatcher || dispatcher.CheckAccess())
             action();
         else
-            dispatcher.BeginInvoke(action);
+            _ = dispatcher.BeginInvoke(action);
     }
 
     private static int SafeGetPid(Process process)

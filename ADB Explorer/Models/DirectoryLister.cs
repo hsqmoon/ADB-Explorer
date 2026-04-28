@@ -64,7 +64,7 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
     private void StartDirectoryList(string path)
     {
-        Dispatcher.BeginInvoke(() =>
+        void resetState()
         {
             IsLinkListingFinished = false;
 
@@ -75,16 +75,27 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
             InProgress = true;
             IsProgressVisible = false;
             CurrentPath = path;
-        }).Wait();
+        }
+
+        if (Dispatcher.CheckAccess())
+            resetState();
+        else
+            Dispatcher.Invoke(resetState);
 
         CurrentCancellationToken = new();
         LinkListCancellation = new();
         currentFileQueue = new ConcurrentQueue<FileStat>();
 
         ReadTask = Task.Run(() => Device.ListDirectory(CurrentPath, ref currentFileQueue, Dispatcher, CurrentCancellationToken.Token), CurrentCancellationToken.Token);
-        ReadTask.ContinueWith((t) => Dispatcher.BeginInvoke(() => StopDirectoryList()), CurrentCancellationToken.Token);
+        ReadTask.ContinueWith((t) =>
+        {
+            _ = Dispatcher.BeginInvoke(new Action(() => StopDirectoryList()));
+        }, CurrentCancellationToken.Token);
 
-        Task.Delay(DIR_LIST_VISIBLE_PROGRESS_DELAY).ContinueWith((t) => Dispatcher.BeginInvoke(() => IsProgressVisible = InProgress), CurrentCancellationToken.Token);
+        Task.Delay(DIR_LIST_VISIBLE_PROGRESS_DELAY).ContinueWith((t) =>
+        {
+            _ = Dispatcher.BeginInvoke(new Action(() => IsProgressVisible = InProgress));
+        }, CurrentCancellationToken.Token);
 
         ScheduleUpdate();
     }
@@ -95,7 +106,10 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
         UpdateTask = Task.Delay(UpdateInterval);
         UpdateTask.ContinueWith(
-            (t) => Dispatcher.BeginInvoke(() => UpdateDirectoryList(!InProgress)),
+            (t) =>
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() => UpdateDirectoryList(!InProgress)));
+            },
             CurrentCancellationToken.Token,
             TaskContinuationOptions.OnlyOnRanToCompletion,
             TaskScheduler.Default);
@@ -120,6 +134,8 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
     private void UpdateDirectoryList(bool finish)
     {
+        List<FileClass> itemsToAdd = [];
+
         if (finish || (currentFileQueue.Count >= MinUpdateThreshold))
         {
             for (int i = 0; finish || (i < DIR_LIST_UPDATE_THRESHOLD_MAX); i++)
@@ -136,9 +152,12 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
                     item = FileManipulator(item);
                 }
 
-                FileList.Add(item);
+                itemsToAdd.Add(item);
             }
         }
+
+        if (itemsToAdd.Count > 0)
+            FileList.AddRange(itemsToAdd);
 
         if (!finish)
         {
@@ -155,12 +174,19 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
         CurrentCancellationToken.Cancel();
 
-        try
+        if (ReadTask.IsCompleted)
         {
-            ReadTask.Wait();
+            try
+            {
+                ReadTask.Wait();
+            }
+            catch (AggregateException e) when (e.InnerException is TaskCanceledException)
+            { }
         }
-        catch (AggregateException e) when (e.InnerException is TaskCanceledException)
-        { }
+        else
+        {
+            _ = ReadTask.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        }
 
         UpdateDirectoryList(true);
 
@@ -203,21 +229,21 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
             return;
         }
 
-        for (var i = 0; i < items.Count; i++)
+        _ = Dispatcher.BeginInvoke(new Action(() =>
         {
-            var file = items[i];
-            var target = result[i];
-
-            Dispatcher.Invoke(() =>
+            for (var i = 0; i < items.Count; i++)
             {
+                var file = items[i];
+                var target = result[i];
+
                 file.LinkTarget = target.Item1;
                 file.Type = target.Item2;
                 file.UpdateType();
-            });
-        }
+            }
 
-        IsLinkListingFinished = true;
+            IsLinkListingFinished = true;
 
-        Data.RuntimeSettings.RefreshExplorerSorting = true;
+            Data.RuntimeSettings.RefreshExplorerSorting = true;
+        }));
     }
 }

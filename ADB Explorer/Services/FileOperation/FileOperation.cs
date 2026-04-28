@@ -54,7 +54,7 @@ public abstract class FileOperation : ViewModelBase
         get => status;
         protected set
         {
-            Dispatcher.Invoke(() =>
+            void applyStatus()
             {
                 if (Set(ref status, value))
                 {
@@ -64,7 +64,12 @@ public abstract class FileOperation : ViewModelBase
 
                     LastProgress = 0;
                 }
-            });
+            }
+
+            if (Dispatcher.CheckAccess())
+                applyStatus();
+            else
+                Dispatcher.Invoke(applyStatus);
         }
     }
 
@@ -72,7 +77,13 @@ public abstract class FileOperation : ViewModelBase
     public FileOpProgressViewModel StatusInfo
     {
         get => statusInfo;
-        set => Dispatcher.Invoke(() => Set(ref statusInfo, value));
+        set
+        {
+            if (Dispatcher.CheckAccess())
+                Set(ref statusInfo, value);
+            else
+                Dispatcher.Invoke(() => Set(ref statusInfo, value));
+        }
     }
 
     private bool isPastOp = false;

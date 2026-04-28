@@ -96,7 +96,11 @@ public abstract class ActionBase : ViewModelBase, IMenuItem
             return;
 
         ActivateAnimation = true;
-        Task.Delay(200).ContinueWith((t) => ActivateAnimation = false);
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(200);
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => ActivateAnimation = false));
+        });
     }
 }
 
@@ -135,7 +139,11 @@ public class AltTextMenu : ActionMenu
             if (Set(ref altText, value) && Data.Settings.IsAnimated && ActionAnimationSource is AnimationSource.External)
             {
                 ActivateAnimation = true;
-                Task.Delay(Animation is StyleHelper.ContentAnimation.Pulsate ? 500 : 200).ContinueWith((t) => ActivateAnimation = false);
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(Animation is StyleHelper.ContentAnimation.Pulsate ? 500 : 200);
+                    _ = App.Current.Dispatcher.BeginInvoke(new Action(() => ActivateAnimation = false));
+                });
             }
         }
     }

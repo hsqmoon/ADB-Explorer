@@ -2,6 +2,7 @@
 using ADB_Explorer.Models;
 using ADB_Explorer.ViewModels;
 using System.Collections;
+using System.Windows.Threading;
 using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Services;
@@ -147,28 +148,39 @@ public class AppRuntimeSettings : ViewModelBase
     }
 
     private DateTime lastServerResponse = DateTime.Now;
+    private int lastServerResponseNotifyScheduled;
     public DateTime LastServerResponse
     {
         get => lastServerResponse;
         set
         {
             lastServerResponse = value;
+            ScheduleLastServerResponseNotification();
+        }
+    }
 
+    private void ScheduleLastServerResponseNotification()
+    {
+        var dispatcher = App.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+            return;
+
+        if (Interlocked.Exchange(ref lastServerResponseNotifyScheduled, 1) == 1)
+            return;
+
+        _ = dispatcher.BeginInvoke(new Action(() =>
+        {
             try
             {
-                App.Current?.Dispatcher.Invoke(() =>
-                {
-                    OnPropertyChanged();
-                    OnPropertyChanged(nameof(TimeFromLastResponse));
-                    OnPropertyChanged(nameof(ServerUnresponsive));
-                });
+                OnPropertyChanged(nameof(LastServerResponse));
+                OnPropertyChanged(nameof(TimeFromLastResponse));
+                OnPropertyChanged(nameof(ServerUnresponsive));
             }
-            catch
+            finally
             {
-                if (App.Current?.Dispatcher is not null)
-                    throw;
+                Interlocked.Exchange(ref lastServerResponseNotifyScheduled, 0);
             }
-        }
+        }), DispatcherPriority.Background);
     }
 
     public string TimeFromLastResponse => $"{DateTime.Now.Subtract(LastServerResponse).TotalSeconds:0}";

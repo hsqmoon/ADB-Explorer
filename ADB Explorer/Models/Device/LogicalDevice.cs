@@ -95,9 +95,13 @@ public class LogicalDevice : Device
         if (other is null)
             return;
 
+        var nextIpAddress = !string.IsNullOrWhiteSpace(other.IpAddress)
+            ? other.IpAddress
+            : IpAddress;
+
         Name = other.Name;
         Type = other.Type;
-        IpAddress = other.IpAddress;
+        IpAddress = nextIpAddress;
         DeviceData = other.DeviceData;
     }
 
@@ -150,11 +154,11 @@ public class LogicalDevice : Device
             if (t.IsCanceled || t.IsFaulted)
                 return;
 
-            dispatcher.BeginInvoke(() =>
+            _ = dispatcher.BeginInvoke(new Action(() =>
             {
                 SetMmcDrive(t.Result);
                 SetExternalDrives();
-            });
+            }));
         });
     }
 

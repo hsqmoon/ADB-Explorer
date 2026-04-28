@@ -2,12 +2,18 @@
 using ADB_Explorer.Models;
 using ADB_Explorer.ViewModels;
 using Vanara.Windows.Shell;
+using System.Windows.Threading;
 using static ADB_Explorer.Models.AbstractFile;
 
 namespace ADB_Explorer.Services.AppInfra;
 
 internal static class FileActionLogic
 {
+    private static readonly object DriveRefreshLock = new();
+    private static readonly HashSet<string> ActiveDriveRefreshes = [];
+    private static readonly Dictionary<string, DateTime> LastDriveRefresh = [];
+    private static int fileActionsRefreshScheduled;
+
     private static string RemoveApkMessage(IEnumerable<IBrowserItem> objects)
     {
         var count = objects.Count();
@@ -103,18 +109,21 @@ internal static class FileActionLogic
             }
             catch (Exception e)
             {
-                App.Current.Dispatcher.Invoke(() =>
-                    DialogService.ShowMessage(e.Message, Strings.Resources.S_READ_FILE_ERROR_TITLE, DialogService.DialogIcon.Exclamation, copyToClipboard: true));
+                _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
+                    DialogService.ShowMessage(e.Message, Strings.Resources.S_READ_FILE_ERROR_TITLE, DialogService.DialogIcon.Exclamation, copyToClipboard: true)));
 
                 return "";
             }
         });
 
-        readTask.ContinueWith((t) => App.Current.Dispatcher.Invoke(() =>
+        readTask.ContinueWith((t) =>
         {
-            Data.FileActions.EditorText =
-            Data.FileActions.OriginalEditorText = t.Result;
-        }));
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                Data.FileActions.EditorText =
+                Data.FileActions.OriginalEditorText = t.Result;
+            }));
+        });
     }
 
     public static void SaveEditorText()
@@ -128,23 +137,26 @@ internal static class FileActionLogic
             }
             catch (Exception e)
             {
-                App.Current.Dispatcher.Invoke(() =>
-                    DialogService.ShowMessage(e.Message, Strings.Resources.S_WRITE_FILE_ERROR_TITLE, DialogService.DialogIcon.Exclamation, copyToClipboard: true));
+                _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
+                    DialogService.ShowMessage(e.Message, Strings.Resources.S_WRITE_FILE_ERROR_TITLE, DialogService.DialogIcon.Exclamation, copyToClipboard: true)));
 
                 return false;
             }
         });
 
-        writeTask.ContinueWith((t) => App.Current.Dispatcher.Invoke(() =>
+        writeTask.ContinueWith((t) =>
         {
-            if (!t.Result)
-                return;
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!t.Result)
+                    return;
 
-            Data.FileActions.OriginalEditorText = Data.FileActions.EditorText;
+                Data.FileActions.OriginalEditorText = Data.FileActions.EditorText;
 
-            if (Data.FileActions.EditorAndroidPath.ParentPath == Data.CurrentPath)
-                Data.RuntimeSettings.Refresh = true;
-        }));
+                if (Data.FileActions.EditorAndroidPath.ParentPath == Data.CurrentPath)
+                    Data.RuntimeSettings.Refresh = true;
+            }));
+        });
     }
 
     public static void RestoreItems()
@@ -182,7 +194,7 @@ internal static class FileActionLogic
 
         restoreTask.ContinueWith((t) =>
         {
-            App.Current.Dispatcher.BeginInvoke(async () =>
+            _ = App.Current.Dispatcher.BeginInvoke(async () =>
             {
                 if (existingItems.Length is int count and > 0)
                 {
@@ -689,6 +701,22 @@ internal static class FileActionLogic
             asyncClassify = true;
 
         string deviceId = currentDevice.ID;
+        lock (DriveRefreshLock)
+        {
+            if (ActiveDriveRefreshes.Contains(deviceId))
+                return;
+
+            if (LastDriveRefresh.TryGetValue(deviceId, out DateTime lastRefresh)
+                && currentDevice.Drives?.Count > 0
+                && DateTime.Now - lastRefresh < AdbExplorerConst.DRIVE_UPDATE_INTERVAL)
+            {
+                return;
+            }
+
+            ActiveDriveRefreshes.Add(deviceId);
+            LastDriveRefresh[deviceId] = DateTime.Now;
+        }
+
         bool isRecovery = currentDevice.Type is AbstractDevice.DeviceType.Recovery;
         bool hasTrashDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Trash) == true;
         bool hasTempDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Temp) == true;
@@ -724,16 +752,24 @@ internal static class FileActionLogic
         });
         driveTask.ContinueWith((t) =>
         {
+            lock (DriveRefreshLock)
+            {
+                ActiveDriveRefreshes.Remove(deviceId);
+            }
+
             if (t.IsCanceled || t.IsFaulted || t.Result is null)
                 return;
 
-            App.Current?.Dispatcher.Invoke(async () =>
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            _ = dispatcher.BeginInvoke(async () =>
             {
                 var activeDevice = Data.DevicesObject.Current;
                 if (activeDevice?.ID != deviceId)
                     return;
 
-                if (await activeDevice.UpdateDrives(t.Result, App.Current.Dispatcher, asyncClassify))
+                if (await activeDevice.UpdateDrives(t.Result, dispatcher, asyncClassify))
                 {
                     Data.RuntimeSettings.FilterDrives = true;
                     FolderHelper.CombineDisplayNames();
@@ -750,14 +786,20 @@ internal static class FileActionLogic
 
         string deviceId = currentDevice.ID;
         var countTask = Task.Run(() => ADBService.CountPackages(deviceId));
-        countTask.ContinueWith((t) => App.Current?.Dispatcher.Invoke(() =>
+        countTask.ContinueWith((t) =>
         {
-            if (!t.IsCanceled && !t.IsFaulted && Data.DevicesObject.Current?.ID == deviceId)
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            _ = dispatcher.BeginInvoke(new Action(() =>
             {
-                var temp = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Temp);
-                ((VirtualDriveViewModel)temp)?.SetItemsCount((long)t.Result);
-            }
-        }));
+                if (!t.IsCanceled && !t.IsFaulted && Data.DevicesObject.Current?.ID == deviceId)
+                {
+                    var temp = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Temp);
+                    ((VirtualDriveViewModel)temp)?.SetItemsCount((long)t.Result);
+                }
+            }));
+        });
     }
 
     public static void UpdatePackagesCount()
@@ -775,11 +817,14 @@ internal static class FileActionLogic
             if (t.IsCanceled || t.IsFaulted || t.Result is null || Data.DevicesObject.Current?.ID != deviceId)
                 return;
 
-            App.Current.Dispatcher.Invoke(() =>
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            _ = dispatcher.BeginInvoke(new Action(() =>
             {
                 var package = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Package);
                 ((VirtualDriveViewModel)package)?.SetItemsCount((int?)t.Result);
-            });
+            }));
         });
     }
 
@@ -795,7 +840,10 @@ internal static class FileActionLogic
             if (t.IsCanceled)
                 return;
 
-            App.Current.Dispatcher.Invoke(() =>
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            _ = dispatcher.BeginInvoke(new Action(() =>
             {
                 Data.Packages = t.Result;
                 if (updateExplorer)
@@ -808,7 +856,7 @@ internal static class FileActionLogic
                 }
 
                 Data.FileActions.ListingInProgress = false;
-            });
+            }));
         });
     }
 
@@ -978,6 +1026,28 @@ internal static class FileActionLogic
             Data.RuntimeSettings.FilterActions = true;
     }
 
+    public static void ScheduleUpdateFileActions()
+    {
+        var dispatcher = App.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+            return;
+
+        if (Interlocked.Exchange(ref fileActionsRefreshScheduled, 1) == 1)
+            return;
+
+        _ = dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                UpdateFileActions();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref fileActionsRefreshScheduled, 0);
+            }
+        }), DispatcherPriority.Background);
+    }
+
     public static void PushItems(bool isFolderPicker, bool isContextMenu)
     {
         Data.RuntimeSettings.IsPathBoxFocused = false;
@@ -1039,7 +1109,38 @@ internal static class FileActionLogic
     }
 
     public static void PushShellObjects(IEnumerable<ShellItem> items, string targetPath, DragDropEffects dropEffects = DragDropEffects.Copy)
-        => items.ForEach(item => PushShellObject(item, targetPath, dropEffects));
+    {
+        var syncItems = items.Select(item =>
+        {
+            var source = new SyncFile(item, true);
+            var target = new SyncFile(FileHelper.ConcatPaths(targetPath, source.FullName),
+                source.IsDirectory ? FileType.Folder : FileType.File)
+                { Size = source.Size };
+
+            return (source, target);
+        }).ToList();
+
+        if (syncItems.Count == 0)
+            return;
+
+        void addPushOperations()
+        {
+            var operations = syncItems.Select(item =>
+            {
+                var pushOperation = FileSyncOperation.PushFile(item.source, item.target, Data.CurrentADBDevice, App.Current.Dispatcher);
+                pushOperation.DropEffects = dropEffects;
+                pushOperation.PropertyChanged += PushOperation_PropertyChanged;
+                return pushOperation;
+            });
+
+            Data.FileOpQ.AddOperations(operations);
+        }
+
+        if (App.Current.Dispatcher.CheckAccess())
+            addPushOperations();
+        else
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(addPushOperations));
+    }
 
     private static void PushOperation_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
@@ -1058,8 +1159,12 @@ internal static class FileActionLogic
                 && op.TargetPath.ParentPath == Data.CurrentPath
                 && Data.DirList.FileList.All(f => f.FullName != op.FilePath.FullName))
             {
-                op.Dispatcher.Invoke(() =>
-                    Data.DirList.FileList.Add(new(op.TargetPath) { ModifiedTime = op.FilePath.DateModified }));
+                void addPushedFile() => Data.DirList.FileList.Add(new(op.TargetPath) { ModifiedTime = op.FilePath.DateModified });
+
+                if (op.Dispatcher.CheckAccess())
+                    addPushedFile();
+                else
+                    _ = op.Dispatcher.BeginInvoke(new Action(addPushedFile));
             }
 
             if (op.FilePath.IsDirectory)
@@ -1164,10 +1269,7 @@ internal static class FileActionLogic
             pullItems = pullItems.Where(f => files.Contains(f.FullPath));
         }
 
-        await Task.Run(() =>
-        {
-            App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperations(GeneratePullOps(path, pullItems, notify)));
-        });
+        await App.Current.Dispatcher.InvokeAsync(() => Data.FileOpQ.AddOperations(GeneratePullOps(path, pullItems, notify)));
         
         static IEnumerable<FileSyncOperation> GeneratePullOps(ShellItem path, IEnumerable<FileClass> pullItems, bool notify)
         {
@@ -1206,39 +1308,49 @@ internal static class FileActionLogic
         Data.RuntimeSettings.RefreshFileOpControls = true;
     }
 
-    private static readonly Mutex FileOpControlsMutex = new();
+    private static int fileOpControlsRefreshScheduled;
 
     public static void UpdateFileOpControls()
     {
-        App.Current.Dispatcher.Invoke(() =>
+        var dispatcher = App.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+            return;
+
+        if (Interlocked.Exchange(ref fileOpControlsRefreshScheduled, 1) == 1)
+            return;
+
+        _ = dispatcher.BeginInvoke(new Action(() =>
         {
-            FileOpControlsMutex.WaitOne(0);
-
-            var changed = false;
-            var plural = Data.FileActions.SelectedFileOps.Value.Count() != 1;
-            var opString = plural
-                ? Strings.Resources.S_ACTION_OPERATION_PLURAL
-                : Strings.Resources.S_ACTION_OPERATION;
-
-            var removeAction = string.Format(Strings.Resources.S_REM_DEVICE_TITLE, opString);
-            if (Data.FileActions.RemoveFileOpDescription.Value != removeAction)
+            try
             {
-                Data.FileActions.RemoveFileOpDescription.Value = removeAction;
-                changed = true;
-            }
+                var changed = false;
+                var plural = Data.FileActions.SelectedFileOps.Value.Count() != 1;
+                var opString = plural
+                    ? Strings.Resources.S_ACTION_OPERATION_PLURAL
+                    : Strings.Resources.S_ACTION_OPERATION;
 
-            var validateAction = string.Format(Strings.Resources.S_ACTION_VALIDATE, opString);
-            if (Data.FileActions.ValidateDescription.Value != validateAction)
+                var removeAction = string.Format(Strings.Resources.S_REM_DEVICE_TITLE, opString);
+                if (Data.FileActions.RemoveFileOpDescription.Value != removeAction)
+                {
+                    Data.FileActions.RemoveFileOpDescription.Value = removeAction;
+                    changed = true;
+                }
+
+                var validateAction = string.Format(Strings.Resources.S_ACTION_VALIDATE, opString);
+                if (Data.FileActions.ValidateDescription.Value != validateAction)
+                {
+                    Data.FileActions.ValidateDescription.Value = validateAction;
+                    changed = true;
+                }
+
+                if (changed)
+                    Data.RuntimeSettings.RefreshFileOpControls = true;
+            }
+            finally
             {
-                Data.FileActions.ValidateDescription.Value = validateAction;
-                changed = true;
+                Interlocked.Exchange(ref fileOpControlsRefreshScheduled, 0);
             }
-
-            if (changed)
-                Data.RuntimeSettings.RefreshFileOpControls = true;
-
-            FileOpControlsMutex.ReleaseMutex();
-        });
+        }), DispatcherPriority.Background);
     }
 
     public static async void ResetAppSettings()

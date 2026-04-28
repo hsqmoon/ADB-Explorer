@@ -443,10 +443,10 @@ public class CopyPasteService : ViewModelBase
 
             if (dataObject.GetDataPresent(AdbDataFormats.FileDescriptor))
             {
-                Task.Run(() =>
+                _ = Task.Run(async () =>
                 {
-                    Task.Delay(500);
-                    App.Current.Dispatcher.Invoke(() => GetDescriptors(dataObject));
+                    await Task.Delay(500);
+                    await App.Current.Dispatcher.InvokeAsync(() => GetDescriptors(dataObject));
                 });
             }
         }
@@ -533,6 +533,7 @@ public class CopyPasteService : ViewModelBase
                 if (!IsWindows)
                 {
                     ADBService.AdbDevice sourceDevice = new(SourceDevice);
+                    List<FileOperation> pullOps = [];
                     foreach (var item in CurrentFiles)
                     {
                         SyncFile target = new(item) { PathType = FilePathType.Windows };
@@ -557,7 +558,7 @@ public class CopyPasteService : ViewModelBase
                             }
 
                             var pushOp = VerifyAndPush(targetFolder, file, CurrentEffect);
-                            if (pushOp is not null || CurrentEffect is not DragDropEffects.Move)
+                            if (pushOp is null || CurrentEffect is not DragDropEffects.Move)
                                 return;
 
                             pushOp.PropertyChanged += (s, e) =>
@@ -573,8 +574,10 @@ public class CopyPasteService : ViewModelBase
                             };
                         };
 
-                        Data.FileOpQ.AddOperation(pullOp);
+                        pullOps.Add(pullOp);
                     }
+
+                    Data.FileOpQ.AddOperations(pullOps);
                 }
                 // From archives, UNC paths, & DLNA servers
                 else if (dataObject.GetDataPresent(AdbDataFormats.ShellidList))
@@ -633,6 +636,7 @@ public class CopyPasteService : ViewModelBase
                     Task.Run(() =>
                     {
                         string[] files = new string[Descriptors.Length];
+                        List<FileOperation> failedOps = [];
 
                         for (int i = 0; i < Descriptors.Length; i++)
                         {
@@ -649,16 +653,13 @@ public class CopyPasteService : ViewModelBase
                             catch (COMException e)
                             {
                                 // If failed, add a failed operation to the queue
-                                App.Current.Dispatcher.Invoke(() =>
-                                {
-                                    Data.FileOpQ.AddOperation(
-                                        new FileSyncOperation(
-                                            FileOperation.OperationType.Push,
-                                            Descriptors[i],
-                                            new(targetFolder),
-                                            Data.CurrentADBDevice,
-                                            new FailedOpProgressViewModel(e.Message)));
-                                });
+                                failedOps.Add(
+                                    new FileSyncOperation(
+                                        FileOperation.OperationType.Push,
+                                        Descriptors[i],
+                                        new(targetFolder),
+                                        Data.CurrentADBDevice,
+                                        new FailedOpProgressViewModel(e.Message)));
 
                                 continue;
                             }
@@ -670,6 +671,9 @@ public class CopyPasteService : ViewModelBase
                             if (Descriptors[i].ChangeTimeUtc is not null)
                                 File.SetLastWriteTime(files[i], Descriptors[i].ChangeTimeUtc.Value.ToLocalTime());
                         }
+
+                        if (failedOps.Count > 0)
+                            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.FileOpQ.AddOperations(failedOps)));
 
                         IEnumerable<FileClass> shItems = [];
                         try

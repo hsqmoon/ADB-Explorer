@@ -315,9 +315,9 @@ public class FileSyncOperation : FileOperation
         if (Dispatcher.CheckAccess())
             applyUpdates();
         else if (invokeSynchronously)
-            Dispatcher.Invoke(applyUpdates);
+            Dispatcher.InvokeAsync(new Action(applyUpdates)).Task.Wait();
         else
-            Dispatcher.BeginInvoke(applyUpdates);
+            _ = Dispatcher.BeginInvoke(new Action(applyUpdates));
 
         if (!pendingProgressUpdates.IsEmpty)
             ScheduleProgressFlush();

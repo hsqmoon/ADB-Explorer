@@ -264,7 +264,8 @@ public partial class ADBService
 
         private IEnumerable<LogicalDrive> ReadDrives(Regex re, params string[] args)
         {
-            int exitCode = ExecuteDeviceAdbShellCommand(ID, "df", out string stdout, out string stderr, CancellationToken.None, args);
+            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
+            int exitCode = ExecuteDeviceAdbShellCommand(ID, "df", out string stdout, out string stderr, cancellation.Token, args);
             if (exitCode != 0)
                 return null;
 
@@ -310,7 +311,8 @@ public partial class ADBService
 
         public static Dictionary<string, string> GetBatteryInfo(LogicalDevice device)
         {
-            if (ExecuteDeviceAdbShellCommand(device.ID, BATTERY, out string stdout, out string stderr, CancellationToken.None) == 0)
+            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
+            if (ExecuteDeviceAdbShellCommand(device.ID, BATTERY, out string stdout, out string stderr, cancellation.Token) == 0)
             {
                 return stdout.Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Where(l => l.Contains(':')).ToDictionary(
                     line => line.Split(':')[0].Trim(),
@@ -327,7 +329,8 @@ public partial class ADBService
 
         public static bool GetDeviceIp(DeviceViewModel device)
         {
-            if (ExecuteDeviceAdbShellCommand(device.ID, "ip", out string stdout, out _, CancellationToken.None, INET_ARGS) != 0)
+            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
+            if (ExecuteDeviceAdbShellCommand(device.ID, "ip", out string stdout, out _, cancellation.Token, INET_ARGS) != 0)
                 return false;
 
             var match = AdbRegEx.RE_DEVICE_WLAN_INET().Match(stdout);

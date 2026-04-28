@@ -8,6 +8,9 @@ namespace ADB_Explorer.Models;
 internal static class Data
 {
     private const int MAX_COMMAND_LOG_ENTRIES = 2000;
+    private static readonly object commandLogLock = new();
+    private static readonly Queue<Log> pendingCommandLogs = new();
+    private static bool isCommandLogFlushScheduled;
 
     public static ADBService.AdbDevice CurrentADBDevice { get; set; } = null;
 
@@ -28,7 +31,7 @@ internal static class Data
 
     public static AdbShellSession Terminal { get; } = new();
 
-    public static ObservableCollection<Log> CommandLog { get; set; } = [];
+    public static BatchObservableCollection<Log> CommandLog { get; set; } = [];
 
     public static void AddCommandLog(string content)
     {
@@ -36,24 +39,65 @@ internal static class Data
             return;
 
         var log = new Log(content);
-
-        void addLog()
+        lock (commandLogLock)
         {
-            CommandLog.Add(log);
-
-            while (CommandLog.Count > MAX_COMMAND_LOG_ENTRIES)
-                CommandLog.RemoveAt(0);
+            pendingCommandLogs.Enqueue(log);
         }
 
-        if (Application.Current?.Dispatcher is { HasShutdownStarted: false, HasShutdownFinished: false } dispatcher)
+        ScheduleCommandLogFlush();
+    }
+
+    private static void ScheduleCommandLogFlush()
+    {
+        if (Application.Current?.Dispatcher is not { HasShutdownStarted: false, HasShutdownFinished: false } dispatcher)
         {
-            if (dispatcher.CheckAccess())
-                addLog();
-            else
-                dispatcher.BeginInvoke(addLog);
+            FlushPendingCommandLogs();
+            return;
         }
-        else
-            addLog();
+
+        if (dispatcher.CheckAccess())
+        {
+            if (isCommandLogFlushScheduled)
+                return;
+
+            isCommandLogFlushScheduled = true;
+            _ = dispatcher.BeginInvoke(FlushPendingCommandLogs, DispatcherPriority.Background);
+            return;
+        }
+
+        _ = dispatcher.BeginInvoke(new Action(ScheduleCommandLogFlush), DispatcherPriority.Background);
+    }
+
+    private static void FlushPendingCommandLogs()
+    {
+        List<Log> logsToAdd = [];
+        lock (commandLogLock)
+        {
+            while (pendingCommandLogs.Count > 0)
+            {
+                logsToAdd.Add(pendingCommandLogs.Dequeue());
+            }
+
+            isCommandLogFlushScheduled = false;
+        }
+
+        if (logsToAdd.Count > 0)
+        {
+            CommandLog.AddRange(logsToAdd);
+
+            int overflow = CommandLog.Count - MAX_COMMAND_LOG_ENTRIES;
+            if (overflow > 0)
+                CommandLog.RemoveRange(0, overflow);
+        }
+
+        bool shouldFlushAgain;
+        lock (commandLogLock)
+        {
+            shouldFlushAgain = pendingCommandLogs.Count > 0;
+        }
+
+        if (shouldFlushAgain)
+            ScheduleCommandLogFlush();
     }
 
     public static ObservableList<TrashIndexer> RecycleIndex { get; set; } = [];

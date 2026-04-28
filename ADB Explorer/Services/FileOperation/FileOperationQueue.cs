@@ -6,6 +6,8 @@ namespace ADB_Explorer.Services;
 
 public class FileOperationQueue : ViewModelBase
 {
+    private static readonly TimeSpan PROGRESS_REFRESH_INTERVAL = TimeSpan.FromMilliseconds(100);
+
     #region Full properties
 
     private bool isActive;
@@ -67,6 +69,7 @@ public class FileOperationQueue : ViewModelBase
     #endregion
 
     private readonly Mutex mutex = new();
+    private int progressRefreshScheduled;
 
     public FileOperationQueue()
     {
@@ -155,15 +158,81 @@ public class FileOperationQueue : ViewModelBase
 
     private void UpdateProgress()
     {
-        var pending = Operations.Where(op => op.Status is FileOperation.OperationStatus.Waiting);
-        var running = Operations.Where(op => op.Status is FileOperation.OperationStatus.InProgress);
+        int totalCount = 0;
+        int pendingCount = 0;
+        int runningCount = 0;
+        double runningProgress = 0;
 
-        double done = TotalCount - pending.Count() - running.Count();
-        double current = running.Sum(op => op.LastProgress) / 100.0;
+        foreach (var op in Operations)
+        {
+            if (op.IsPastOp)
+                continue;
 
-        Progress = (done + current) / TotalCount;
+            totalCount++;
+
+            switch (op.Status)
+            {
+                case FileOperation.OperationStatus.Waiting:
+                    pendingCount++;
+                    break;
+                case FileOperation.OperationStatus.InProgress:
+                    runningCount++;
+                    runningProgress += op.LastProgress;
+                    break;
+            }
+        }
+
+        if (totalCount == 0)
+        {
+            Progress = 0;
+            FileOpRingVisibility();
+            return;
+        }
+
+        double done = totalCount - pendingCount - runningCount;
+        double current = runningProgress / 100.0;
+
+        Progress = (done + current) / totalCount;
 
         FileOpRingVisibility();
+    }
+
+    private void ScheduleProgressRefresh(bool immediate = false)
+    {
+        if (immediate)
+        {
+            if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher && !dispatcher.CheckAccess())
+                _ = dispatcher.BeginInvoke(new Action(UpdateProgress));
+            else
+                UpdateProgress();
+
+            return;
+        }
+
+        if (Interlocked.Exchange(ref progressRefreshScheduled, 1) == 1)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(PROGRESS_REFRESH_INTERVAL);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref progressRefreshScheduled, 0);
+            }
+
+            if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher)
+            {
+                if (dispatcher.CheckAccess())
+                    UpdateProgress();
+                else
+                    _ = dispatcher.BeginInvoke(new Action(UpdateProgress));
+            }
+            else
+                UpdateProgress();
+        });
     }
 
     public void Start()
@@ -179,7 +248,7 @@ public class FileOperationQueue : ViewModelBase
 
         MoveToNextOperation();
 
-        UpdateProgress();
+        ScheduleProgressRefresh(immediate: true);
     }
 
     public void Stop()
@@ -204,7 +273,7 @@ public class FileOperationQueue : ViewModelBase
             mutex.WaitOne();
 
             op.PropertyChanged -= CurrentOperation_PropertyChanged;
-            UpdateProgress();
+            ScheduleProgressRefresh(immediate: true);
 
             OnPropertyChanged(nameof(HasIncompleteOperations));
             FileOpRingVisibility();
@@ -303,7 +372,7 @@ public class FileOperationQueue : ViewModelBase
             && op.StatusInfo is InProgSyncProgressViewModel { TotalPercentage: double percentage })
         {
             op.LastProgress = percentage;
-            UpdateProgress();
+            ScheduleProgressRefresh();
         }
     }
 
@@ -315,7 +384,7 @@ public class FileOperationQueue : ViewModelBase
     private void Operations_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
     {
         OnPropertyChanged(nameof(TotalCount));
-        UpdateProgress();
+        ScheduleProgressRefresh(immediate: true);
 
         if (e.Action is not NotifyCollectionChangedAction.Reset && e.NewItems is null)
             return;

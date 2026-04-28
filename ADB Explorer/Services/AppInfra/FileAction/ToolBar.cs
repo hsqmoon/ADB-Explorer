@@ -158,7 +158,7 @@ internal static class ExplorerContextMenu
         var list = List.ToArray();
         var separators = list.OfType<SubMenuSeparator>().Select(separator => (separator, List.IndexOf(separator))).ToList();
 
-        App.Current.Dispatcher.Invoke(() =>
+        void updateSeparators()
         {
             for (int i = 0; i < separators.Count; i++)
             {
@@ -173,7 +173,12 @@ internal static class ExplorerContextMenu
             }
 
             List.OfType<DummySubMenu>().First().IsEnabled = List.Where(a => a is not SubMenuSeparator and not DummySubMenu).All(a => !a.Action.Command.IsEnabled);
-        });
+        }
+
+        if (App.Current.Dispatcher.CheckAccess())
+            updateSeparators();
+        else
+            _ = App.Current.Dispatcher.BeginInvoke(new Action(updateSeparators));
     }
 
     public static ObservableList<SubMenu> List { get; } = [

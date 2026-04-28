@@ -165,8 +165,6 @@ public class SyncFile : FilePath
                 ExecuteInDispatcher(() =>
                 {
                     Children.Add(file);
-                    
-                    OnPropertyChanged(nameof(Children));
                 }, executeInDispatcher);
             }
 
