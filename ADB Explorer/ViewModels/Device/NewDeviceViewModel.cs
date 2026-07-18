@@ -132,6 +132,8 @@ public class NewDeviceViewModel : PairingDeviceViewModel
             Device.HostName = name; 
             OnPropertyChanged(nameof(HostName));
             OnPropertyChanged(nameof(IsHostNameValid));
+
+            return true;
         }
 
         return false;

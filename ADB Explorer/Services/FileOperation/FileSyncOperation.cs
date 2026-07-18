@@ -132,7 +132,7 @@ public class FileSyncOperation : FileOperation
 
                 // Open a new connection for each file to allow parallel transfers, maximizing throughput of the medium.
                 // Connecting by both USB and WiFi at the same time causes instability and doesn't seem to improve the speed further.
-                using SyncService service = new(Device.Device.DeviceData);
+                using SyncService service = new(ADBService.AdbServerEndPoint, Device.Device.DeviceData);
                 var targetPath = FilePath.IsDirectory
                         ? FileHelper.ConcatPaths(TargetPath, FileHelper.ExtractRelativePath(item.FullPath, FilePath.FullPath))
                         : TargetPath.FullPath;

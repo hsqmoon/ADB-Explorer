@@ -60,7 +60,7 @@ internal static class AdbHelper
     public static string ReadFile(ADBService.AdbDevice device, string path)
     {
         using MemoryStream stream = new();
-        using SyncService service = new(device.Device.DeviceData);
+        using SyncService service = new(ADBService.AdbServerEndPoint, device.Device.DeviceData);
 
         service.Pull(path, stream);
 
@@ -77,7 +77,7 @@ internal static class AdbHelper
         writer.Flush();
         stream.Position = 0;
 
-        using SyncService service = new(device.Device.DeviceData);
+        using SyncService service = new(ADBService.AdbServerEndPoint, device.Device.DeviceData);
         service.Push(stream, path, (UnixFileMode)0x1ED, DateTime.Now); // 0x1ED = 0777 in octal
     }
 }

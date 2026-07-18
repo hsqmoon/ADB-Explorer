@@ -525,15 +525,18 @@ public class AppSettings : ViewModelBase
     {
         if (storage is null || storage.Equals(default(T)))
         {
+            var rawValue = Storage.RetrieveValue(propertyName);
             var value = storage switch
             {
-                Version => new Version((string)Storage.RetrieveValue(propertyName)),
+                Version => new Version((string)rawValue),
                 Enum => Storage.RetrieveEnum<T>(propertyName),
                 bool => Storage.RetrieveBool(propertyName),
-                null when typeof(T) == typeof(string) => Storage.RetrieveValue(propertyName),
+                null when typeof(T) == typeof(string) => rawValue,
                 null when typeof(T) == typeof(bool?) => Storage.RetrieveBool(propertyName),
-                null when typeof(T) == typeof(Version) => new Version((string)Storage.RetrieveValue(propertyName)),
-                _ => Storage.RetrieveValue(propertyName),
+                null when typeof(T) == typeof(Version) => new Version((string)rawValue),
+                null when typeof(T).IsArray && rawValue is JArray array => array.ToObject<T>(),
+                null when rawValue is JArray array => array.ToObject<T>(),
+                _ => rawValue,
             };
 
             storage = (T)(value ?? defaultValue);

@@ -99,10 +99,7 @@ public partial class App : Application
                 try
                 {
                     var jObj = JsonConvert.DeserializeObject(keyValue[1], JsonSettings);
-                    if (jObj is JArray jArr)
-                        Properties[keyValue[0]] = jArr.Values<string>().ToArray();
-                    else
-                        Properties[keyValue[0]] = jObj;
+                    Properties[keyValue[0]] = jObj;
                 }
                 catch (Exception)
                 {

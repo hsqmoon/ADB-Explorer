@@ -1,5 +1,6 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
+using System.Net;
 using static ADB_Explorer.Models.AdbExplorerConst;
 using static ADB_Explorer.Models.AdbRegEx;
 using static ADB_Explorer.Models.Data;
@@ -10,6 +11,8 @@ public partial class ADBService
 {
     private const string GET_DEVICES = "devices";
     private const string ENABLE_MDNS = "ADB_MDNS_OPENSCREEN";
+    private const string ADB_SERVER_PORT_ENV = "ANDROID_ADB_SERVER_PORT";
+    private const int DEFAULT_ADB_SERVER_PORT = 5037;
     private const string INTERACTIVE_TERMINAL_COMMAND = "env TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 CLICOLOR_FORCE=1 TERM_PROGRAM=ADBExplorer sh -i";
 
     // find /sdcard/.Trash-AdbExplorer/ -maxdepth 1 -mindepth 1 \( -iname "\*" ! -iname ".RecycleIndex" ! -iname ".RecycleIndex.bak" \) 2>/dev/null | wc -l
@@ -28,6 +31,98 @@ public partial class ADBService
         }
         catch
         { }
+    }
+
+    private static void EnsureAdbServerPort() => RuntimeSettings.AdbServerPort = DEFAULT_ADB_SERVER_PORT;
+
+    private static bool IsAdbExecutable(string file)
+    {
+        if (string.IsNullOrWhiteSpace(file))
+            return false;
+
+        var trimmed = file.Trim('"');
+        var name = Path.GetFileNameWithoutExtension(trimmed);
+
+        return string.Equals(name, ADB_PROCESS, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static IPEndPoint AdbServerEndPoint
+    {
+        get
+        {
+            EnsureAdbServerPort();
+            return RuntimeSettings.AdbServerEndPoint;
+        }
+    }
+
+    private static IEnumerable<LogicalDevice> ParseDevices(string stdout) =>
+        RE_DEVICE_NAME().Matches(stdout).Select(LogicalDevice.New).Where(d => d);
+
+    private static string GetRunningAdbServerPath(int port)
+    {
+        try
+        {
+            using ManagementObjectSearcher searcher = new(
+                "SELECT ExecutablePath, CommandLine " +
+                "FROM Win32_Process " +
+                "WHERE Name='adb.exe'");
+
+            foreach (ManagementObject item in searcher.Get())
+            {
+                var commandLine = item["CommandLine"]?.ToString();
+                if (string.IsNullOrWhiteSpace(commandLine)
+                    || !commandLine.Contains("fork-server server", StringComparison.OrdinalIgnoreCase)
+                    || !commandLine.Contains($"tcp:{port}", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var path = item["ExecutablePath"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                    return path;
+            }
+        }
+        catch
+        { }
+
+        return null;
+    }
+
+    private static bool TrySwitchToVisibleAdbServer(out IEnumerable<LogicalDevice> devices)
+    {
+        devices = [];
+
+        var adbServerPath = GetRunningAdbServerPath(DEFAULT_ADB_SERVER_PORT);
+        if (string.IsNullOrWhiteSpace(adbServerPath))
+            return false;
+
+        var originalAdbPath = RuntimeSettings.AdbPath;
+        var originalAdbServerPort = RuntimeSettings.AdbServerPort;
+
+        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+        RuntimeSettings.AdbPath = adbServerPath;
+        RuntimeSettings.AdbServerPort = DEFAULT_ADB_SERVER_PORT;
+
+        var result = ExecuteCommand(adbServerPath, GET_DEVICES, out string stdout, out _, Encoding.UTF8, cancellation.Token, "-l");
+        if (result != 0)
+        {
+            RuntimeSettings.AdbPath = originalAdbPath;
+            RuntimeSettings.AdbServerPort = originalAdbServerPort;
+            return false;
+        }
+
+        var serverDevices = ParseDevices(stdout).ToList();
+        if (serverDevices.Count == 0)
+        {
+            RuntimeSettings.AdbPath = originalAdbPath;
+            RuntimeSettings.AdbServerPort = originalAdbServerPort;
+            return false;
+        }
+
+        Data.AddCommandLog($"Using visible adb server: {adbServerPath} on {DEFAULT_ADB_SERVER_PORT}");
+
+        devices = serverDevices;
+        return true;
     }
 
     public class ProcessFailedException : Exception
@@ -52,6 +147,10 @@ public partial class ADBService
 
     public static Process StartCommandProcess(string file, string cmd, Encoding encoding, bool redirect = true, Process cmdProcess = null, string workingDir = null, params string[] args)
     {
+        bool isAdbExecutable = IsAdbExecutable(file);
+        if (isAdbExecutable)
+            EnsureAdbServerPort();
+
         cmdProcess ??= new();
         var arguments = string.Join(' ', args.Prepend(cmd).Where(arg => !string.IsNullOrEmpty(arg)));
 
@@ -72,17 +171,24 @@ public partial class ADBService
 
         if (IsMdnsEnabled)
             cmdProcess.StartInfo.EnvironmentVariables[ENABLE_MDNS] = "1";
+
+        if (isAdbExecutable)
+            cmdProcess.StartInfo.EnvironmentVariables[ADB_SERVER_PORT_ENV] = RuntimeSettings.AdbServerPort.ToString(CultureInfo.InvariantCulture);
         
         cmdProcess.Start();
         SetBackgroundPriority(cmdProcess);
 
-        Data.AddCommandLog($"{file} {arguments}");
+        Data.AddCommandLog(isAdbExecutable
+            ? $"[adb-server:{RuntimeSettings.AdbServerPort}] {file} {arguments}"
+            : $"{file} {arguments}");
 
         return cmdProcess;
     }
 
     public static Process StartInteractiveAdbShellProcess(string deviceId)
     {
+        EnsureAdbServerPort();
+
         Process process = new()
         {
             StartInfo = new()
@@ -109,8 +215,10 @@ public partial class ADBService
         if (IsMdnsEnabled)
             process.StartInfo.EnvironmentVariables[ENABLE_MDNS] = "1";
 
+        process.StartInfo.EnvironmentVariables[ADB_SERVER_PORT_ENV] = RuntimeSettings.AdbServerPort.ToString(CultureInfo.InvariantCulture);
+
         process.Start();
-        Data.AddCommandLog($"{RuntimeSettings.AdbPath} -s {deviceId} shell -tt {EscapeAdbString(INTERACTIVE_TERMINAL_COMMAND)}");
+        Data.AddCommandLog($"[adb-server:{RuntimeSettings.AdbServerPort}] {RuntimeSettings.AdbPath} -s {deviceId} shell -tt {EscapeAdbString(INTERACTIVE_TERMINAL_COMMAND)}");
 
         return process;
     }
@@ -151,6 +259,16 @@ public partial class ADBService
     public static int ExecuteAdbCommand(string cmd, out string stdout, out string stderr, CancellationToken cancellationToken, params string[] args)
     {
         var result = ExecuteCommand(RuntimeSettings.AdbPath, cmd, out stdout, out stderr, Encoding.UTF8, cancellationToken, args);
+
+        if (result != 0
+            && cmd is not "kill-server"
+            && cmd is not "start-server"
+            && IsAdbTransportFault(stdout, stderr)
+            && RestartAdbServer())
+        {
+            result = ExecuteCommand(RuntimeSettings.AdbPath, cmd, out stdout, out stderr, Encoding.UTF8, cancellationToken, args);
+        }
+
         RuntimeSettings.LastServerResponse = DateTime.Now;
 
         return result;
@@ -289,10 +407,15 @@ public partial class ADBService
 
     public static IEnumerable<LogicalDevice> GetDevices()
     {
+        EnsureAdbServerPort();
+
+        if (TrySwitchToVisibleAdbServer(out var visibleDevices))
+            return visibleDevices;
+
         using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
         ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, cancellation.Token, "-l");
 
-        return RE_DEVICE_NAME().Matches(stdout).Select(LogicalDevice.New).Where(d => d);
+        return ParseDevices(stdout).ToList();
     }
 
     public static void ConnectNetworkDevice(string host, UInt16 port) => NetworkDeviceOperation("connect", $"{host}:{port}");
@@ -309,11 +432,45 @@ public partial class ADBService
     /// <exception cref="ConnectionTimeoutException"></exception>
     private static void NetworkDeviceOperation(string cmd, string fullAddress, string pairingCode = null)
     {
-        ExecuteAdbCommand(cmd, out string stdout, out _, CancellationToken.None, fullAddress, pairingCode);
-        if (stdout.ToLower() is string lower
-            && (lower.Contains("cannot connect") || lower.Contains("error") || lower.Contains("failed")))
+        var result = ExecuteAdbCommand(cmd, out string stdout, out string stderr, CancellationToken.None, fullAddress, pairingCode);
+        var output = string.Join('\n', [stdout, stderr]).Trim();
+
+        if (result != 0
+            || IsAdbTransportFault(output)
+            || output.Contains("cannot connect", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("error", StringComparison.OrdinalIgnoreCase)
+            || output.Contains("failed", StringComparison.OrdinalIgnoreCase))
         {
-            throw new Exception(stdout);
+            throw new Exception(string.IsNullOrWhiteSpace(output) ? $"{cmd} {fullAddress} failed" : output);
+        }
+    }
+
+    private static bool IsAdbTransportFault(string stdout, string stderr) =>
+        IsAdbTransportFault(string.Join('\n', [stdout, stderr]));
+
+    private static bool IsAdbTransportFault(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return false;
+
+        return output.Contains("protocol fault", StringComparison.OrdinalIgnoreCase)
+               || output.Contains("connection reset", StringComparison.OrdinalIgnoreCase)
+               || output.Contains("failed to check server version", StringComparison.OrdinalIgnoreCase)
+               || output.Contains("daemon not running", StringComparison.OrdinalIgnoreCase)
+               || output.Contains("server version", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool RestartAdbServer()
+    {
+        try
+        {
+            ExecuteCommand(RuntimeSettings.AdbPath, "kill-server", out _, out _, Encoding.UTF8, CancellationToken.None);
+            ExecuteCommand(RuntimeSettings.AdbPath, "start-server", out _, out _, Encoding.UTF8, CancellationToken.None);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 

@@ -2,6 +2,7 @@
 using ADB_Explorer.Models;
 using ADB_Explorer.ViewModels;
 using System.Collections;
+using System.Net;
 using System.Windows.Threading;
 using Vanara.Windows.Shell;
 
@@ -425,6 +426,10 @@ public class AppRuntimeSettings : ViewModelBase
     public string DefaultBrowserPath { get; set; }
 
     public string AdbPath { get; set; }
+
+    public int AdbServerPort { get; set; }
+
+    public IPEndPoint AdbServerEndPoint => new(IPAddress.Loopback, AdbServerPort);
 
     private string tempDragPath = null;
     public string TempDragPath
