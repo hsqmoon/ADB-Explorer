@@ -16,6 +16,16 @@ public partial class App : Application
     private static string CrashLogPath => Path.Combine(LogDirectoryPath, "crash.log");
     private static readonly JsonSerializerSettings JsonSettings = new() { TypeNameHandling = TypeNameHandling.None };
 
+    public App()
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("windir")))
+        {
+            string windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (!string.IsNullOrWhiteSpace(windowsDirectory))
+                Environment.SetEnvironmentVariable("windir", windowsDirectory, EnvironmentVariableTarget.Process);
+        }
+    }
+
     private void Application_Startup(object sender, StartupEventArgs e)
     {
         // Read to force it to be set to Windows' culture
@@ -108,7 +118,7 @@ public partial class App : Application
             }
         }
 
-        ClearDrag();
+        ScheduleDragCleanup();
     }
 
     private void Application_Exit(object sender, ExitEventArgs e)
@@ -119,17 +129,37 @@ public partial class App : Application
         if (Data.Settings.UnrootOnDisconnect is true)
             ADBService.Unroot(Data.CurrentADBDevice);
 
-        App.Current.Dispatcher.Invoke(ClearDrag);
+        ScheduleDragCleanup();
     }
 
-    private static void ClearDrag()
+    private static void ScheduleDragCleanup()
     {
-        try
+        _ = Task.Run(() =>
         {
-            Directory.GetDirectories(Data.AppDataPath).ForEach(dir => Directory.Delete(dir, true));
-        }
-        catch
-        { }
+            string[] directories;
+            try
+            {
+                directories = Directory.GetDirectories(Data.AppDataPath, "drag-*");
+            }
+            catch
+            {
+                return;
+            }
+
+            var staleBefore = DateTime.UtcNow.AddDays(-1);
+            directories.ForEach(dir =>
+            {
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(dir) >= staleBefore)
+                        return;
+
+                    Directory.Delete(dir, true);
+                }
+                catch
+                { }
+            });
+        });
     }
 
     private void WriteSettings()

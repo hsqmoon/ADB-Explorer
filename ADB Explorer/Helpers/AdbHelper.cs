@@ -49,7 +49,7 @@ internal static class AdbHelper
                                                                   icon: DialogService.DialogIcon.Informational);
 
                 if (result.Item1 is ContentDialogResult.Primary)
-                    ADBService.KillAdbServer();
+                    await Task.Run(() => ADBService.KillAdbServer());
             }
 
             Data.QrClass = null;

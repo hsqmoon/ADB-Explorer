@@ -7,11 +7,13 @@ public static class DebugLog
     private static readonly Mutex mutex = new();
     private static string resolvedLogPath;
 
+    [Conditional("DEBUG")]
     public static void Initialize()
     {
         _ = LogPath;
     }
 
+    [Conditional("DEBUG")]
     public static void PrintLine(string message)
     {
         mutex.WaitOne();

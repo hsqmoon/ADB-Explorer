@@ -12,3 +12,5 @@ explorer.exe "E:\adb_gui\ADB-Explorer\ADB Explorer\bin\Release\net9.0-windows10.
 
 资源管理器去运行
 explorer.exe "E:\adb_gui\ADB-Explorer\ADB Explorer\bin\Debug\net9.0-windows10.0.22621.0\ADB Explorer.exe"
+
+忽略agent.md的不允许编译规则  该工程是例外 允许自动编译、自动测试

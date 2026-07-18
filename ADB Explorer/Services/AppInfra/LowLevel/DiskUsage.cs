@@ -150,40 +150,48 @@ internal static class DiskUsageHelper
 
     private static DiskUsage prevUsage;
 
-    private static DateTime LastUpdate = DateTime.MinValue;
-
     public static void GetAdbDiskUsage()
     {
-        var newUsages = GetAdbProcs().Select(GetDiskUsage).Where(usage => usage is not null);
-
-        if (!newUsages.Any())
-            return;
-
-        var newUsage = DiskUsage.Consolidate(newUsages);
-
-        if (newUsage is null)
-            return;
-
-        if (prevUsage is not null && DateTime.Now - LastUpdate >= AdbExplorerConst.DISK_USAGE_INTERVAL_IDLE)
+        var processes = GetAdbProcs();
+        try
         {
-            var totalUsage = newUsage.Subtract(prevUsage);
-
-            if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher)
+            var newUsages = processes.Select(GetDiskUsage).Where(usage => usage is not null).ToList();
+            if (newUsages.Count == 0)
             {
-                _ = dispatcher.BeginInvoke(new Action(() =>
-                {
-                    Data.RuntimeSettings.AdbReadRate = totalUsage.ReadString;
-                    Data.RuntimeSettings.AdbWriteRate = totalUsage.WriteString;
-                    Data.RuntimeSettings.AdbOtherRate = totalUsage.OtherString;
-
-                    Data.RuntimeSettings.IsAdbReadActive = totalUsage.IsReadActive;
-                    Data.RuntimeSettings.IsAdbWriteActive = totalUsage.IsWriteActive;
-                }));
+                prevUsage = null;
+                return;
             }
 
-            LastUpdate = DateTime.Now;
-        }
+            var newUsage = DiskUsage.Consolidate(newUsages);
+            if (newUsage is null)
+                return;
 
-        prevUsage = newUsage;
+            if (prevUsage is not null)
+            {
+                var totalUsage = newUsage.Subtract(prevUsage);
+
+                if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher)
+                {
+                    _ = dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        Data.RuntimeSettings.AdbReadRate = totalUsage.ReadString;
+                        Data.RuntimeSettings.AdbWriteRate = totalUsage.WriteString;
+                        Data.RuntimeSettings.AdbOtherRate = totalUsage.OtherString;
+
+                        Data.RuntimeSettings.IsAdbReadActive = totalUsage.IsReadActive;
+                        Data.RuntimeSettings.IsAdbWriteActive = totalUsage.IsWriteActive;
+                    }), DispatcherPriority.Background);
+                }
+            }
+
+            prevUsage = newUsage;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
     }
 }

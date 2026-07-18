@@ -1,5 +1,6 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
+using AdvancedSharpAdbClient;
 using System.Net;
 using static ADB_Explorer.Models.AdbExplorerConst;
 using static ADB_Explorer.Models.AdbRegEx;
@@ -14,6 +15,12 @@ public partial class ADBService
     private const string ADB_SERVER_PORT_ENV = "ANDROID_ADB_SERVER_PORT";
     private const int DEFAULT_ADB_SERVER_PORT = 5037;
     private const string INTERACTIVE_TERMINAL_COMMAND = "env TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 CLICOLOR_FORCE=1 TERM_PROGRAM=ADBExplorer sh -i";
+    private static readonly TimeSpan ADB_SERVER_RESTART_COOLDOWN = TimeSpan.FromSeconds(3);
+    private static readonly object AdbServerDiscoveryLock = new();
+    private static readonly object AdbServerRestartLock = new();
+    private static bool adbServerDiscoveryCompleted;
+    private static DateTime lastAdbServerRestart = DateTime.MinValue;
+    private static bool lastAdbServerRestartSucceeded;
 
     // find /sdcard/.Trash-AdbExplorer/ -maxdepth 1 -mindepth 1 \( -iname "\*" ! -iname ".RecycleIndex" ! -iname ".RecycleIndex.bak" \) 2>/dev/null | wc -l
     // Exclude the recycle folder, exclude content of sub-folders, include all files (including hidden), exclude the recycle index file, discard errors, count lines
@@ -92,37 +99,38 @@ public partial class ADBService
     {
         devices = [];
 
-        var adbServerPath = GetRunningAdbServerPath(DEFAULT_ADB_SERVER_PORT);
-        if (string.IsNullOrWhiteSpace(adbServerPath))
-            return false;
-
-        var originalAdbPath = RuntimeSettings.AdbPath;
-        var originalAdbServerPort = RuntimeSettings.AdbServerPort;
-
-        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-        RuntimeSettings.AdbPath = adbServerPath;
-        RuntimeSettings.AdbServerPort = DEFAULT_ADB_SERVER_PORT;
-
-        var result = ExecuteCommand(adbServerPath, GET_DEVICES, out string stdout, out _, Encoding.UTF8, cancellation.Token, "-l");
-        if (result != 0)
+        lock (AdbServerDiscoveryLock)
         {
-            RuntimeSettings.AdbPath = originalAdbPath;
-            RuntimeSettings.AdbServerPort = originalAdbServerPort;
-            return false;
+            if (adbServerDiscoveryCompleted)
+                return false;
+
+            adbServerDiscoveryCompleted = true;
+
+            try
+            {
+                var adbServerPath = GetRunningAdbServerPath(DEFAULT_ADB_SERVER_PORT);
+                if (string.IsNullOrWhiteSpace(adbServerPath))
+                    return false;
+
+                using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+                var result = ExecuteCommand(adbServerPath, GET_DEVICES, out string stdout, out _, Encoding.UTF8, cancellation.Token, "-l");
+                if (result != 0)
+                    return false;
+
+                if (!string.Equals(RuntimeSettings.AdbPath, adbServerPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    RuntimeSettings.AdbPath = adbServerPath;
+                    Data.AddCommandLog($"Using visible adb server: {adbServerPath} on {DEFAULT_ADB_SERVER_PORT}");
+                }
+
+                devices = ParseDevices(stdout).ToList();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
-
-        var serverDevices = ParseDevices(stdout).ToList();
-        if (serverDevices.Count == 0)
-        {
-            RuntimeSettings.AdbPath = originalAdbPath;
-            RuntimeSettings.AdbServerPort = originalAdbServerPort;
-            return false;
-        }
-
-        Data.AddCommandLog($"Using visible adb server: {adbServerPath} on {DEFAULT_ADB_SERVER_PORT}");
-
-        devices = serverDevices;
-        return true;
     }
 
     public class ProcessFailedException : Exception
@@ -178,9 +186,12 @@ public partial class ADBService
         cmdProcess.Start();
         SetBackgroundPriority(cmdProcess);
 
-        Data.AddCommandLog(isAdbExecutable
-            ? $"[adb-server:{RuntimeSettings.AdbServerPort}] {file} {arguments}"
-            : $"{file} {arguments}");
+        if (!isAdbExecutable || cmd != GET_DEVICES)
+        {
+            Data.AddCommandLog(isAdbExecutable
+                ? $"[adb-server:{RuntimeSettings.AdbServerPort}] {file} {arguments}"
+                : $"{file} {arguments}");
+        }
 
         return cmdProcess;
     }
@@ -296,9 +307,9 @@ public partial class ADBService
         string file, string cmd, Encoding encoding, CancellationToken cancellationToken, bool redirect = true, Process process = null, string workingDir = null, params string[] args)
     {
         using var cmdProcess = StartCommandProcess(file, cmd, encoding, redirect, process, workingDir, args: args);
-        cancellationToken.Register(() => ProcessHandling.KillProcess(cmdProcess));
+        using var cancellationRegistration = cancellationToken.Register(() => ProcessHandling.KillProcess(cmdProcess));
 
-        BlockingCollection<string> outputQueue = [];
+        using BlockingCollection<string> outputQueue = [];
         string stderr = "";
         cmdProcess.OutputDataReceived += (sender, e) =>
         {
@@ -308,7 +319,12 @@ public partial class ADBService
                 }
                 else
                 {
-                    outputQueue.Add(e.Data, cancellationToken);
+                    try
+                    {
+                        outputQueue.Add(e.Data);
+                    }
+                    catch (Exception exception) when (exception is InvalidOperationException or ObjectDisposedException)
+                    { }
                 }
 
             RuntimeSettings.LastServerResponse = DateTime.Now;
@@ -347,7 +363,7 @@ public partial class ADBService
         }
         else
         {
-            if (!string.IsNullOrEmpty(stderr) && stderr[1] == '\0')
+            if (stderr.Length > 1 && stderr[1] == '\0')
             {
                 stderr = Encoding.Unicode.GetString(Encoding.UTF8.GetBytes(stderr));
 
@@ -412,8 +428,24 @@ public partial class ADBService
         if (TrySwitchToVisibleAdbServer(out var visibleDevices))
             return visibleDevices;
 
-        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-        ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, cancellation.Token, "-l");
+        try
+        {
+            using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+            var devices = new AdbClient(AdbServerEndPoint)
+                .GetDevicesAsync(cancellation.Token)
+                .GetAwaiter()
+                .GetResult()
+                .Select(LogicalDevice.New)
+                .Where(device => device)
+                .ToList();
+            RuntimeSettings.LastServerResponse = DateTime.Now;
+            return devices;
+        }
+        catch
+        { }
+
+        using var processCancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+        ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, processCancellation.Token, "-l");
 
         return ParseDevices(stdout).ToList();
     }
@@ -462,15 +494,25 @@ public partial class ADBService
 
     private static bool RestartAdbServer()
     {
-        try
+        lock (AdbServerRestartLock)
         {
-            ExecuteCommand(RuntimeSettings.AdbPath, "kill-server", out _, out _, Encoding.UTF8, CancellationToken.None);
-            ExecuteCommand(RuntimeSettings.AdbPath, "start-server", out _, out _, Encoding.UTF8, CancellationToken.None);
-            return true;
-        }
-        catch
-        {
-            return false;
+            if (DateTime.UtcNow - lastAdbServerRestart < ADB_SERVER_RESTART_COOLDOWN)
+                return lastAdbServerRestartSucceeded;
+
+            lastAdbServerRestartSucceeded = false;
+
+            try
+            {
+                using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
+                ExecuteCommand(RuntimeSettings.AdbPath, "kill-server", out _, out _, Encoding.UTF8, cancellation.Token);
+                lastAdbServerRestartSucceeded = ExecuteCommand(RuntimeSettings.AdbPath, "start-server", out _, out _, Encoding.UTF8, cancellation.Token) == 0;
+            }
+            catch
+            { }
+
+            lastAdbServerRestart = DateTime.UtcNow;
+
+            return lastAdbServerRestartSucceeded;
         }
     }
 

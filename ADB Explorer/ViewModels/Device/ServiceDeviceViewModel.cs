@@ -47,7 +47,8 @@ public abstract class ServiceDeviceViewModel : PairingDeviceViewModel
 
     public DeviceAction PairCommand { get; }
 
-    public ServiceDeviceViewModel(ServiceDevice service) : base(service)
+    public ServiceDeviceViewModel(ServiceDevice service, bool subscribeRuntimeSettings = true)
+        : base(service, subscribeRuntimeSettings)
     {
         Device = service;
 
@@ -64,12 +65,12 @@ public abstract class ServiceDeviceViewModel : PairingDeviceViewModel
         return SetPairingPort(other.PairingPort);
     }
 
-    public static ServiceDeviceViewModel New(ServiceDevice device)
+    public static ServiceDeviceViewModel New(ServiceDevice device, bool subscribeRuntimeSettings = true)
     {
         return device switch
         {
-            PairingService => new PairingServiceViewModel(device),
-            ConnectService => new ConnectServiceViewModel(device),
+            PairingService => new PairingServiceViewModel(device, subscribeRuntimeSettings),
+            ConnectService => new ConnectServiceViewModel(device, subscribeRuntimeSettings),
             _ => throw new NotImplementedException(),
         };
     }
@@ -77,27 +78,14 @@ public abstract class ServiceDeviceViewModel : PairingDeviceViewModel
 
 public class PairingServiceViewModel : ServiceDeviceViewModel
 {
-    public PairingServiceViewModel(ServiceDevice service) : base(service)
+    public PairingServiceViewModel(ServiceDevice service, bool subscribeRuntimeSettings = true)
+        : base(service, subscribeRuntimeSettings)
     { }
 }
 
 public class ConnectServiceViewModel : ServiceDeviceViewModel
 {
-    public ConnectServiceViewModel(ServiceDevice service) : base(service)
+    public ConnectServiceViewModel(ServiceDevice service, bool subscribeRuntimeSettings = true)
+        : base(service, subscribeRuntimeSettings)
     { }
-}
-
-public class ServiceDeviceViewModelEqualityComparer : IEqualityComparer<ServiceDeviceViewModel>
-{
-    public bool Equals(ServiceDeviceViewModel x, ServiceDeviceViewModel y)
-    {
-        // IDs are equal and either both ports have a value, or they're both null
-        // We do not update the port since it can change too frequently, and we do not use it anyway
-        return x.ID == y.ID && !(string.IsNullOrEmpty(x.PairingPort) ^ string.IsNullOrEmpty(y.PairingPort));
-    }
-
-    public int GetHashCode([DisallowNull] ServiceDeviceViewModel obj)
-    {
-        throw new NotImplementedException();
-    }
 }

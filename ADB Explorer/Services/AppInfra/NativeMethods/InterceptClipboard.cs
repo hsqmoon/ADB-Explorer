@@ -9,6 +9,8 @@ public static partial class NativeMethods
         private static Action _externalClipAction;
         private static Action<string> _externalIpcAction;
         private static HwndSource _hwndSource;
+        private static Dispatcher _dispatcher;
+        private static int _clipboardRefreshScheduled;
 
         public static HANDLE MainWindowHandle { get; private set; } = IntPtr.Zero;
 
@@ -16,18 +18,8 @@ public static partial class NativeMethods
         {
             _externalClipAction = clipboardAction;
             _externalIpcAction = ipcAction;
+            _dispatcher = window.Dispatcher;
             RoutedEventHandler windowLoadedHandler = null;
-            PropertyChangedEventHandler driveViewHandler = null;
-
-            driveViewHandler = (sender, e) =>
-            {
-                if (e.PropertyName == nameof(Data.RuntimeSettings.DriveViewNav) && Data.RuntimeSettings.DriveViewNav)
-                {
-                    Data.RuntimeSettings.PropertyChanged -= driveViewHandler;
-                }
-            };
-
-            Data.RuntimeSettings.PropertyChanged += driveViewHandler;
 
             windowLoadedHandler = (sender, e) =>
             {
@@ -37,6 +29,7 @@ public static partial class NativeMethods
                 _hwndSource.AddHook(WndProc);
 
                 AddClipboardFormatListener(MainWindowHandle);
+                ScheduleClipboardRefresh();
 
                 window.Loaded -= windowLoadedHandler;
             };
@@ -49,29 +42,47 @@ public static partial class NativeMethods
             RemoveClipboardFormatListener(MainWindowHandle);
             _hwndSource?.RemoveHook(WndProc);
             _hwndSource?.Dispose();
+            _hwndSource = null;
+            _dispatcher = null;
+            _externalClipAction = null;
+            _externalIpcAction = null;
+            Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
+        }
+
+        private static void ScheduleClipboardRefresh()
+        {
+            if (_dispatcher is not { HasShutdownStarted: false } dispatcher
+                || Interlocked.Exchange(ref _clipboardRefreshScheduled, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                _ = dispatcher.BeginInvoke(new Action(() =>
+                {
+                    Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
+                    _externalClipAction?.Invoke();
+                }), DispatcherPriority.ContextIdle);
+            }
+            catch (InvalidOperationException)
+            {
+                Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
+            }
         }
 
         private static HANDLE WndProc(HANDLE hwnd, int msg, HANDLE wParam, HANDLE lParam, ref bool handled)
         {
             if ((ClipboardNotificationMessage)msg is ClipboardNotificationMessage.WM_CLIPBOARDUPDATE)
             {
-                try
-                {
-                    _externalClipAction();
-                }
-                catch (Exception ex) when (ex is COMException or ExternalException or OutOfMemoryException)
-                {
-#if !DEPLOY
-                    DebugLog.PrintLine($"Clipboard hook failed: {ex.GetType().Name}: {ex.Message}");
-#endif
-                }
+                ScheduleClipboardRefresh();
                 handled = true;
             }
             else if ((WindowMessages)msg is WindowMessages.WM_COPYDATA)
             // Since we already have a hook for MainWindow, we'll use it for IPC as well
             {
                 var cds = Marshal.PtrToStructure<COPYDATASTRUCT>(lParam);
-                _externalIpcAction(cds.lpData);
+                _externalIpcAction?.Invoke(cds.lpData);
             }
 
             return IntPtr.Zero;

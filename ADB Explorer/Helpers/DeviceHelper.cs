@@ -9,6 +9,7 @@ namespace ADB_Explorer.Helpers;
 
 public static class DeviceHelper
 {
+    private static int deviceOpenRequestVersion;
     private static readonly TimeSpan WsaInstallCheckCacheDuration = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan RootStatusUpdateInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan WsaStatusUpdateInterval = TimeSpan.FromSeconds(5);
@@ -25,10 +26,9 @@ public static class DeviceHelper
 
     public static DeviceStatus GetStatus(string status) => status switch
     {
-        "device" or "recovery" or "sideload" => DeviceStatus.Ok,
-        "offline" => DeviceStatus.Offline,
+        "device" or "online" or "recovery" or "sideload" => DeviceStatus.Ok,
         "unauthorized" or "authorizing" => DeviceStatus.Unauthorized,
-        _ => throw new NotImplementedException(),
+        _ => DeviceStatus.Offline,
     };
 
     public static DeviceType GetType(string id, string status)
@@ -112,11 +112,12 @@ public static class DeviceHelper
 
     public static void BrowseDeviceAction(LogicalDeviceViewModel device)
     {
-        Data.RuntimeSettings.DeviceToOpen = device;
+        OpenDevice(device);
     }
 
     public static void CloseCurrentDevice()
     {
+        Data.DirList?.Stop();
         Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
         DriveHelper.ClearDrives();
         FileActionLogic.ClearExplorer();
@@ -186,7 +187,7 @@ public static class DeviceHelper
             Data.DevicesObject.StoreHistoryDevices();
     }
 
-    public static void SideloadDeviceAction(LogicalDeviceViewModel device)
+    public static async void SideloadDeviceAction(LogicalDeviceViewModel device)
     {
         OpenFileDialog dialog = new()
         {
@@ -198,11 +199,35 @@ public static class DeviceHelper
         if (dialog.ShowDialog() is not true)
             return;
 
-        var res = ADBService.ExecuteDeviceAdbCommand(device.ID, "sideload", out string stdout, out string stderr, CancellationToken.None, ADBService.EscapeAdbString(dialog.FileName));
-        DialogService.ShowMessage(string.Join('\n', stdout, stderr),
+        (int res, string stdout, string stderr) result;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                var res = ADBService.ExecuteDeviceAdbCommand(
+                    device.ID,
+                    "sideload",
+                    out string stdout,
+                    out string stderr,
+                    CancellationToken.None,
+                    ADBService.EscapeAdbString(dialog.FileName));
+                return (res, stdout, stderr);
+            });
+        }
+        catch (Exception e)
+        {
+            DialogService.ShowMessage(
+                e.Message,
+                Strings.Resources.S_REBOOT_SIDELOAD,
+                DialogService.DialogIcon.Critical,
+                copyToClipboard: true);
+            return;
+        }
+
+        DialogService.ShowMessage(string.Join('\n', result.stdout, result.stderr),
                                   Strings.Resources.S_REBOOT_SIDELOAD,
-                                  res == 0 ? DialogService.DialogIcon.Informational
-                                           : DialogService.DialogIcon.Critical);
+                                  result.res == 0 ? DialogService.DialogIcon.Informational
+                                                  : DialogService.DialogIcon.Critical);
     }
 
     private static async void RemoveDeviceAction(DeviceViewModel device)
@@ -330,99 +355,128 @@ public static class DeviceHelper
             Process.Start($"{AdbExplorerConst.WSA_PROCESS_NAME}.exe");
         });
 
-    public static readonly Predicate<DeviceViewModel> DevicePredicate = device =>
+    internal static Predicate<DeviceViewModel> CreateDevicePredicate(IEnumerable<DeviceViewModel> devices)
     {
-        // current device cannot be hidden
-        if (device is LogicalDeviceViewModel { IsOpen: true })
-            return true;
+        var deviceList = devices.ToList();
+        var logicalDevices = deviceList.OfType<LogicalDeviceViewModel>().ToList();
+        var serviceDevices = deviceList.OfType<ServiceDeviceViewModel>().ToList();
+        HashSet<string> serviceIps = [.. serviceDevices.Select(service => service.IpAddress)];
+        HashSet<string> onlineRemoteOrLocalIps = [.. logicalDevices
+            .Where(logical => logical.Type is DeviceType.Remote or DeviceType.Local
+                && logical.Status is DeviceStatus.Ok)
+            .Select(logical => logical.IpAddress)];
+        HashSet<string> onlineLogicalIps = [.. logicalDevices
+            .Where(logical => logical.Status is not DeviceStatus.Offline)
+            .Select(logical => logical.IpAddress)];
+        HashSet<string> logicalIps = [.. logicalDevices.Select(logical => logical.IpAddress)];
+        HashSet<string> qrServiceIps = [.. serviceDevices
+            .Where(service => service.MdnsType is ServiceDevice.ServiceType.QrCode)
+            .Select(service => service.IpAddress)];
+        var onlineLocalDevices = logicalDevices
+            .Where(logical => logical.Type is DeviceType.Local && logical.Status is DeviceStatus.Ok)
+            .ToList();
+        var logicalNameCounts = logicalDevices
+            .GroupBy(logical => logical.Name ?? "", StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        bool onlineWsaExists = logicalDevices.Any(logical =>
+            logical.Type is DeviceType.WSA && logical.Status is not DeviceStatus.Offline);
 
-        if (device is LogicalDeviceViewModel && device.Type is DeviceType.Service)
+        foreach (var logical in logicalDevices.Where(logical => logical.Type is not DeviceType.Emulator))
+            logical.UseIdForName = logicalNameCounts.GetValueOrDefault(logical.Name ?? "") > 1;
+
+        return device =>
         {
-            if (device.Status is DeviceStatus.Offline)
+            // current device cannot be hidden
+            if (device is LogicalDeviceViewModel { IsOpen: true })
+                return true;
+
+            if (device is LogicalDeviceViewModel && device.Type is DeviceType.Service)
             {
-                // if a logical service is offline, and we have one of its services - hide the logical service
-                return Data.DevicesObject.ServiceDeviceViewModels.All(s => s.IpAddress != device.IpAddress);
+                if (device.Status is DeviceStatus.Offline)
+                {
+                    // if a logical service is offline, and we have one of its services - hide the logical service
+                    return !serviceIps.Contains(device.IpAddress);
+                }
+
+                // if there's a logical service and a remote device with the same IP - hide the logical service
+                return !onlineRemoteOrLocalIps.Contains(device.IpAddress);
             }
 
-            // if there's a logical service and a remote device with the same IP - hide the logical service
-            return !Data.DevicesObject.LogicalDeviceViewModels.Any(l => l.IpAddress == device.IpAddress
-                                                    && l.Type is DeviceType.Remote or DeviceType.Local
-                                                    && l.Status is DeviceStatus.Ok);
-        }
+            if (device is LogicalDeviceViewModel && device.Type is DeviceType.Remote)
+            {
+                // if a remote device is also connected by USB and both are authorized - hide the remote device
+                return !onlineLocalDevices.Any(usb =>
+                    (!string.IsNullOrEmpty(device.ID)
+                        && !string.IsNullOrEmpty(usb.ID)
+                        && device.ID.Contains(usb.ID))
+                    || usb.IpAddress == device.IpAddress);
+            }
 
-        if (device is LogicalDeviceViewModel && device.Type is DeviceType.Remote)
-        {
-            // if a remote device is also connected by USB and both are authorized - hide the remote device
-            return !Data.DevicesObject.LogicalDeviceViewModels.Any(usb => usb.Type is DeviceType.Local
-                && usb.Status is DeviceStatus.Ok
-                && (device.ID.Contains(usb.ID)
-                    || usb.IpAddress == device.IpAddress));
-        }
+            if (device is HistoryDeviceViewModel hist)
+            {
+                // if there's any device with the IP of a history device - hide the history device
+                return !logicalIps.Contains(hist.IpAddress)
+                    && !logicalIps.Contains(hist.HostName)
+                    && !serviceIps.Contains(hist.IpAddress)
+                    && !serviceIps.Contains(hist.HostName);
+            }
 
-        if (device is HistoryDeviceViewModel hist)
-        {
-            // if there's any device with the IP of a history device - hide the history device
-            return !Data.DevicesObject.LogicalDeviceViewModels.Any(logical => logical.IpAddress == hist.IpAddress || logical.IpAddress == hist.HostName)
-                    && !Data.DevicesObject.ServiceDeviceViewModels.Any(service => service.IpAddress == hist.IpAddress || service.IpAddress == hist.HostName);
-        }
+            if (device is ServiceDeviceViewModel service)
+            {
+                // connect services are always hidden
+                if (service is ConnectServiceViewModel)
+                    return false;
 
-        if (device is ServiceDeviceViewModel service)
-        {
-            // connect services are always hidden
-            if (service is ConnectServiceViewModel)
+                // if there's any online logical device with the IP of a pairing service - hide the pairing service
+                if (onlineLogicalIps.Contains(service.IpAddress))
+                    return false;
+
+                // if there's any QR service with the IP of a code pairing service - hide the code pairing service
+                if (service.MdnsType is ServiceDevice.ServiceType.PairingCode
+                    && qrServiceIps.Contains(service.IpAddress))
+                    return false;
+            }
+
+            if (device is WsaPkgDeviceViewModel wsaPkg)
+            {
+                // if WSA is not installed - hide it
+                if (wsaPkg.Status is DeviceStatus.Offline)
+                    return false;
+
+                // if an online logical WSA device exists, the WSA package is hidden
+                if (onlineWsaExists)
+                    return false;
+            }
+
+            // if there's an offline WSA device - hide it
+            if (device is LogicalDeviceViewModel { Type: DeviceType.WSA, Status: DeviceStatus.Offline })
                 return false;
 
-            // if there's any online logical device with the IP of a pairing service - hide the pairing service
-            if (Data.DevicesObject.LogicalDeviceViewModels.Any(logical => logical.Status is not DeviceStatus.Offline && logical.IpAddress == service.IpAddress))
-                return false;
+            return true;
+        };
+    }
 
-            // if there's any QR service with the IP of a code pairing service - hide the code pairing service
-            if (service.MdnsType is ServiceDevice.ServiceType.PairingCode
-                && Data.DevicesObject.ServiceDeviceViewModels.Any(qr => qr.MdnsType is ServiceDevice.ServiceType.QrCode
-                                                          && qr.IpAddress == service.IpAddress))
-                return false;
-        }
-
-        if (device is WsaPkgDeviceViewModel wsaPkg)
-        {
-            // if WSA is not installed - hide it
-            if (wsaPkg.Status is DeviceStatus.Offline)
-                return false;
-
-            // if an online logical WSA device exists, the WSA package is hidden
-            if (Data.DevicesObject.LogicalDeviceViewModels.Any(logical => logical.Type is DeviceType.WSA && logical.Status is not DeviceStatus.Offline))
-                return false;
-        }
-
-        // if there's an offline WSA device - hide it
-        if (device is LogicalDeviceViewModel { Type: DeviceType.WSA, Status: DeviceStatus.Offline })
-            return false;
-
-        if (device is LogicalDeviceViewModel logicalDev && logicalDev.Type is not DeviceType.Emulator)
-        {
-            // if there are multiple logical devices of the same model, display their ID instead
-            logicalDev.UseIdForName = Data.DevicesObject.LogicalDeviceViewModels.Count(dev => dev.Name.Equals(logicalDev.Name)) > 1;
-        }
-
-        return true;
-    };
-
-    public static readonly Predicate<object> devicePredicate = d => DevicePredicate((DeviceViewModel)d);
+    internal static int CountVisibleDevices(IEnumerable<DeviceViewModel> devices)
+    {
+        var deviceList = devices.ToList();
+        var predicate = CreateDevicePredicate(deviceList);
+        return deviceList.Count(device => predicate(device)
+            && device is not HistoryDeviceViewModel and not NewDeviceViewModel);
+    }
 
     public static void FilterDevices(ICollectionView collectionView)
     {
         if (collectionView is null)
             return;
 
-        if (collectionView.Filter is not null)
+        if (collectionView.Filter is null)
         {
-            collectionView.Refresh();
-            return;
+            collectionView.SortDescriptions.Clear();
+            collectionView.SortDescriptions.Add(new SortDescription(nameof(DeviceViewModel.Type), ListSortDirection.Ascending));
         }
 
-        collectionView.Filter = new(devicePredicate);
-        collectionView.SortDescriptions.Clear();
-        collectionView.SortDescriptions.Add(new SortDescription(nameof(DeviceViewModel.Type), ListSortDirection.Ascending));
+        var predicate = CreateDevicePredicate(Data.DevicesObject.UIList);
+        collectionView.Filter = item => item is DeviceViewModel device && predicate(device);
     }
 
     public static void UpdateDevicesBatInfo()
@@ -464,11 +518,12 @@ public static class DeviceHelper
         if (services is null)
             return;
 
-        var viewModels = services.Select(ServiceDeviceViewModel.New);
+        var serviceList = services.ToList();
 
-        if (!Data.DevicesObject.ServicesChanged(viewModels))
+        if (!Data.DevicesObject.ServicesChanged(serviceList))
             return;
 
+        var viewModels = serviceList.Select(service => ServiceDeviceViewModel.New(service, false)).ToList();
         Data.DevicesObject.UpdateServices(viewModels);
 
         var qrServices = Data.DevicesObject.ServiceDeviceViewModels.Where(service =>
@@ -640,33 +695,51 @@ public static class DeviceHelper
 
     public static IEnumerable<LogicalDeviceViewModel> ReconnectFileOpDevice(IEnumerable<LogicalDeviceViewModel> devices)
     {
-        var pastOps = Data.FileOpQ.Operations.Where(op => op.IsPastOp);
+        var connectedDevices = devices.ToList();
+        var currentUiDevices = Data.DevicesObject.UIList.ToHashSet();
+        var pastDevices = Data.FileOpQ.Operations
+            .Where(op => op.IsPastOp && !currentUiDevices.Contains(op.Device.Device))
+            .Select(op => op.Device.Device)
+            .GroupBy(device => device.ID)
+            .ToDictionary(group => group.Key, group => group.First());
 
-        // get the newly acquired devices with similar IDs to devices of the past file ops [the objects of] which also do not exist in the devices UI list
-        var exceptDevices = devices.Where(d => pastOps.Any(op => op.Device.ID == d.ID && !Data.DevicesObject.UIList.Contains(op.Device.Device)));
+        for (int i = 0; i < connectedDevices.Count; i++)
+        {
+            if (pastDevices.TryGetValue(connectedDevices[i].ID, out var pastDevice))
+            {
+                pastDevice.UpdateDevice(connectedDevices[i]);
+                connectedDevices[i] = pastDevice;
+            }
+        }
 
-        // get the corresponding file op devices
-        var fileOpDevices = pastOps.Select(op => op.Device.Device).Where(d => exceptDevices.Any(e => e.ID == d.ID));
-
-        return devices.Except(exceptDevices, new LogicalDeviceViewModelEqualityComparer()).AppendRange(fileOpDevices.Distinct());
+        return connectedDevices;
     }
 
     public static void DeviceListSetup(string selectedAddress = "")
     {
         Task.Run(ADBService.GetDevices).ContinueWith((t) =>
         {
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => DeviceListSetup(t.Result.Select(l => new LogicalDeviceViewModel(l)), selectedAddress)));
+            if (!t.IsCompletedSuccessfully || App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            _ = dispatcher.BeginInvoke(new Action(() => DeviceListSetup(
+                t.Result.Select(l => new LogicalDeviceViewModel(l, false)).ToList(), selectedAddress)));
         });
     }
 
     public static void DeviceListSetup(IEnumerable<LogicalDeviceViewModel> devices, string selectedAddress = "")
     {
-        devices = ReconnectFileOpDevice(devices);
-        Data.DevicesObject.UpdateDevices(devices);
+        int openRequestVersion = Interlocked.Increment(ref deviceOpenRequestVersion);
+        var deviceList = ReconnectFileOpDevice(devices).ToList();
+        Data.DevicesObject.UpdateDevices(deviceList);
         Data.RuntimeSettings.FilterDevices = true;
 
-        if (Data.DevicesObject.Current is null || Data.DevicesObject.Current.IsOpen && Data.DevicesObject.Current.Status is not DeviceStatus.Ok)
+        var currentDevice = Data.DevicesObject.Current;
+        if (currentDevice is null
+            || currentDevice.Status is not DeviceStatus.Ok
+            || !Data.DevicesObject.LogicalDeviceViewModels.Contains(currentDevice))
         {
+            Data.DirList?.Stop();
             DriveHelper.ClearDrives();
             Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
             Data.CurrentADBDevice = null;
@@ -679,12 +752,11 @@ public static class DeviceHelper
 
         CollapseDevices();
 
+        Data.DirList?.Stop();
         Data.DevicesObject.SetOpenDevice((LogicalDeviceViewModel)null);
         Data.CurrentADBDevice = null;
         Data.RuntimeSettings.CurrentDevice = null;
         Data.DirList = null;
-
-        Data.CopyPaste.GetClipboardPasteItems();
 
         FileActionLogic.ClearExplorer();
         Data.FileActions.IsExplorerVisible = false;
@@ -692,84 +764,107 @@ public static class DeviceHelper
         NavHistory.Reset();
         DriveHelper.ClearDrives();
 
-        if (string.IsNullOrEmpty(selectedAddress))
-        {
-            if (!Data.Settings.AutoOpen)
-                return;
-        }
-        else
-        {
-            if (!Data.DevicesObject.SetOpenDevice(selectedAddress))
-                return;
-        }
-
-        if (!devices.Any() && Data.DevicesObject.Current is null)
+        if (string.IsNullOrEmpty(selectedAddress) && !Data.Settings.AutoOpen)
             return;
 
-        var startTime = DateTime.Now;
-        LogicalDeviceViewModel device;
+        var availableDevices = Data.DevicesObject.LogicalDeviceViewModels.ToList();
+        if (availableDevices.Count == 0)
+            return;
 
-        if (Data.DevicesObject.Current is null)
+        LogicalDeviceViewModel device;
+        if (!string.IsNullOrEmpty(selectedAddress))
         {
-            device = devices.FirstOrDefault(d => d.ID == Data.Settings.LastDeviceId)
-                ?? devices.FirstOrDefault(d => d.Name == Data.Settings.LastDevice)
-                ?? devices.FirstOrDefault();
+            device = availableDevices.FirstOrDefault(d => d.ID == selectedAddress && d.Status is DeviceStatus.Ok);
         }
         else
-            device = Data.DevicesObject.Current;
+        {
+            device = availableDevices.FirstOrDefault(d => d.ID == Data.Settings.LastDeviceId)
+                ?? availableDevices.FirstOrDefault(d => d.Name == Data.Settings.LastDevice)
+                ?? availableDevices.FirstOrDefault();
+        }
 
-        Task.Run(() =>
+        _ = Task.Run(async () =>
         {
             if (device is null)
                 return false;
 
+            var startTime = DateTime.Now;
             while (device.Status is not DeviceStatus.Ok)
             {
-                if (DateTime.Now - startTime > TimeSpan.FromSeconds(6))
+                if (openRequestVersion != Volatile.Read(ref deviceOpenRequestVersion)
+                    || DateTime.Now - startTime > TimeSpan.FromSeconds(6))
+                {
                     return false;
+                }
 
-                Thread.Sleep(500);
+                await Task.Delay(500);
             }
             return true;
         }).ContinueWith(t =>
         {
             _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!t.Result)
+                if (!t.IsCompletedSuccessfully || !t.Result
+                    || openRequestVersion != Volatile.Read(ref deviceOpenRequestVersion)
+                    || device.Status is not DeviceStatus.Ok)
+                {
                     return;
+                }
 
-                Data.DevicesObject.SetOpenDevice(device);
-                Data.CurrentADBDevice = new(Data.DevicesObject.Current);
-                Data.RuntimeSettings.InitLister = true;
+                OpenDevice(device);
             }));
         });
     }
 
-    public static void InitDevice()
+    private static async Task InitDevice()
     {
-        string reopenPath = GetAutoOpenPath(Data.DevicesObject.Current);
+        var currentDevice = Data.DevicesObject.Current;
+        var currentAdbDevice = Data.CurrentADBDevice;
+        if (currentDevice is null || currentAdbDevice is null)
+            return;
 
-        SetAndroidVersion();
-        FileActionLogic.RefreshDrives(true);
+        string reopenPath = GetAutoOpenPath(currentDevice);
+        if (string.IsNullOrEmpty(reopenPath))
+            Data.RuntimeSettings.DriveViewNav = true;
+        else
+            Data.FileActions.IsDriveViewVisible = false;
 
-        FolderHelper.CombineDisplayNames();
-        Data.RuntimeSettings.DriveViewNav = true;
-
-        Data.CopyPaste.GetClipboardPasteItems();
         Data.RuntimeSettings.FilterDrives = true;
-
-        Data.RuntimeSettings.CurrentDevice = Data.DevicesObject.Current;
-        Data.FileActions.PushPackageEnabled = Data.Settings.EnableApk && Data.DevicesObject?.Current?.Type is not DeviceType.Recovery;
+        Data.FileActions.PushPackageEnabled = Data.Settings.EnableApk && currentDevice.Type is not DeviceType.Recovery;
 
         Data.FileOpQ.MoveOperationsToPast();
         FileActionLogic.UpdateFileActions();
 
-        if (!string.IsNullOrEmpty(reopenPath))
+        try
         {
-            Data.Settings.LastDevicePath = reopenPath;
-            Data.Settings.SetLastDevicePath(Data.DevicesObject.Current?.ID, reopenPath);
-            ScheduleAutoOpenRestore(Data.DevicesObject.Current, reopenPath);
+            string version = await currentAdbDevice.GetAndroidVersion();
+            if (ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+                && ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+            {
+                currentDevice.SetAndroidVersion(version);
+            }
         }
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to read Android version: {e.Message}");
+        }
+
+        if (!ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+            || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+        {
+            return;
+        }
+
+        await FileActionLogic.RefreshDrives(true, string.IsNullOrEmpty(reopenPath));
+
+        if (string.IsNullOrEmpty(reopenPath)
+            || !ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+            || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+        {
+            return;
+        }
+
+        Data.RuntimeSettings.LocationToNavigate = new(reopenPath);
     }
 
     public static void TestDevices()
@@ -778,21 +873,6 @@ public static class DeviceHelper
 
         //DevicesObject.UpdateServices(new List<ServiceDevice>() { new PairingService("sdfsdfdsf_adb-tls-pairing._tcp.", "192.168.1.20", "5555") { MdnsType = ServiceDevice.ServiceType.PairingCode } });
         //DevicesObject.UpdateDevices(new List<LogicalDevice>() { LogicalDevice.New("Test", "test.ID", "device") });
-    }
-
-    public static void SetAndroidVersion()
-    {
-        var versionTask = Task.Run(Data.CurrentADBDevice.GetAndroidVersion);
-        versionTask.ContinueWith(t =>
-        {
-            if (t.IsCanceled)
-                return;
-
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                Data.DevicesObject.Current.SetAndroidVersion(t.Result);
-            }));
-        });
     }
 
     public static void ConnectDevice(DeviceViewModel device)
@@ -817,6 +897,7 @@ public static class DeviceHelper
                 }
 
                 Data.DevicesObject.UIList.Remove(device);
+                logical.DetachRuntimeSettings();
                 Data.RuntimeSettings.FilterDevices = true;
                 DeviceListSetup();
                 break;
@@ -830,12 +911,16 @@ public static class DeviceHelper
 
     public static void OpenDevice(LogicalDeviceViewModel device)
     {
+        if (device is null || device.Status is not DeviceStatus.Ok)
+            return;
+
+        Interlocked.Increment(ref deviceOpenRequestVersion);
+        FileActionLogic.ClearExplorer();
+        NavHistory.Reset();
         Data.CurrentADBDevice = new(device);
         Data.DevicesObject.SetOpenDevice(device);
         Data.RuntimeSettings.InitLister = true;
-        FileActionLogic.ClearExplorer();
-        NavHistory.Reset();
-        InitDevice();
+        _ = InitDevice();
 
         Data.RuntimeSettings.IsDevicesPaneOpen = false;
     }
@@ -852,36 +937,6 @@ public static class DeviceHelper
         return string.Equals(Data.Settings.LastDevice, device.Name, StringComparison.Ordinal)
             ? Data.Settings.LastDevicePath
             : null;
-    }
-
-    private static void ScheduleAutoOpenRestore(LogicalDeviceViewModel device, string path)
-    {
-        if (device is null || string.IsNullOrWhiteSpace(path))
-            return;
-
-        string deviceId = device.ID;
-
-        Task.Run(async () =>
-        {
-            for (int attempt = 0; attempt < 12; attempt++)
-            {
-                if (!Data.Settings.AutoOpen || Data.DevicesObject.Current?.ID != deviceId)
-                    return;
-
-                string realPath = FolderHelper.FolderExists(path, showError: false);
-                if (!string.IsNullOrEmpty(realPath))
-                {
-                    _ = App.Current?.Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        if (Data.DevicesObject.Current?.ID == deviceId)
-                            Data.RuntimeSettings.LocationToNavigate = new(realPath);
-                    }));
-                    return;
-                }
-
-                await Task.Delay(1000);
-            }
-        });
     }
 
     public static void ConnectWsaDevice()
@@ -942,8 +997,18 @@ public static class DeviceHelper
         }
     }
 
-    public static int? GetWsaPid() =>
-        Process.GetProcessesByName(AdbExplorerConst.WSA_PROCESS_NAME).FirstOrDefault()?.Id;
+    public static int? GetWsaPid()
+    {
+        var processes = Process.GetProcessesByName(AdbExplorerConst.WSA_PROCESS_NAME);
+        try
+        {
+            return processes.FirstOrDefault()?.Id;
+        }
+        finally
+        {
+            processes.ForEach(process => process.Dispose());
+        }
+    }
 
     private static bool IsWsaInstalled()
     {

@@ -12,7 +12,13 @@ internal static class FileActionLogic
     private static readonly object DriveRefreshLock = new();
     private static readonly HashSet<string> ActiveDriveRefreshes = [];
     private static readonly Dictionary<string, DateTime> LastDriveRefresh = [];
+    private static readonly object PushedFilesLock = new();
+    private static readonly Dictionary<
+        (string DeviceId, string ParentPath, string FullName),
+        (string FullPath, FileType Type, long? Size, DateTime? Modified)> PendingPushedFiles = [];
+    private static bool PushedFilesUpdateScheduled;
     private static int fileActionsRefreshScheduled;
+    private static int packageRefreshVersion;
 
     private static string RemoveApkMessage(IEnumerable<IBrowserItem> objects)
     {
@@ -81,8 +87,7 @@ internal static class FileActionLogic
         if (dialog.ShowDialog() != CommonFileDialogResult.Ok)
             return;
 
-        var shItems = dialog.FileNames.Select(ShellItem.Open);
-        ShellFileOperation.PushPackages(Data.CurrentADBDevice, shItems, App.Current.Dispatcher);
+        ShellFileOperation.PushPackages(Data.CurrentADBDevice, dialog.FileNames, App.Current.Dispatcher);
     }
 
     public static void UpdateModifiedDates()
@@ -159,90 +164,92 @@ internal static class FileActionLogic
         });
     }
 
-    public static void RestoreItems()
+    public static async void RestoreItems()
     {
-        var restoreItems = (!Data.SelectedFiles.Any() ? Data.DirList.FileList : Data.SelectedFiles).Where(file => file.TrashIndex is not null && !string.IsNullOrEmpty(file.TrashIndex.OriginalPath));
-        string[] existingItems = [];
-        List<FileClass> existingFiles = [];
-        bool merge = false;
+        var device = Data.CurrentADBDevice;
+        var lister = Data.DirList;
+        var currentPath = Data.CurrentPath;
+        if (device is null || lister is null)
+            return;
 
-        var restoreTask = Task.Run(() =>
+        var restoreItems = (!Data.SelectedFiles.Any() ? lister.FileList : Data.SelectedFiles)
+            .Where(file => file.TrashIndex is not null
+                && !string.IsNullOrEmpty(file.TrashIndex.OriginalPath))
+            .ToList();
+        if (restoreItems.Count == 0)
+            return;
+
+        HashSet<FileClass> conflictingItems;
+        bool merge;
+        try
         {
-            existingItems = ADBService.FindFiles(Data.CurrentADBDevice.ID, restoreItems.Select(file => file.TrashIndex.OriginalPath));
-            if (existingItems?.Length > 0)
+            (conflictingItems, merge) = await Task.Run(() =>
             {
-                if (restoreItems.Any(item => item.IsDirectory && existingItems.Contains(item.TrashIndex.OriginalPath)))
-                    merge = true;
+                var existingPaths = (ADBService.FindFiles(
+                        device.ID,
+                        restoreItems.Select(file => file.TrashIndex.OriginalPath)) ?? [])
+                    .ToHashSet(StringComparer.Ordinal);
+                HashSet<FileClass> conflicts = restoreItems
+                    .Where(item => existingPaths.Contains(item.TrashIndex.OriginalPath))
+                    .ToHashSet();
 
-                existingItems = [.. existingItems.Select(path => path[(path.LastIndexOf('/') + 1)..])];
-            }
-
-            foreach (var item in restoreItems)
-            {
-                if (existingItems.Contains(item.FullName))
-                    return;
-
-                if (restoreItems.Count(file => file.FullName == item.FullName && file.TrashIndex.OriginalPath == item.TrashIndex.OriginalPath) > 1)
+                foreach (var group in restoreItems.GroupBy(
+                    item => item.TrashIndex.OriginalPath,
+                    StringComparer.Ordinal))
                 {
-                    existingItems = [.. existingItems, item.FullName];
-                    existingFiles.Add(item);
-                    if (item.IsDirectory)
-                        merge = true;
-                }
-            }
-        });
-
-        restoreTask.ContinueWith((t) =>
-        {
-            _ = App.Current.Dispatcher.BeginInvoke(async () =>
-            {
-                if (existingItems.Length is int count and > 0)
-                {
-                    var result = await DialogService.ShowConfirmation(
-                        count == 1
-                            ? Strings.Resources.S_CONFLICT_ITEMS
-                            : string.Format(Strings.Resources.S_CONFLICT_ITEMS_PLURAL, count),
-                        Strings.Resources.S_RESTORE_CONF_TITLE,
-                        primaryText: merge
-                            ? Strings.Resources.S_MERGE_OR_REPLACE
-                            : Strings.Resources.S_REPLACE,
-                        secondaryText: count == restoreItems.Count() ? "" : Strings.Resources.S_SKIP,
-                        cancelText: Strings.Resources.S_CANCEL,
-                        icon: DialogService.DialogIcon.Exclamation);
-
-                    if (result.Item1 is ContentDialogResult.None)
-                    {
-                        return;
-                    }
-
-                    if (result.Item1 is ContentDialogResult.Secondary)
-                    {
-                        restoreItems = existingFiles.Count != count
-                            ? restoreItems.Where(item => !existingItems.Contains(item.FullName))
-                            : restoreItems.Except(existingFiles);
-                    }
+                    conflicts.UnionWith(group.Skip(1));
                 }
 
-                ShellFileOperation.MoveItems(device: Data.CurrentADBDevice,
-                                         items: restoreItems,
-                                         targetPath: null,
-                                         currentPath: Data.CurrentPath,
-                                         fileList: Data.DirList.FileList,
-                                         dispatcher: App.Current.Dispatcher);
-
-                var remainingItems = Data.DirList.FileList.Except(restoreItems);
-                TrashHelper.EnableRecycleButtons(remainingItems);
-
-                // Clear all remaining files if none of them are indexed
-                if (!remainingItems.Any(item => item.TrashIndex is not null))
-                {
-                    _ = Task.Run(() => ShellFileOperation.SilentDelete(Data.CurrentADBDevice, remainingItems));
-                }
-
-                if (!Data.SelectedFiles.Any())
-                    TrashHelper.EnableRecycleButtons();
+                return (conflicts, conflicts.Any(item => item.IsDirectory));
             });
-        });
+        }
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to check restore conflicts: {e.Message}");
+            return;
+        }
+
+        if (conflictingItems.Count > 0)
+        {
+            var result = await DialogService.ShowConfirmation(
+                conflictingItems.Count == 1
+                    ? Strings.Resources.S_CONFLICT_ITEMS
+                    : string.Format(Strings.Resources.S_CONFLICT_ITEMS_PLURAL, conflictingItems.Count),
+                Strings.Resources.S_RESTORE_CONF_TITLE,
+                primaryText: merge
+                    ? Strings.Resources.S_MERGE_OR_REPLACE
+                    : Strings.Resources.S_REPLACE,
+                secondaryText: conflictingItems.Count == restoreItems.Count ? "" : Strings.Resources.S_SKIP,
+                cancelText: Strings.Resources.S_CANCEL,
+                icon: DialogService.DialogIcon.Exclamation);
+
+            if (result.Item1 is ContentDialogResult.None)
+                return;
+
+            if (result.Item1 is ContentDialogResult.Secondary)
+                restoreItems = restoreItems.Where(item => !conflictingItems.Contains(item)).ToList();
+        }
+
+        await ShellFileOperation.MoveItems(
+            device: device,
+            items: restoreItems,
+            targetPath: null,
+            currentPath: currentPath,
+            fileList: lister.FileList,
+            dispatcher: App.Current.Dispatcher);
+
+        if (!ReferenceEquals(Data.DirList, lister))
+            return;
+
+        var remainingItems = lister.FileList.Except(restoreItems).ToList();
+        TrashHelper.EnableRecycleButtons(remainingItems);
+
+        // Clear all remaining files if none of them are indexed
+        if (!remainingItems.Any(item => item.TrashIndex is not null))
+            _ = Task.Run(() => ShellFileOperation.SilentDelete(device, remainingItems));
+
+        if (!Data.SelectedFiles.Any())
+            TrashHelper.EnableRecycleButtons();
     }
 
     public static void CopyItemPath()
@@ -262,7 +269,7 @@ internal static class FileActionLogic
         try
         {
             if (file.Type is FileType.Folder)
-                ShellFileOperation.MakeDir(Data.CurrentADBDevice, file.FullPath);
+                _ = ShellFileOperation.MakeDir(Data.CurrentADBDevice, file.FullPath);
             else if (file.Type is FileType.File)
                 ShellFileOperation.MakeFile(Data.CurrentADBDevice, file.FullPath);
             else
@@ -662,9 +669,9 @@ internal static class FileActionLogic
 
         if (!Data.FileActions.IsRecycleBin && Data.Settings.EnableRecycle && !result.Item2)
         {
-            await Task.Run(() => ShellFileOperation.MakeDir(Data.CurrentADBDevice, AdbExplorerConst.RECYCLE_PATH));
+            await ShellFileOperation.MakeDir(Data.CurrentADBDevice, AdbExplorerConst.RECYCLE_PATH);
 
-            ShellFileOperation.MoveItems(Data.CurrentADBDevice,
+            await ShellFileOperation.MoveItems(Data.CurrentADBDevice,
                                          itemsToDelete,
                                          AdbExplorerConst.RECYCLE_PATH,
                                          Data.CurrentPath,
@@ -677,7 +684,7 @@ internal static class FileActionLogic
 
             if (Data.FileActions.IsRecycleBin)
             {
-                var remainingItems = Data.DirList.FileList.Except(itemsToDelete);
+                var remainingItems = Data.DirList.FileList.Except(itemsToDelete).ToList();
                 TrashHelper.EnableRecycleButtons(remainingItems);
 
                 // Clear all remaining files if none of them are indexed
@@ -689,7 +696,7 @@ internal static class FileActionLogic
         }
     }
 
-    public static void RefreshDrives(bool asyncClassify = false)
+    public static async Task RefreshDrives(bool asyncClassify = false, bool updateCounts = true)
     {
         var currentDevice = Data.DevicesObject.Current;
         var currentAdbDevice = Data.CurrentADBDevice;
@@ -701,20 +708,82 @@ internal static class FileActionLogic
             asyncClassify = true;
 
         string deviceId = currentDevice.ID;
+        bool refreshTopology;
         lock (DriveRefreshLock)
         {
             if (ActiveDriveRefreshes.Contains(deviceId))
                 return;
 
-            if (LastDriveRefresh.TryGetValue(deviceId, out DateTime lastRefresh)
-                && currentDevice.Drives?.Count > 0
-                && DateTime.Now - lastRefresh < AdbExplorerConst.DRIVE_UPDATE_INTERVAL)
-            {
-                return;
-            }
+            refreshTopology = !LastDriveRefresh.TryGetValue(deviceId, out DateTime lastRefresh)
+                || currentDevice.Drives?.Count is not > 0
+                || DateTime.Now - lastRefresh >= AdbExplorerConst.DRIVE_UPDATE_INTERVAL;
 
-            ActiveDriveRefreshes.Add(deviceId);
-            LastDriveRefresh[deviceId] = DateTime.Now;
+            if (refreshTopology)
+                ActiveDriveRefreshes.Add(deviceId);
+        }
+
+        if (refreshTopology)
+        {
+            try
+            {
+                var drives = await Task.Run(() => currentAdbDevice.Status is AbstractDevice.DeviceStatus.Ok
+                    ? currentAdbDevice.GetDrives()
+                    : null);
+
+                if (drives is null
+                    || !ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+                    || !ReferenceEquals(Data.DevicesObject.Current, currentDevice)
+                    || App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                {
+                    return;
+                }
+
+                Task<bool> updateTask = await dispatcher.InvokeAsync(
+                    () => currentDevice.UpdateDrives(drives, dispatcher, asyncClassify),
+                    DispatcherPriority.Background);
+                await updateTask;
+
+                if (!ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+                    || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+                {
+                    return;
+                }
+
+                await dispatcher.InvokeAsync(() =>
+                {
+                    if (!ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+                        || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+                    {
+                        return;
+                    }
+
+                    Data.RuntimeSettings.FilterDrives = true;
+                    FolderHelper.CombineDisplayNames();
+                }, DispatcherPriority.Background);
+
+                lock (DriveRefreshLock)
+                {
+                    LastDriveRefresh[deviceId] = DateTime.Now;
+                }
+            }
+            catch (Exception e)
+            {
+                Data.AddCommandLog($"@ADB Explorer: failed to refresh drives: {e.Message}");
+            }
+            finally
+            {
+                lock (DriveRefreshLock)
+                {
+                    ActiveDriveRefreshes.Remove(deviceId);
+                }
+            }
+        }
+
+        if (!updateCounts
+            || !ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+            || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+        {
+            return;
         }
 
         bool isRecovery = currentDevice.Type is AbstractDevice.DeviceType.Recovery;
@@ -722,87 +791,78 @@ internal static class FileActionLogic
         bool hasTempDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Temp) == true;
         bool hasPackageDrive = currentDevice.Drives?.Any(d => d.Type is AbstractDrive.DriveType.Package) == true;
 
-        var driveTask = Task.Run(() =>
+        if (isRecovery)
         {
-            if (currentAdbDevice.Status is not AbstractDevice.DeviceStatus.Ok)
-                return null;
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
 
-            var drives = currentAdbDevice.GetDrives();
-
-            if (isRecovery)
+            await dispatcher.InvokeAsync(() =>
             {
+                if (!ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+                    return;
+
                 foreach (var item in currentDevice.Drives?.OfType<VirtualDriveViewModel>() ?? [])
                 {
                     item.SetItemsCount(item.Type is AbstractDrive.DriveType.Package ? -1 : null);
                 }
-            }
-            else
-            {
-                if (Data.Settings.EnableRecycle && hasTrashDrive)
-                    TrashHelper.UpdateRecycledItemsCount();
+            }, DispatcherPriority.Background);
+            return;
+        }
 
-                if (Data.Settings.EnableApk && hasTempDrive)
-                    UpdateInstallersCount();
+        if (Data.Settings.EnableRecycle && hasTrashDrive)
+            await TrashHelper.UpdateRecycledItemsCount();
 
-                if (Data.Settings.EnableApk && hasPackageDrive)
-                    UpdatePackagesCount();
-            }
-
-            return drives;
-        });
-        driveTask.ContinueWith((t) =>
+        if (!ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+            || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
         {
-            lock (DriveRefreshLock)
-            {
-                ActiveDriveRefreshes.Remove(deviceId);
-            }
+            return;
+        }
 
-            if (t.IsCanceled || t.IsFaulted || t.Result is null)
-                return;
+        if (Data.Settings.EnableApk && hasTempDrive)
+            await UpdateInstallersCount();
 
-            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
-                return;
+        if (!ReferenceEquals(Data.CurrentADBDevice, currentAdbDevice)
+            || !ReferenceEquals(Data.DevicesObject.Current, currentDevice))
+        {
+            return;
+        }
 
-            _ = dispatcher.BeginInvoke(async () =>
-            {
-                var activeDevice = Data.DevicesObject.Current;
-                if (activeDevice?.ID != deviceId)
-                    return;
-
-                if (await activeDevice.UpdateDrives(t.Result, dispatcher, asyncClassify))
-                {
-                    Data.RuntimeSettings.FilterDrives = true;
-                    FolderHelper.CombineDisplayNames();
-                }
-            });
-        });
+        if (Data.Settings.EnableApk && hasPackageDrive)
+            await UpdatePackagesCount();
     }
 
-    public static void UpdateInstallersCount()
+    public static async Task UpdateInstallersCount()
     {
         var currentDevice = Data.DevicesObject.Current;
         if (currentDevice is null)
             return;
 
         string deviceId = currentDevice.ID;
-        var countTask = Task.Run(() => ADBService.CountPackages(deviceId));
-        countTask.ContinueWith((t) =>
+        ulong count;
+        try
         {
-            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+            count = await Task.Run(() => ADBService.CountPackages(deviceId));
+        }
+        catch
+        {
+            return;
+        }
+
+        if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+            return;
+
+        await dispatcher.InvokeAsync(() =>
+        {
+            if (Data.DevicesObject.Current?.ID != deviceId)
                 return;
 
-            _ = dispatcher.BeginInvoke(new Action(() =>
-            {
-                if (!t.IsCanceled && !t.IsFaulted && Data.DevicesObject.Current?.ID == deviceId)
-                {
-                    var temp = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Temp);
-                    ((VirtualDriveViewModel)temp)?.SetItemsCount((long)t.Result);
-                }
-            }));
-        });
+            var temp = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Temp);
+            ((VirtualDriveViewModel)temp)?.SetItemsCount(
+                count <= (ulong)long.MaxValue ? (long)count : null);
+        }, DispatcherPriority.Background);
     }
 
-    public static void UpdatePackagesCount()
+    public static async Task UpdatePackagesCount()
     {
         var currentDevice = Data.DevicesObject.Current;
         var currentAdbDevice = Data.CurrentADBDevice;
@@ -810,58 +870,102 @@ internal static class FileActionLogic
             return;
 
         string deviceId = currentDevice.ID;
-        var packageTask = Task.Run(() => ShellFileOperation.GetPackagesCount(currentAdbDevice));
-
-        packageTask.ContinueWith((t) =>
+        ulong? count;
+        try
         {
-            if (t.IsCanceled || t.IsFaulted || t.Result is null || Data.DevicesObject.Current?.ID != deviceId)
+            count = await Task.Run(() => ShellFileOperation.GetPackagesCount(currentAdbDevice));
+        }
+        catch
+        {
+            return;
+        }
+
+        if (count is null
+            || Data.DevicesObject.Current?.ID != deviceId
+            || App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+        {
+            return;
+        }
+
+        await dispatcher.InvokeAsync(() =>
+        {
+            if (Data.DevicesObject.Current?.ID != deviceId)
                 return;
 
-            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
-                return;
-
-            _ = dispatcher.BeginInvoke(new Action(() =>
-            {
-                var package = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Package);
-                ((VirtualDriveViewModel)package)?.SetItemsCount((int?)t.Result);
-            }));
-        });
+            var package = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Package);
+            ((VirtualDriveViewModel)package)?.SetItemsCount(
+                count.Value <= (ulong)long.MaxValue ? (long)count.Value : null);
+        }, DispatcherPriority.Background);
     }
 
     public static void UpdatePackages(bool updateExplorer = false)
     {
-        Data.FileActions.ListingInProgress = true;
+        int requestVersion = Interlocked.Increment(ref packageRefreshVersion);
+        var currentDevice = Data.DevicesObject.Current;
+        var currentAdbDevice = Data.CurrentADBDevice;
+        if (currentDevice is null || currentAdbDevice is null)
+        {
+            if (updateExplorer)
+                Data.FileActions.ListingInProgress = false;
+            return;
+        }
 
-        var version = Data.DevicesObject.Current.AndroidVersion;
-        var packageTask = Task.Run(() => ShellFileOperation.GetPackages(Data.CurrentADBDevice, Data.Settings.ShowSystemPackages, version is not null && version >= AdbExplorerConst.MIN_PKG_UID_ANDROID_VER));
+        if (updateExplorer)
+            Data.FileActions.ListingInProgress = true;
+
+        string deviceId = currentDevice.ID;
+        var version = currentDevice.AndroidVersion;
+        bool showSystemPackages = Data.Settings.ShowSystemPackages;
+        var packageTask = Task.Run(() => ShellFileOperation.GetPackages(
+            currentAdbDevice,
+            showSystemPackages,
+            version is not null && version >= AdbExplorerConst.MIN_PKG_UID_ANDROID_VER));
 
         packageTask.ContinueWith((t) =>
         {
-            if (t.IsCanceled)
-                return;
-
             if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
                 return;
 
             _ = dispatcher.BeginInvoke(new Action(() =>
             {
-                Data.Packages = t.Result;
-                if (updateExplorer)
-                    Data.RuntimeSettings.ExplorerSource = Data.Packages;
-
-                if (!updateExplorer && Data.DevicesObject.Current is not null)
+                if (requestVersion != Volatile.Read(ref packageRefreshVersion)
+                    || Data.DevicesObject.Current?.ID != deviceId)
                 {
-                    var package = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Package);
-                    ((VirtualDriveViewModel)package)?.SetItemsCount(Data.Packages.Count);
+                    return;
                 }
 
-                Data.FileActions.ListingInProgress = false;
+                try
+                {
+                    if (!t.IsCompletedSuccessfully)
+                    {
+                        if (t.Exception is not null)
+                            Data.AddCommandLog($"@ADB Explorer: failed to list packages: {t.Exception.GetBaseException().Message}");
+                        return;
+                    }
+
+                    Data.Packages = t.Result;
+                    if (updateExplorer)
+                        Data.RuntimeSettings.ExplorerSource = Data.Packages;
+
+                    if (!updateExplorer && Data.DevicesObject.Current is not null)
+                    {
+                        var package = Data.DevicesObject.Current.Drives.Find(d => d.Type is AbstractDrive.DriveType.Package);
+                        ((VirtualDriveViewModel)package)?.SetItemsCount(Data.Packages.Count);
+                    }
+                }
+                finally
+                {
+                    if (updateExplorer)
+                        Data.FileActions.ListingInProgress = false;
+                }
             }));
         });
     }
 
     public static void ClearExplorer(bool clearDevice = true)
     {
+        Interlocked.Increment(ref packageRefreshVersion);
+        Data.FileActions.ListingInProgress = false;
         Data.DirList?.FileList?.Clear();
         Data.Packages.Clear();
         Data.SelectedFiles = [];
@@ -958,9 +1062,12 @@ internal static class FileActionLogic
                                          && Data.FileActions.IsRegularItem
                                          && (!Data.FileActions.IsFollowLinkEnabled || Data.RuntimeSettings.IsRootActive);
 
-        var allSelectedAreCut = Data.CopyPaste.IsSelf
-                                && Data.CopyPaste.Files.AnyAll(item => Data.SelectedFiles.Any(f => f.FullPath == item))
-                                && Data.CopyPaste.Files.Length == Data.SelectedFiles.Count();
+        var allSelectedAreCut = false;
+        if (Data.CopyPaste.IsSelf && Data.CopyPaste.Files.Length == Data.SelectedFiles.Count())
+        {
+            var selectedPaths = Data.SelectedFiles.Select(file => file.FullPath).ToHashSet();
+            allSelectedAreCut = Data.CopyPaste.Files.All(selectedPaths.Contains);
+        }
         
         Data.FileActions.CutEnabled = Data.SelectedFiles.AnyAll(f => f.Type is not FileType.BrokenLink)
                                       && !(allSelectedAreCut && Data.CopyPaste.PasteState is DragDropEffects.Move)
@@ -1083,63 +1190,138 @@ internal static class FileActionLogic
         if (dialog.ShowDialog() != CommonFileDialogResult.Ok)
             return;
 
-        var shItems = dialog.FileNames.Select(ShellItem.Open);
-        
-        CopyPasteService.VerifyAndPush(targetPath, shItems);
+        _ = CopyPasteService.VerifyAndPush(targetPath, dialog.FileNames, Data.CurrentADBDevice);
     }
 
-    public static FileSyncOperation PushShellObject(ShellItem item, string targetPath, DragDropEffects dropEffects = DragDropEffects.Copy, ShellItem originalShellItem = null)
+    public static async Task<FileSyncOperation> PushShellObject(string itemPath, string targetPath, ADBService.AdbDevice device, DragDropEffects dropEffects = DragDropEffects.Copy, ShellItem originalShellItem = null)
     {
         FileSyncOperation pushOperation = null;
-        var source = new SyncFile(item, true);
-        var target = new SyncFile(FileHelper.ConcatPaths(targetPath, source.FullName),
-            source.IsDirectory ? FileType.Folder : FileType.File)
-            { Size = source.Size };
+        SyncFile source = null;
 
-        App.Current.Dispatcher.Invoke(() =>
+        try
         {
-            pushOperation = FileSyncOperation.PushFile(source, target, Data.CurrentADBDevice, App.Current.Dispatcher);
-            pushOperation.DropEffects = dropEffects;
-            pushOperation.OriginalShellItem = originalShellItem;
-            pushOperation.PropertyChanged += PushOperation_PropertyChanged;
-            Data.FileOpQ.AddOperation(pushOperation);
-        });
+            source = await Task.Run(() => SyncFile.FromWindowsPath(itemPath));
 
-        return pushOperation;
-    }
-
-    public static void PushShellObjects(IEnumerable<ShellItem> items, string targetPath, DragDropEffects dropEffects = DragDropEffects.Copy)
-    {
-        var syncItems = items.Select(item =>
-        {
-            var source = new SyncFile(item, true);
             var target = new SyncFile(FileHelper.ConcatPaths(targetPath, source.FullName),
                 source.IsDirectory ? FileType.Folder : FileType.File)
                 { Size = source.Size };
 
-            return (source, target);
-        }).ToList();
-
-        if (syncItems.Count == 0)
-            return;
-
-        void addPushOperations()
-        {
-            var operations = syncItems.Select(item =>
+            void addPushOperation()
             {
-                var pushOperation = FileSyncOperation.PushFile(item.source, item.target, Data.CurrentADBDevice, App.Current.Dispatcher);
+                pushOperation = FileSyncOperation.PushFile(source, target, device, App.Current.Dispatcher);
                 pushOperation.DropEffects = dropEffects;
+                pushOperation.OriginalShellItem = originalShellItem;
                 pushOperation.PropertyChanged += PushOperation_PropertyChanged;
-                return pushOperation;
-            });
+                Data.FileOpQ.AddOperation(pushOperation);
+            }
 
-            Data.FileOpQ.AddOperations(operations);
+            if (App.Current.Dispatcher.CheckAccess())
+                addPushOperation();
+            else
+                await App.Current.Dispatcher.InvokeAsync(addPushOperation);
+        }
+        catch
+        {
+            source?.ClearAll();
+            throw;
         }
 
-        if (App.Current.Dispatcher.CheckAccess())
-            addPushOperations();
-        else
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(addPushOperations));
+        return pushOperation;
+    }
+
+    public static async Task<IReadOnlyList<FileSyncOperation>> PushShellObjects(
+        IEnumerable<string> itemPaths,
+        string targetPath,
+        ADBService.AdbDevice device,
+        DragDropEffects dropEffects = DragDropEffects.Copy)
+    {
+        var paths = itemPaths.ToList();
+        List<(string Path, string Message)> failures = [];
+        var syncItems = await Task.Run(() =>
+        {
+            List<SyncFile> sources = [];
+            foreach (var path in paths)
+            {
+                SyncFile source = null;
+
+                try
+                {
+                    source = SyncFile.FromWindowsPath(path);
+
+                    sources.Add(source);
+                    source = null;
+                }
+                catch (Exception e)
+                {
+                    source?.ClearAll();
+                    failures.Add((path, e.Message));
+                }
+            }
+
+            List<(SyncFile source, SyncFile target, bool isBatch)> items = [];
+            foreach (var group in sources.GroupBy(source => source.ParentPath, StringComparer.OrdinalIgnoreCase))
+            {
+                var groupItems = group.ToList();
+                if (groupItems.Count == 1)
+                {
+                    var source = groupItems[0];
+                    var target = new SyncFile(FileHelper.ConcatPaths(targetPath, source.FullName),
+                        source.IsDirectory ? FileType.Folder : FileType.File)
+                        { Size = source.Size };
+                    items.Add((source, target, false));
+                    continue;
+                }
+
+                SyncFile batchSource = new(group.Key, FileType.Folder)
+                {
+                    PathType = FilePathType.Windows,
+                };
+                batchSource.Children.AddRange(groupItems);
+                items.Add((batchSource, new SyncFile(targetPath, FileType.Folder), true));
+            }
+
+            return items;
+        });
+
+        if (failures.Count > 0)
+        {
+            Data.AddCommandLog($"@Windows: failed to prepare {failures.Count} item(s) for upload. "
+                + $"{failures[0].Path}: {failures[0].Message}");
+        }
+
+        if (syncItems.Count == 0)
+            return [];
+
+        List<FileSyncOperation> queuedOperations = [];
+        void addPushOperations()
+        {
+            queuedOperations = syncItems.Select(item =>
+            {
+                var pushOperation = FileSyncOperation.PushFile(item.source, item.target, device, App.Current.Dispatcher);
+                pushOperation.DropEffects = dropEffects;
+                pushOperation.IsBatch = item.isBatch;
+                pushOperation.PropertyChanged += PushOperation_PropertyChanged;
+                return pushOperation;
+            }).ToList();
+
+            Data.FileOpQ.AddOperations(queuedOperations);
+        }
+
+        try
+        {
+            if (App.Current.Dispatcher.CheckAccess())
+                addPushOperations();
+            else
+                await App.Current.Dispatcher.InvokeAsync(addPushOperations);
+        }
+        catch (Exception e)
+        {
+            syncItems.ForEach(item => item.source.ClearAll());
+            Data.AddCommandLog($"@ADB Explorer: failed to queue upload: {e.Message}");
+            return [];
+        }
+
+        return queuedOperations;
     }
 
     private static void PushOperation_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -1151,49 +1333,134 @@ internal static class FileActionLogic
             or FileOperation.OperationStatus.InProgress)
             return;
 
-        // If operation was cancelled or had failed - don't delete the source, but still perform cleanup
-        if (op.Status is FileOperation.OperationStatus.Completed)
+        try
         {
-            // Current path (and device) is where the new file was pushed to and it is not shown yet
-            if (op.Device.ID == Data.CurrentADBDevice.ID
-                && op.TargetPath.ParentPath == Data.CurrentPath
-                && Data.DirList.FileList.All(f => f.FullName != op.FilePath.FullName))
-            {
-                void addPushedFile() => Data.DirList.FileList.Add(new(op.TargetPath) { ModifiedTime = op.FilePath.DateModified });
+            // If operation was cancelled or had failed - don't delete the source.
+            if (op.Status is not FileOperation.OperationStatus.Completed)
+                return;
 
-                if (op.Dispatcher.CheckAccess())
-                    addPushedFile();
-                else
-                    _ = op.Dispatcher.BeginInvoke(new Action(addPushedFile));
-            }
-
-            if (op.FilePath.IsDirectory)
+            var hasSkippedFiles = op.StatusInfo is CompletedSyncProgressViewModel { FilesSkipped: > 0 };
+            if (hasSkippedFiles)
             {
-                var empty = FolderHelper.GetEmptySubfoldersRecursively((ShellFolder)op.FilePath.ShellItem);
-                foreach (var folder in empty)
+                if (op.Device.ID == Data.CurrentADBDevice?.ID
+                    && (op.IsBatch ? op.TargetPath.FullPath : op.TargetPath.ParentPath) == Data.CurrentPath)
                 {
-                    string relative = FileHelper.ExtractRelativePath(folder.FileSystemPath, op.FilePath.FullPath).Replace('\\', '/');
-                    ShellFileOperation.MakeDir(op.Device, FileHelper.ConcatPaths(op.TargetPath.FullPath, relative));
+                    Data.RuntimeSettings.Refresh = true;
                 }
+            }
+            else
+            {
+                SchedulePushedFileUpdate(op);
             }
 
             // In push we can delete the source once the operation has completed
-            if (op.DropEffects is DragDropEffects.Move)
+            if (op.DropEffects is DragDropEffects.Move && !hasSkippedFiles)
             {
-                try
+                List<(string FullPath, bool IsDirectory)> sources = op.IsBatch
+                    ? op.FilePath.Children.Select(file => (file.FullPath, file.IsDirectory)).ToList()
+                    : [(op.FilePath.FullPath, op.FilePath.IsDirectory)];
+
+                _ = Task.Run(() =>
                 {
-                    if (op.FilePath.IsDirectory)
-                        Directory.Delete(op.FilePath.FullPath, true);
-                    else
-                        File.Delete(op.FilePath.FullPath);
-                }
-                catch
-                { }
+                    op.WaitForCompletion();
+
+                    foreach (var (sourcePath, isDirectory) in sources)
+                    {
+                        try
+                        {
+                            if (isDirectory)
+                                Directory.Delete(sourcePath, true);
+                            else
+                                File.Delete(sourcePath);
+                        }
+                        catch
+                        { }
+                    }
+                });
             }
         }
+        finally
+        {
+            op.PropertyChanged -= PushOperation_PropertyChanged;
+        }
+    }
 
-        op.FilePath.ShellItem = null;
-        op.PropertyChanged -= PushOperation_PropertyChanged;
+    private static void SchedulePushedFileUpdate(FileSyncOperation op)
+    {
+        IEnumerable<(
+            (string DeviceId, string ParentPath, string FullName) Key,
+            (string FullPath, FileType Type, long? Size, DateTime? Modified) Value)> updates = op.IsBatch
+            ? op.FilePath.Children.Select(file => (
+                Key: (op.Device.ID, op.TargetPath.FullPath, file.FullName),
+                Value: (
+                    FileHelper.ConcatPaths(op.TargetPath.FullPath, file.FullName),
+                    file.IsDirectory ? FileType.Folder : FileType.File,
+                    file.Size,
+                    file.DateModified)))
+            : [(
+                Key: (op.Device.ID, op.TargetPath.ParentPath, op.TargetPath.FullName),
+                Value: (
+                    op.TargetPath.FullPath,
+                    op.TargetPath.IsDirectory ? FileType.Folder : FileType.File,
+                    op.TargetPath.Size,
+                    op.FilePath.DateModified))];
+
+        lock (PushedFilesLock)
+        {
+            foreach (var update in updates)
+                PendingPushedFiles[update.Key] = update.Value;
+
+            if (PushedFilesUpdateScheduled)
+                return;
+
+            PushedFilesUpdateScheduled = true;
+        }
+
+        var dispatcher = op.Dispatcher;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(100);
+
+            KeyValuePair<
+                (string DeviceId, string ParentPath, string FullName),
+                (string FullPath, FileType Type, long? Size, DateTime? Modified)>[] updates;
+
+            lock (PushedFilesLock)
+            {
+                updates = [.. PendingPushedFiles];
+                PendingPushedFiles.Clear();
+                PushedFilesUpdateScheduled = false;
+            }
+
+            var preparedFiles = updates.Select(update => (
+                update.Key,
+                File: new FileClass(
+                    update.Key.FullName,
+                    update.Value.FullPath,
+                    update.Value.Type,
+                    size: update.Value.Size,
+                    modifiedTime: update.Value.Modified,
+                    loadIcon: false))).ToArray();
+
+            if (dispatcher.HasShutdownStarted)
+                return;
+
+            _ = dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (Data.CurrentADBDevice is null || Data.DirList is null)
+                    return;
+
+                HashSet<string> existingNames = [.. Data.DirList.FileList.Select(file => file.FullName)];
+                var filesToAdd = preparedFiles
+                    .Where(update => update.Key.DeviceId == Data.CurrentADBDevice.ID
+                        && update.Key.ParentPath == Data.CurrentPath
+                        && existingNames.Add(update.Key.FullName))
+                    .Select(update => update.File)
+                    .ToList();
+
+                Data.DirList.FileList.AddRange(filesToAdd);
+            }), DispatcherPriority.Background);
+        });
     }
 
     // Pull where we know the actual target path
@@ -1226,65 +1493,140 @@ internal static class FileActionLogic
             path = ShellItem.Open(dialog.FileName);
         }
 
-        PullFiles(path, pullItems, true);
+        _ = PullFiles(path, pullItems, true);
     }
 
-    public static async void PullFiles(ShellItem path, IEnumerable<FileClass> pullItems, bool notify = false)
+    private static async Task PullFiles(ShellItem path, IEnumerable<FileClass> pullItems, bool notify = false)
     {
-        if (pullItems is null || !pullItems.Any())
-            return;
-
-        var match = AdbRegEx.RE_WINDOWS_DRIVE_ROOT().Match(path.ParsingName);
-        var invalidFiles = pullItems.Where(f => AdbExplorerConst.INVALID_WINDOWS_ROOT_PATHS.Contains(f.FullName));
-
-        if (match.Success && invalidFiles.Any())
+        try
         {
-            var result = await DialogService.ShowConfirmation(string.Format(Strings.Resources.S_WIN_ROOT_ILLEGAL, invalidFiles.Count()),
-                                                 Strings.Resources.S_WIN_ROOT_ILLEGAL_TITLE,
-                                                 primaryText: Strings.Resources.S_SKIP,
-                                                 icon: DialogService.DialogIcon.Exclamation);
-
-            if (result.Item1 is not ContentDialogResult.Primary)
+            var pullItemList = pullItems?.ToList();
+            if (pullItemList is null || pullItemList.Count == 0)
                 return;
 
-            pullItems = pullItems.Except(invalidFiles);
-        }
+            var device = Data.CurrentADBDevice;
+            if (device is null)
+                return;
 
-        if (!Directory.Exists(path.ParsingName))
+            string targetPath = path.ParsingName;
+            var dispatcher = App.Current.Dispatcher;
+            var match = AdbRegEx.RE_WINDOWS_DRIVE_ROOT().Match(targetPath);
+            var invalidFiles = pullItemList
+                .Where(f => AdbExplorerConst.INVALID_WINDOWS_ROOT_PATHS.Contains(f.FullName))
+                .ToList();
+
+            if (match.Success && invalidFiles.Count > 0)
+            {
+                var result = await DialogService.ShowConfirmation(string.Format(Strings.Resources.S_WIN_ROOT_ILLEGAL, invalidFiles.Count),
+                                                     Strings.Resources.S_WIN_ROOT_ILLEGAL_TITLE,
+                                                     primaryText: Strings.Resources.S_SKIP,
+                                                     icon: DialogService.DialogIcon.Exclamation);
+
+                if (result.Item1 is not ContentDialogResult.Primary)
+                    return;
+
+                pullItemList = pullItemList.Except(invalidFiles).ToList();
+            }
+
+            string directoryError = await Task.Run(() =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(targetPath);
+                    return null;
+                }
+                catch (Exception e)
+                {
+                    return e.Message;
+                }
+            });
+
+            if (directoryError is not null)
+            {
+                DialogService.ShowMessage(directoryError, Strings.Resources.S_DEST_ERR,
+                    DialogService.DialogIcon.Critical, copyToClipboard: true);
+                return;
+            }
+
+            var files = await CopyPasteService.MergeFiles(
+                pullItemList.Select(f => f.FullPath), targetPath, device);
+            var fileSet = files.ToHashSet();
+            if (fileSet.Count < pullItemList.Count)
+                pullItemList = pullItemList.Where(f => fileSet.Contains(f.FullPath)).ToList();
+
+            var operations = await Task.Run(() => GeneratePullOps(
+                targetPath, pullItemList, device, dispatcher, notify));
+            await dispatcher.InvokeAsync(() => Data.FileOpQ.AddOperations(operations));
+
+            static List<FileSyncOperation> GeneratePullOps(
+                string targetPath,
+                IEnumerable<FileClass> pullItems,
+                ADBService.AdbDevice device,
+                Dispatcher dispatcher,
+                bool notify)
+            {
+                List<FileSyncOperation> operations = [];
+                var itemList = pullItems.ToList();
+                var treesBySource = FileHelper.GetFolderTrees(
+                    itemList.Where(file => file.IsDirectory).Select(file => file.FullPath),
+                    device);
+
+                foreach (var group in itemList.GroupBy(file => file.ParentPath, StringComparer.Ordinal))
+                {
+                    var sources = group.Select(file => new SyncFile(
+                        file,
+                        file.IsDirectory && treesBySource.TryGetValue(file.FullPath, out var tree)
+                            ? tree.Skip(1)
+                            : null)).ToList();
+                    FileSyncOperation fileOp;
+                    if (sources.Count == 1)
+                    {
+                        var source = sources[0];
+                        fileOp = FileSyncOperation.PullFile(
+                            source,
+                            SyncFile.MergeToWindowsPath(source, targetPath),
+                            device,
+                            dispatcher);
+                    }
+                    else
+                    {
+                        SyncFile batchSource = new(group.Key, FileType.Folder);
+                        batchSource.Children.AddRange(sources);
+                        SyncFile batchTarget = new(targetPath, FileType.Folder)
+                        {
+                            PathType = FilePathType.Windows,
+                        };
+                        fileOp = FileSyncOperation.PullFile(batchSource, batchTarget, device, dispatcher);
+                        fileOp.IsBatch = true;
+                    }
+
+                    if (notify)
+                        fileOp.PropertyChanged += PullOperation_PropertyChanged;
+
+                    operations.Add(fileOp);
+                }
+
+                return operations;
+            }
+        }
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to prepare download: {e.Message}");
+        }
+        finally
         {
             try
             {
-                Directory.CreateDirectory(path.ParsingName);
+                path?.Dispose();
             }
-            catch (Exception e)
-            {
-                DialogService.ShowMessage(e.Message, Strings.Resources.S_DEST_ERR, DialogService.DialogIcon.Critical, copyToClipboard: true);
-                return;
-            }
-        }
-
-        var files = await CopyPasteService.MergeFiles(pullItems.Select(f => f.FullPath), path.ParsingName);
-        if (files.Count() < pullItems.Count())
-        {
-            pullItems = pullItems.Where(f => files.Contains(f.FullPath));
-        }
-
-        await App.Current.Dispatcher.InvokeAsync(() => Data.FileOpQ.AddOperations(GeneratePullOps(path, pullItems, notify)));
-        
-        static IEnumerable<FileSyncOperation> GeneratePullOps(ShellItem path, IEnumerable<FileClass> pullItems, bool notify)
-        {
-            foreach (var item in pullItems.Select(f => f.GetSyncFile()))
-            {
-                var target = SyncFile.MergeToWindowsPath(item, path);
-                var fileOp = FileSyncOperation.PullFile(item, target, Data.CurrentADBDevice, App.Current.Dispatcher);
-
-                if (notify)
-                    fileOp.PropertyChanged += PullOperation_PropertyChanged;
-
-                yield return fileOp;
-            }
+            catch
+            { }
         }
     }
+
+    private static readonly object explorerRefreshLock = new();
+    private static readonly HashSet<string> pendingExplorerRefreshes = [];
+    private static bool explorerRefreshScheduled;
 
     private static void PullOperation_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
@@ -1292,8 +1634,38 @@ internal static class FileActionLogic
             return;
 
         var op = sender as FileSyncOperation;
-        if (op.Status is FileOperation.OperationStatus.Completed)
-            NativeMethods.RefreshExplorerDirectory(op.TargetPath.ParentPath);
+        if (op.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress)
+            return;
+
+        op.PropertyChanged -= PullOperation_PropertyChanged;
+        if (op.Status is not FileOperation.OperationStatus.Completed)
+            return;
+
+        lock (explorerRefreshLock)
+        {
+            pendingExplorerRefreshes.Add(op.IsBatch
+                ? op.TargetPath.FullPath
+                : op.TargetPath.ParentPath);
+            if (explorerRefreshScheduled)
+                return;
+
+            explorerRefreshScheduled = true;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(250);
+
+            string[] directories;
+            lock (explorerRefreshLock)
+            {
+                directories = [.. pendingExplorerRefreshes];
+                pendingExplorerRefreshes.Clear();
+                explorerRefreshScheduled = false;
+            }
+
+            directories.ForEach(NativeMethods.RefreshExplorerDirectory);
+        });
     }
 
     public static void ToggleFileOpQ()

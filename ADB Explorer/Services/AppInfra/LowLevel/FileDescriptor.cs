@@ -6,19 +6,16 @@ namespace ADB_Explorer.Services;
 
 public class FileGroup
 {
-    public readonly IEnumerable<FileDescriptor> FileDescriptors;
+    public readonly IReadOnlyList<FileDescriptor> FileDescriptors;
 
-    private FILEGROUPDESCRIPTOR GroupDescriptor;
-
-    public IEnumerable<byte> GroupDescriptorBytes => GroupDescriptor.Bytes;
+    public byte[] GroupDescriptorBytes { get; }
 
     public IEnumerable<FileDescriptor.StreamContents> DataStreams => FileDescriptors.Select(f => f.Stream);
 
     public FileGroup(IEnumerable<FileDescriptor> fileDescriptors)
     {
-        FileDescriptors = fileDescriptors;
-
-        GroupDescriptor = new(FileDescriptors);
+        FileDescriptors = fileDescriptors.ToArray();
+        GroupDescriptorBytes = new FILEGROUPDESCRIPTOR(FileDescriptors).Bytes;
     }
 }
 
@@ -75,18 +72,6 @@ public class FileDescriptor
 
     public static FileDescriptor[] GetDescriptors(IDataObject dataObject)
     {
-        if (Data.CopyPaste.IsSelf)
-        {
-            try
-            {
-                return VirtualFileDataObject.SelfFileGroup?.FileDescriptors?.ToArray();
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
         try
         {
             if (dataObject.GetData(AdbDataFormats.FileDescriptor) is not MemoryStream fdStream)
@@ -95,10 +80,9 @@ public class FileDescriptor
             var fileGroup = FILEGROUPDESCRIPTOR.FromStream(fdStream);
             return fileGroup.descriptors.Select(FILEDESCRIPTOR.GetFile)?.ToArray();
         }
-        catch (COMException)
+        catch (Exception)
         {
-            // Usually HResult.DV_E_FORMATETC
-            // This happens when GetData in our own VFDO isn't ready yet
+            // The source may still be rendering the descriptor stream, or may provide malformed virtual data.
         }
 
         return null;
@@ -111,20 +95,35 @@ struct FILEGROUPDESCRIPTOR : IByteStruct
     public UInt32 cItems;
     public FILEDESCRIPTOR[] descriptors;
 
-    public readonly IEnumerable<byte> Bytes
+    public readonly byte[] Bytes
     {
         get
         {
-            List<byte> bytes = [.. BytesFromStructure(cItems)];
+            int descriptorSize = Marshal.SizeOf<FILEDESCRIPTOR>();
+            byte[] bytes = new byte[checked(sizeof(UInt32) + descriptors.Length * descriptorSize)];
+            BitConverter.TryWriteBytes(bytes.AsSpan(0, sizeof(UInt32)), cItems);
+            int offset = sizeof(UInt32);
+            IntPtr descriptorBuffer = Marshal.AllocHGlobal(descriptorSize);
 
-            foreach (var item in descriptors)
+            try
             {
-                bytes.AddRange(item.Bytes);
+                foreach (var item in descriptors)
+                {
+                    Marshal.StructureToPtr(item, descriptorBuffer, false);
+                    Marshal.Copy(descriptorBuffer, bytes, offset, descriptorSize);
+                    offset += descriptorSize;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(descriptorBuffer);
             }
 
             return bytes;
         }
     }
+
+    IEnumerable<byte> IByteStruct.Bytes => Bytes;
 
     public FILEGROUPDESCRIPTOR(IEnumerable<FileDescriptor> fileDescriptors)
     {

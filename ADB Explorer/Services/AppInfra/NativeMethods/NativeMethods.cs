@@ -659,8 +659,17 @@ public static partial class NativeMethods
 
     public static int StringCompareLogical(string a, string b) => StrCmpLogicalW(a, b);
 
+    private static readonly Dictionary<string, string> ShellFileTypeCache = [];
+
     public static string GetShellFileType(string fileName)
     {
+        var extension = Path.GetExtension(fileName).ToLowerInvariant();
+        lock (ShellFileTypeCache)
+        {
+            if (ShellFileTypeCache.TryGetValue(extension, out string cachedType))
+                return cachedType;
+        }
+
         SHFILEINFO shInfo = new();
         const FileInfoFlags flags = FileInfoFlags.SHGFI_TYPENAME | FileInfoFlags.SHGFI_USEFILEATTRIBUTES;
 
@@ -670,10 +679,12 @@ public static partial class NativeMethods
                               (uint)Marshal.SizeOf(shInfo),
                               flags);
 
-        if (fileInfo == IntPtr.Zero)
-            return "File";
-
-        return shInfo.szTypeName;
+        var fileType = fileInfo == IntPtr.Zero ? "File" : shInfo.szTypeName;
+        lock (ShellFileTypeCache)
+        {
+            ShellFileTypeCache.TryAdd(extension, fileType);
+            return ShellFileTypeCache[extension];
+        }
     }
 
     #endregion
@@ -752,13 +763,20 @@ public static partial class NativeMethods
 
     public static T StructureFromBytes<T>(IEnumerable<byte> bytes)
     {
-        var handle = GCHandle.Alloc(bytes.ToArray(), GCHandleType.Pinned);
+        var data = bytes as byte[] ?? bytes.ToArray();
+        int structureSize = Marshal.SizeOf<T>();
+        if (data.Length < structureSize)
+            throw new ArgumentException($"Insufficient data for {typeof(T).Name}.", nameof(bytes));
 
-        var data = Marshal.PtrToStructure<T>(handle.AddrOfPinnedObject());
-
-        handle.Free();
-
-        return data;
+        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try
+        {
+            return Marshal.PtrToStructure<T>(handle.AddrOfPinnedObject());
+        }
+        finally
+        {
+            handle.Free();
+        }
     }
 
     public static void ThrowExceptionForHR(HResult hr)

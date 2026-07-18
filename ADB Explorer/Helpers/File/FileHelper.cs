@@ -9,19 +9,21 @@ namespace ADB_Explorer.Helpers;
 
 public static class FileHelper
 {
+    private const int FIND_PATH_BATCH_LENGTH = 8_000;
+
     public static FileClass ListerFileManipulator(FileClass item)
     {
         if (Data.CopyPaste.Files.Length > 0
             && Data.CopyPaste.IsSelfClipboard
             && Data.CopyPaste.ParentFolder == Data.DirList.CurrentPath
-            && Data.CopyPaste.Files.FirstOrDefault(f => f == item.FullPath) is not null)
+            && Data.CopyPaste.FileSet.Contains(item.FullPath))
         {
             item.CutState = Data.CopyPaste.PasteState;
         }
 
         if (Data.FileActions.IsRecycleBin)
         {
-            var indexer = Data.RecycleIndex.FirstOrDefault(index => index.RecycleName == item.FullName);
+            var indexer = TrashHelper.FindIndexer(item.FullName);
             if (indexer is not null)
             {
                 item.TrashIndex = indexer;
@@ -335,13 +337,17 @@ public static class FileHelper
         tree.Select(t => new FileClass(GetFullName(t.Item1), t.Item1, t.Item2 is null ? FileType.Folder : FileType.File, size: t.Item2)
         { ModifiedTime = t.Item3.FromUnixTime() });
 
-    public static (string, long?, double?)[] GetFolderTree(IEnumerable<string> paths, bool isFolder = true)
+    public static (string, long?, double?)[] GetFolderTree(
+        IEnumerable<string> paths,
+        ADBService.AdbDevice device,
+        bool isFolder = true,
+        CancellationToken cancellationToken = default)
     {
         string stdout = "";
         var files = string.Join(" ", paths.Select(p => ADBService.EscapeAdbShellString(p)));
         var depth = isFolder ? "-mindepth 1" : "";
 
-        if (ShellCommands.FindPrintf)
+        if (ShellCommands.SupportsFindPrintf(device.ID))
         {
             // get absolute paths, sizes and dates of all files, directries are marked with 'd'
             string[] args =
@@ -354,7 +360,7 @@ public static class FileHelper
                 "2>&1"
             ];
 
-            ADBService.ExecuteDeviceAdbShellCommand(Data.CurrentADBDevice.ID, "find", out stdout, out _, CancellationToken.None, args);
+            ADBService.ExecuteDeviceAdbShellCommand(device.ID, "find", out stdout, out _, cancellationToken, args);
         }
         else // when find does not support -printf
         {
@@ -370,7 +376,7 @@ public static class FileHelper
                 """fi; done;"""
             ];
 
-            ADBService.ExecuteDeviceAdbShellCommand(Data.CurrentADBDevice.ID, "find", out stdout, out _, CancellationToken.None, args);
+            ADBService.ExecuteDeviceAdbShellCommand(device.ID, "find", out stdout, out _, cancellationToken, args);
         }
         var matches = AdbRegEx.RE_FIND_TREE().Matches(stdout);
 
@@ -381,6 +387,54 @@ public static class FileHelper
                     m.Groups["Size"].Value == "d" ? (long?)null : long.Parse(m.Groups["Size"].Value, CultureInfo.InvariantCulture),
                     m.Groups["Date"].Value == "d" ? (double?)null : double.Parse(m.Groups["Date"].Value, CultureInfo.InvariantCulture)
                 ))];
+    }
+
+    internal static Dictionary<string, List<(string, long?, double?)>> GetFolderTrees(
+        IEnumerable<string> paths,
+        ADBService.AdbDevice device,
+        CancellationToken cancellationToken = default)
+    {
+        Dictionary<string, List<(string, long?, double?)>> treesBySource = new(StringComparer.Ordinal);
+        foreach (var path in paths.Where(path => !string.IsNullOrEmpty(path)).Distinct(StringComparer.Ordinal))
+            treesBySource.Add(path, []);
+
+        if (treesBySource.Count == 0)
+            return treesBySource;
+
+        List<string> batch = [];
+        int batchLength = 0;
+
+        void readBatch()
+        {
+            if (batch.Count == 0)
+                return;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            List<(string, long?, double?)> currentTree = null;
+            foreach (var treeItem in GetFolderTree(batch, device, false, cancellationToken))
+            {
+                if (treesBySource.TryGetValue(treeItem.Item1, out var rootTree))
+                    currentTree = rootTree;
+
+                currentTree?.Add(treeItem);
+            }
+
+            batch.Clear();
+            batchLength = 0;
+        }
+
+        foreach (var path in treesBySource.Keys)
+        {
+            int pathLength = ADBService.EscapeAdbShellString(path).Length + 1;
+            if (batch.Count > 0 && batchLength + pathLength > FIND_PATH_BATCH_LENGTH)
+                readBatch();
+
+            batch.Add(path);
+            batchLength += pathLength;
+        }
+
+        readBatch();
+        return treesBySource;
     }
 
     public static (long? Size, DateTime? ModifiedTime) GetShellSizeDate(ShellItem shellItem, bool isDirectory)

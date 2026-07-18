@@ -149,11 +149,6 @@ public abstract class FileOperation : ViewModelBase
         }
     }
 
-    /// <summary>
-    /// The type of operation and the device ID it is being performed on.
-    /// </summary>
-    public string TypeOnDevice => $"{OperationName}@{Device.ID}";
-
     public ObservableList<SyncFile> Children => AndroidPath.Children;
 
     public string SourcePathString
@@ -297,7 +292,7 @@ public abstract class FileOperation : ViewModelBase
             else
             {
                 if (!Device.Device.IsOpen)
-                    Data.RuntimeSettings.DeviceToOpen = Device.Device;
+                    DeviceHelper.OpenDevice(Device.Device);
 
                 Data.RuntimeSettings.LocationToNavigate = new(file.ParentPath);
             }
@@ -305,7 +300,7 @@ public abstract class FileOperation : ViewModelBase
         else if (location is AdbLocation loc)
         {
             if (!Device.Device.IsOpen)
-                Data.RuntimeSettings.DeviceToOpen = Device.Device;
+                DeviceHelper.OpenDevice(Device.Device);
 
             Data.RuntimeSettings.LocationToNavigate = loc;
         }

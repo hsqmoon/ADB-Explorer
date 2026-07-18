@@ -687,7 +687,9 @@
         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
         <Setter Property="HeadersVisibility" Value="Column" />
         <Setter Property="RowDetailsTemplate" Value="{StaticResource FileOpRowDetailTemplate}" />
-        <Setter Property="ScrollViewer.CanContentScroll" Value="False" />
+        <Setter Property="EnableRowVirtualization" Value="True" />
+        <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
+        <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
     </Style>
     <Style
         x:Key="FileOpDeviceTextblockStyle"

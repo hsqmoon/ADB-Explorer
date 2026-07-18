@@ -2,6 +2,7 @@
 using ADB_Explorer.Helpers;
 using ADB_Explorer.Services;
 using ADB_Explorer.Services.AppInfra;
+using ADB_Explorer.ViewModels;
 using Vanara.PInvoke;
 using Vanara.Windows.Shell;
 
@@ -119,12 +120,11 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
     public bool IsTemp { get; set; }
 
     public FileNameSort SortName { get; private set; }
-
-    public (string, long?, double?)[] Children => !IsDirectory
-        ? null 
-        : FileHelper.GetFolderTree([FullPath]);
+    private bool iconLoaded;
 
     public IEnumerable<FileDescriptor> Descriptors { get; private set; }
+
+    internal void ClearDescriptors() => Descriptors = null;
 
     #region Read Only Properties
 
@@ -161,7 +161,8 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
         bool isLink = false,
         long? size = null,
         DateTime? modifiedTime = null,
-        bool isTemp = false)
+        bool isTemp = false,
+        bool loadIcon = true)
         : base(path, fileName, type)
     {
         Type = type;
@@ -169,15 +170,12 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
         ModifiedTime = modifiedTime;
         IsLink = isLink;
 
-        GetIcon();
         TypeName = GetTypeName();
+        if (loadIcon)
+            LoadIcon();
         IsTemp = isTemp;
         
         SortName = new(fileName);
-
-        // Use a weak event pattern to prevent Settings from rooting this object
-        WeakEventManager<INotifyPropertyChanged, PropertyChangedEventArgs>.AddHandler(
-            Data.Settings, nameof(Data.Settings.PropertyChanged), OnSettingsPropertyChanged);
     }
 
     public FileClass(FileClass other)
@@ -194,7 +192,8 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
                other.IsDirectory ? FileType.Folder : FileType.File,
                other.SpecialType.HasFlag(SpecialFileType.LinkOverlay),
                other.Size,
-               other.DateModified)
+               other.DateModified,
+               loadIcon: false)
     { }
 
     public FileClass(ShellItem windowsPath)
@@ -205,8 +204,8 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
 
         (Size, ModifiedTime) = FileHelper.GetShellSizeDate(windowsPath, IsDirectory);
 
-        GetIcon();
         TypeName = GetTypeName();
+        LoadIcon();
 
         SortName = new(FullName);
     }
@@ -225,16 +224,9 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
         type: fileStat.Type,
         size: fileStat.Size,
         modifiedTime: fileStat.ModifiedTime,
-        isLink: fileStat.IsLink
+        isLink: fileStat.IsLink,
+        loadIcon: false
     );
-
-    private void OnSettingsPropertyChanged(object sender, PropertyChangedEventArgs args)
-    {
-        if (args.PropertyName == nameof(Data.Settings.ShowExtensions))
-        {
-            OnPropertyChanged(nameof(DisplayName));
-        }
-    }
 
     public override void UpdatePath(string androidPath)
     {
@@ -247,9 +239,19 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
     public void UpdateType()
     {
         TypeName = GetTypeName();
-        GetIcon();
+        if (iconLoaded)
+            GetIcon();
         OnPropertyChanged(nameof(ExtensionIsGlyph));
         OnPropertyChanged(nameof(ExtensionIsFontIcon));
+    }
+
+    public void LoadIcon()
+    {
+        if (iconLoaded)
+            return;
+
+        GetIcon();
+        iconLoaded = true;
     }
 
     public void UpdateSpecialType()
@@ -323,22 +325,27 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
         }
     }
 
-    public SyncFile GetSyncFile() => new(this, Children);
-
-    public FileSyncOperation PrepareDescriptors(VirtualFileDataObject vfdo, bool includeContent = true)
+    public FileSyncOperation PrepareDescriptors(
+        VirtualFileDataObject vfdo,
+        string tempDragPath,
+        ADBService.AdbDevice device,
+        string name,
+        bool includeContent = true,
+        IEnumerable<(string, long?, double?)> children = null)
     {
-        var name = Data.FileActions.IsAppDrive
-            ? Data.SelectedPackages.FirstOrDefault(pkg => pkg.Path == FullPath)?.Name + ".apk"
-            : FullName;
-
-        SyncFile target = new(FileHelper.ConcatPaths(Data.RuntimeSettings.TempDragPath, name, '\\'))
+        SyncFile target = new(FileHelper.ConcatPaths(tempDragPath, name, '\\'))
             { PathType = FilePathType.Windows };
 
-        var children = Children;
+        if (!includeContent || !IsDirectory)
+            children = null;
 
-        var fileOp = FileSyncOperation.PullFile(new(this, children), target, Data.CurrentADBDevice, App.Current.Dispatcher);
-        fileOp.PropertyChanged += PullOperation_PropertyChanged;
-        fileOp.VFDO = vfdo;
+        FileSyncOperation fileOp = null;
+        if (includeContent)
+        {
+            fileOp = FileSyncOperation.PullFile(new(this, children), target, device, App.Current.Dispatcher);
+            fileOp.PropertyChanged += PullOperation_PropertyChanged;
+            fileOp.VFDO = vfdo;
+        }
 
         (string, long?, double?)[] items = [(name, Size, UnixTime)];
         if (includeContent && children is not null)
@@ -355,32 +362,41 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
             ChangeTimeUtc = item.Item3.FromUnixTime(),
             Stream = () =>
             {
-                var isActive = App.Current.Dispatcher.Invoke(() => App.Current.MainWindow.IsActive);
-                var operations = vfdo.Operations.Where(op => op.Status is FileOperation.OperationStatus.None).ToList();
+                if (!includeContent)
+                    return null;
+
+                var operations = vfdo.Operations;
 
                 // When a VFDO that does not contain folders is sent to the clipboard, the shell immediately requests the file contents.
                 // To prevent this, we refuse to give data when the app is focused.
                 // When a legitimate request for data is made, the app can't be focused during the first file, but it can become focused again for the next files.
-                if ((Data.CopyPaste.IsClipboard && isActive && operations.Any())
-                    || !includeContent)
-                    return null;
+                lock (operations)
+                {
+                    var uninitiated = operations.Where(op => op.Status is FileOperation.OperationStatus.None).ToList();
+                    if (Data.CopyPaste.IsClipboard
+                        && uninitiated.Count > 0
+                        && App.Current.Dispatcher.Invoke(() => App.Current.MainWindow.IsActive))
+                    {
+                        return null;
+                    }
 
 #if !DEPLOY
-                DebugLog.PrintLine($"Total uninitiated operations: {operations.Count()}");
+                    DebugLog.PrintLine($"Total uninitiated operations: {uninitiated.Count}");
 #endif
 
-                // Add all uninitiated operations to the queue.
-                // For all consecutive files this list will be empty.
-                if (operations.Count > 0)
-                    App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperations(operations));
-
-                // Wait for the operation to complete
-                while (fileOp.Status is not FileOperation.OperationStatus.Completed)
-                {
-                    Thread.Sleep(100);
+                    // Add all uninitiated operations to the queue.
+                    // For all consecutive files this list will be empty.
+                    if (uninitiated.Count > 0)
+                        App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperations(uninitiated));
                 }
 
-                var file = FileHelper.ConcatPaths(Data.RuntimeSettings.TempDragPath, FileHelper.ExtractRelativePath(item.Item1, ParentPath), '\\');
+                // Wait for the operation to complete
+                fileOp.WaitForCompletion();
+
+                if (fileOp.Status is not FileOperation.OperationStatus.Completed)
+                    return null;
+
+                var file = FileHelper.ConcatPaths(tempDragPath, FileHelper.ExtractRelativePath(item.Item1, ParentPath), '\\');
 
                 // Try 10 times to read from the file and write to the stream,
                 // in case the file is still in use by ADB or hasn't appeared yet
@@ -420,32 +436,55 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
             or FileOperation.OperationStatus.InProgress)
             return;
 
-        if (op.Status is FileOperation.OperationStatus.Completed)
+        var vfdo = op.VFDO;
+        try
         {
-            if (op.VFDO.CurrentEffect.HasFlag(DragDropEffects.Move))
+            if (op.Status is FileOperation.OperationStatus.Completed
+                && op.StatusInfo is CompletedSyncProgressViewModel { FilesSkipped: 0 }
+                && vfdo?.CurrentEffect.HasFlag(DragDropEffects.Move) is true)
             {
-                // Delete file from device
-                ShellFileOperation.SilentDelete(op.Device, op.FilePath.FullPath);
+                var device = op.Device;
+                var sourcePath = op.FilePath.FullPath;
+                var dispatcher = op.Dispatcher;
 
-                // Remove file in UI if present
-                if (op.Device.ID == Data.CurrentADBDevice.ID
-                    && op.FilePath.ParentPath == Data.CurrentPath)
+                _ = Task.Run(() =>
                 {
-                    op.Dispatcher.Invoke(() =>
+                    op.WaitForCompletion();
+
+                    try
                     {
-                        Data.DirList.FileList.RemoveAll(f => f.FullPath == op.FilePath.FullPath);
-                        FileActionLogic.ScheduleUpdateFileActions();
-                    });
-                }
+                        ShellFileOperation.SilentDelete(device, sourcePath);
+                    }
+                    catch
+                    {
+                        return;
+                    }
 
-                if (op.VFDO.Operations.All(op => op.Status is FileOperation.OperationStatus.Completed))
-                    Data.CopyPaste.Clear();
+                    if (dispatcher.HasShutdownStarted)
+                        return;
+
+                    _ = dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (device.ID == Data.CurrentADBDevice?.ID
+                            && FileHelper.GetParentPath(sourcePath) == Data.CurrentPath
+                            && Data.DirList is not null)
+                        {
+                            Data.DirList.FileList.RemoveAll(f => f.FullPath == sourcePath);
+                            FileActionLogic.ScheduleUpdateFileActions();
+                        }
+                    }), DispatcherPriority.Background);
+                });
+
+                if (vfdo.Operations.All(operation => operation.Status is FileOperation.OperationStatus.Completed))
+                    _ = op.Dispatcher.BeginInvoke(
+                        new Action(Data.CopyPaste.Clear), DispatcherPriority.Background);
             }
-
-            op.VFDO = null;
         }
-
-        op.PropertyChanged -= PullOperation_PropertyChanged;
+        finally
+        {
+            op.VFDO = null;
+            op.PropertyChanged -= PullOperation_PropertyChanged;
+        }
     }
 
     public void GetIcon()

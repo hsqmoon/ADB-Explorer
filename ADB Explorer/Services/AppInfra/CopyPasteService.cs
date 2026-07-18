@@ -1,5 +1,6 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
+using ADB_Explorer.Converters;
 using ADB_Explorer.Services.AppInfra;
 using ADB_Explorer.ViewModels;
 using Vanara.Windows.Shell;
@@ -9,6 +10,27 @@ namespace ADB_Explorer.Services;
 
 public class CopyPasteService : ViewModelBase
 {
+    private static void RunInBackgroundSta(Action action)
+    {
+        Thread thread = new(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception e)
+            {
+                Data.AddCommandLog($"@ADB Explorer: failed to read virtual files: {e.Message}");
+            }
+        })
+        {
+            IsBackground = true,
+            Priority = ThreadPriority.BelowNormal,
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+    }
+
     [Flags]
     public enum DataSource
     {
@@ -139,11 +161,19 @@ public class CopyPasteService : ViewModelBase
     }
 
     private string[] files = [];
+    private HashSet<string> fileSet = [];
     public string[] Files
     {
         get => files;
-        set => Set(ref files, value);
+        set
+        {
+            value ??= [];
+            if (Set(ref files, value))
+                fileSet = value.ToHashSet(StringComparer.Ordinal);
+        }
     }
+
+    public IReadOnlySet<string> FileSet => fileSet;
 
     private string[] dragFiles = [];
     public string[] DragFiles
@@ -156,7 +186,7 @@ public class CopyPasteService : ViewModelBase
                 return;
 
             Set(ref dragFiles, value);
-            _currentFiles = null;
+            ResetCurrentFiles();
         }
     }
 
@@ -171,16 +201,21 @@ public class CopyPasteService : ViewModelBase
                 return;
 
             Set(ref descriptors, value);
-            _currentFiles = null;
+            ResetCurrentFiles();
         }
     }
 
-    private IEnumerable<FileClass> _currentFiles = [];
+    private IReadOnlyList<FileClass> _currentFiles = [];
+    private IDataObject previewDataObject;
+
+    private void ResetCurrentFiles() => _currentFiles = null;
+
     public IEnumerable<FileClass> CurrentFiles
     {
         get
         {
-            _currentFiles ??= GetCurrentFiles();
+            if (_currentFiles is null)
+                _currentFiles = GetCurrentFiles().ToList();
 
             return _currentFiles;
         }
@@ -192,16 +227,60 @@ public class CopyPasteService : ViewModelBase
         {
             foreach (var file in DragFiles)
             {
-                yield return new(ShellItem.Open(file));
+                yield return new(new FileDescriptor
+                {
+                    Name = FileHelper.GetFullName(file),
+                    SourcePath = file,
+                    IsDirectory = Directory.Exists(file),
+                })
+                {
+                    PathType = FilePathType.Windows,
+                };
             }
         }
         else
         {
-            if (IsSelf && VirtualFileDataObject.SelfFiles is not null)
+            if (IsSelf
+                && MasterPid == Environment.ProcessId
+                && VirtualFileDataObject.SelfFiles is not null)
             {
                 foreach (var file in VirtualFileDataObject.SelfFiles)
                 {
                     yield return file;
+                }
+
+                yield break;
+            }
+
+            if (!IsWindows && DragFiles.Length > 0)
+            {
+                var descriptorMap = Descriptors
+                    .GroupBy(descriptor => descriptor.Name.Replace('\\', '/').Trim('/'))
+                    .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+
+                foreach (var fullPath in DragFiles)
+                {
+                    var relativePath = FileHelper.ExtractRelativePath(fullPath, CurrentParent)
+                        .Replace('\\', '/')
+                        .Trim('/');
+                    descriptorMap.TryGetValue(relativePath, out var descriptor);
+
+                    var item = new FileClass(
+                        FileHelper.GetFullName(fullPath),
+                        fullPath,
+                        descriptor is null
+                            ? FileType.Unknown
+                            : descriptor.IsDirectory ? FileType.Folder : FileType.File,
+                        size: descriptor?.Length,
+                        modifiedTime: descriptor?.ChangeTimeUtc,
+                        loadIcon: false)
+                    {
+                        TrashIndex = CurrentParent is AdbExplorerConst.RECYCLE_PATH
+                            ? new() { RecycleName = fullPath }
+                            : null,
+                    };
+
+                    yield return item;
                 }
 
                 yield break;
@@ -239,8 +318,10 @@ public class CopyPasteService : ViewModelBase
         FileActionLogic.UpdateFileActions();
 
         List<FileClass> cutItems = [];
-        if (PasteSource is not DataSource.None && PasteSource.HasFlag(DataSource.Self))
-            cutItems = [.. Data.DirList.FileList.Where(f => Files.Contains(f.FullPath))];
+        if (PasteSource is not DataSource.None
+            && PasteSource.HasFlag(DataSource.Self)
+            && Data.DirList is not null)
+            cutItems = [.. Data.DirList.FileList.Where(f => FileSet.Contains(f.FullPath))];
 
         cutItems.ForEach(file => file.CutState = PasteState);
         Data.DirList?.FileList.Except(cutItems).ForEach(file => file.CutState = DragDropEffects.None);
@@ -251,10 +332,15 @@ public class CopyPasteService : ViewModelBase
         if (IsClipboard)
         {
             Clipboard.Clear();
+            VirtualFileDataObject.ReleaseClipboardData();
             PasteState = DragDropEffects.None;
             PasteSource = DataSource.None;
             Files = [];
+            Descriptors = [];
+            _currentFiles = [];
             ParentFolder = "";
+            SourceDevice = null;
+            MasterPid = 0;
         }
 
         ClearDrag();
@@ -263,6 +349,8 @@ public class CopyPasteService : ViewModelBase
 
     public void ClearDrag()
     {
+        previewDataObject = null;
+
         if (!IsDrag)
             return;
 
@@ -273,7 +361,11 @@ public class CopyPasteService : ViewModelBase
         DropEffect = DragDropEffects.None;
         DragPasteSource = DataSource.None;
         DragFiles = [];
+        Descriptors = [];
+        _currentFiles = [];
         DragParent = "";
+        SourceDevice = null;
+        MasterPid = 0;
     }
 
     public void GetClipboardPasteItems()
@@ -333,11 +425,16 @@ public class CopyPasteService : ViewModelBase
 
     private void ClearClipboardPasteItems()
     {
+        VirtualFileDataObject.ReleaseClipboardData();
         PasteState = DragDropEffects.None;
         PasteSource = DataSource.None;
         Files = [];
+        Descriptors = [];
+        ResetCurrentFiles();
         _currentFiles = [];
         ParentFolder = "";
+        SourceDevice = null;
+        MasterPid = 0;
         UpdateUI();
     }
 
@@ -375,6 +472,9 @@ public class CopyPasteService : ViewModelBase
             DragPasteSource &= ~DataSource.None;
 
         PreviewDataObject(dataObject);
+        if (sender is null)
+            previewDataObject = null;
+
         if (DragFiles.Length < 1)
             return DragDropEffects.None;
 
@@ -408,10 +508,14 @@ public class CopyPasteService : ViewModelBase
 
     public void PreviewDataObject(IDataObject dataObject)
     {
-        CurrentSource &= ~(DataSource.Android | DataSource.Self | DataSource.Virtual);
-
         if (Data.CurrentADBDevice is null)
             return;
+
+        if (ReferenceEquals(previewDataObject, dataObject))
+            return;
+
+        previewDataObject = dataObject;
+        CurrentSource &= ~(DataSource.Android | DataSource.Self | DataSource.Virtual);
 
         DragParent = "";
         string[] oldFiles = [.. DragFiles];
@@ -446,35 +550,131 @@ public class CopyPasteService : ViewModelBase
                 _ = Task.Run(async () =>
                 {
                     await Task.Delay(500);
-                    await App.Current.Dispatcher.InvokeAsync(() => GetDescriptors(dataObject));
+                    if (!ReferenceEquals(previewDataObject, dataObject))
+                        return;
+
+                    RunInBackgroundSta(() =>
+                    {
+                        var newDescriptors = FileDescriptor.GetDescriptors(dataObject);
+                        if (newDescriptors is null)
+                            return;
+
+                        _ = App.Current.Dispatcher.BeginInvoke(
+                            new Action(() =>
+                            {
+                                if (!ReferenceEquals(previewDataObject, dataObject))
+                                    return;
+
+                                Descriptors = newDescriptors;
+                                UpdateUI();
+                            }), DispatcherPriority.Background);
+                    });
                 });
             }
         }
         // Shell ID List - the only format Microsoft supports for anything added after Windows XP (non-ZIP archives, UNC paths, etc.)
         else if (dataObject.GetDataPresent(AdbDataFormats.ShellidList))
         {
-            var shItems = ShellItemArray.FromDataObject((System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
-            if (shItems is not null)
+            if (IsDrag)
             {
-                Descriptors = [.. shItems.Select(sh => new FileDescriptor(sh))];
-                DragFiles = [.. shItems.Select(sh => sh.ParsingName)];
+                Descriptors = [];
+                DragFiles = [];
 
-                CurrentSource &= ~DataSource.Android;
-                if (!shItems[0].IsFileSystem)
-                    CurrentSource |= DataSource.Virtual;
+                RunInBackgroundSta(() =>
+                {
+                    using var shItems = ShellItemArray.FromDataObject(
+                        (System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
+                    if (shItems is null)
+                        return;
+
+                    var shellItems = shItems.ToArray();
+                    var newDescriptors = shellItems.Select(sh => new FileDescriptor(sh)).ToArray();
+                    var newFiles = shellItems.Select(sh => sh.ParsingName).ToArray();
+                    var isVirtual = shellItems.Length > 0 && !shellItems[0].IsFileSystem;
+
+                    _ = App.Current.Dispatcher.BeginInvoke(
+                        new Action(() =>
+                        {
+                            if (!ReferenceEquals(previewDataObject, dataObject))
+                                return;
+
+                            Descriptors = newDescriptors;
+                            DragFiles = newFiles;
+                            CurrentSource &= ~DataSource.Android;
+                            if (isVirtual)
+                                CurrentSource |= DataSource.Virtual;
+                            else
+                                CurrentSource &= ~DataSource.Virtual;
+
+                            UpdateUI();
+                        }), DispatcherPriority.Background);
+                });
+            }
+            else
+            {
+                using var shItems = ShellItemArray.FromDataObject(
+                    (System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
+                if (shItems is null)
+                {
+                    Descriptors = [];
+                    DragFiles = [];
+                }
+                else
+                {
+                    var shellItems = shItems.ToArray();
+                    Descriptors = [.. shellItems.Select(sh => new FileDescriptor(sh))];
+                    DragFiles = [.. shellItems.Select(sh => sh.ParsingName)];
+
+                    CurrentSource &= ~DataSource.Android;
+                    if (shellItems.Length > 0 && !shellItems[0].IsFileSystem)
+                        CurrentSource |= DataSource.Virtual;
+                }
             }
         }
         // VFDO (FileGroupDescriptor + FileContents) - the only viable format for virtual files not mapped to a drive.
         // This is the format we supply to File Explorer. Also provided by File Explorer for contents of ZIP archives (introduced in Windows ME).
         else if (dataObject.GetDataPresent(AdbDataFormats.FileDescriptor))
         {
-            GetDescriptors(dataObject);
+            if (IsDrag)
+            {
+                Descriptors = [];
+                DragFiles = [];
+                var hasFileContents = dataObject.GetDataPresent(AdbDataFormats.FileContents);
 
-            DragFiles = [.. Descriptors.Where(d => !d.Name.Contains('\\')).Select(d => d.Name)];
+                RunInBackgroundSta(() =>
+                {
+                    var newDescriptors = FileDescriptor.GetDescriptors(dataObject) ?? [];
+                    var newFiles = newDescriptors
+                        .Where(descriptor => !descriptor.Name.Contains('\\'))
+                        .Select(descriptor => descriptor.Name)
+                        .ToArray();
 
-            CurrentSource |= DataSource.Virtual;
-            if (dataObject.GetDataPresent(AdbDataFormats.FileContents))
-                CurrentSource &= ~DataSource.Android;
+                    _ = App.Current.Dispatcher.BeginInvoke(
+                        new Action(() =>
+                        {
+                            if (!ReferenceEquals(previewDataObject, dataObject))
+                                return;
+
+                            Descriptors = newDescriptors;
+                            DragFiles = newFiles;
+                            CurrentSource |= DataSource.Virtual;
+                            if (hasFileContents)
+                                CurrentSource &= ~DataSource.Android;
+
+                            UpdateUI();
+                        }), DispatcherPriority.Background);
+                });
+            }
+            else
+            {
+                GetDescriptors(dataObject);
+
+                DragFiles = [.. Descriptors.Where(d => !d.Name.Contains('\\')).Select(d => d.Name)];
+
+                CurrentSource |= DataSource.Virtual;
+                if (dataObject.GetDataPresent(AdbDataFormats.FileContents))
+                    CurrentSource &= ~DataSource.Android;
+            }
         }
         // If the data object only has FileDrop, then it's probably dropping by target detect, which we can't support (7-Zip, WinRAR, etc.)
         else
@@ -522,192 +722,310 @@ public class CopyPasteService : ViewModelBase
 
     public void AcceptDataObject(IDataObject dataObject, string targetFolder, bool isLink = false)
     {
+        var dropEffect = CurrentEffect;
+        var isAppDrive = Data.FileActions.IsAppDrive;
+        var allFilesAreApks = isAppDrive && FileHelper.AllFilesAreApks(DragFiles);
+        var dragFromMaster = IsDragFromMaster;
+        var sourceMasterPid = MasterPid;
+        var targetDevice = Data.CurrentADBDevice;
+
         void ReadObject()
         {
             // For all cases where the files aren't immediately available on disk
             if (IsVirtual)
             {
-                ClearTempFolder();
+                string tempDragPath = Data.RuntimeSettings.ResetTempDragPath();
 
                 // Transfer from another Android device
                 if (!IsWindows)
                 {
                     ADBService.AdbDevice sourceDevice = new(SourceDevice);
-                    List<FileOperation> pullOps = [];
-                    foreach (var item in CurrentFiles)
+                    var sourcePaths = DragFiles.ToArray();
+                    var dispatcher = App.Current.Dispatcher;
+                    _ = Task.Run(() =>
                     {
-                        SyncFile target = new(item) { PathType = FilePathType.Windows };
-                        target.UpdatePath(FileHelper.ConcatPaths(Data.RuntimeSettings.TempDragPath, item.FullName, '\\'));
+                        var treesBySource = FileHelper.GetFolderTrees(sourcePaths, sourceDevice);
 
-                        // Pull the file from the source device to the temp folder
-                        var pullOp = FileSyncOperation.PullFile(new(item), target, sourceDevice, App.Current.Dispatcher);
-                        pullOp.PropertyChanged += (s, e) =>
+                        List<FileOperation> pullOps = [];
+                        List<(FileClass Item, SyncFile Source, string TargetPath)> transfers = [];
+                        foreach (var sourcePath in sourcePaths)
                         {
-                            if (e.PropertyName != nameof(FileSyncOperation.Status)
-                                || pullOp.Status is not FileOperation.OperationStatus.Completed)
-                                return;
-
-                            // Once done, create a shell item and push it to the target device (current)
-                            FileClass file = new(target) { ShellItem = ShellItem.Open(target.FullPath) };
-                            if (Data.FileActions.IsAppDrive)
+                            var targetPath = FileHelper.ConcatPaths(
+                                tempDragPath,
+                                FileHelper.GetFullName(sourcePath),
+                                '\\');
+                            if (!treesBySource.TryGetValue(sourcePath, out var sourceItems)
+                                || sourceItems.Count == 0)
                             {
-                                if (FileHelper.AllFilesAreApks(DragFiles))
-                                    ShellFileOperation.PushPackages(Data.CurrentADBDevice, [file.ShellItem], App.Current.Dispatcher);
-
-                                return;
+                                FileDescriptor failedSource = new()
+                                {
+                                    Name = FileHelper.GetFullName(sourcePath),
+                                    SourcePath = sourcePath,
+                                };
+                                SyncFile failedTarget = new(targetPath) { PathType = FilePathType.Windows };
+                                pullOps.Add(new FileSyncOperation(
+                                    FileOperation.OperationType.Pull,
+                                    failedSource,
+                                    failedTarget,
+                                    sourceDevice,
+                                    new FailedOpProgressViewModel(Strings.Resources.S_SYNC_FILE_NOT_FOUND)));
+                                continue;
                             }
 
-                            var pushOp = VerifyAndPush(targetFolder, file, CurrentEffect);
-                            if (pushOp is null || CurrentEffect is not DragDropEffects.Move)
-                                return;
+                            var root = sourceItems[0];
+                            FileClass item = new(
+                                FileHelper.GetFullName(sourcePath),
+                                sourcePath,
+                                root.Item2 is null ? FileType.Folder : FileType.File,
+                                size: root.Item2,
+                                modifiedTime: root.Item3.FromUnixTime(),
+                                loadIcon: false);
+                            transfers.Add((item, new SyncFile(item, sourceItems.Skip(1)), targetPath));
+                        }
 
-                            pushOp.PropertyChanged += (s, e) =>
+                        if (transfers.Count > 0)
+                        {
+                            FileSyncOperation pullOp;
+                            if (transfers.Count == 1)
+                            {
+                                SyncFile target = new(transfers[0].Item) { PathType = FilePathType.Windows };
+                                target.UpdatePath(transfers[0].TargetPath);
+                                pullOp = FileSyncOperation.PullFile(
+                                    transfers[0].Source,
+                                    target,
+                                    sourceDevice,
+                                    dispatcher);
+                            }
+                            else
+                            {
+                                SyncFile batchSource = new(
+                                    FileHelper.GetParentPath(transfers[0].Item.FullPath),
+                                    FileType.Folder);
+                                batchSource.Children.AddRange(transfers.Select(transfer => transfer.Source));
+                                SyncFile batchTarget = new(tempDragPath, FileType.Folder)
+                                {
+                                    PathType = FilePathType.Windows,
+                                };
+                                pullOp = FileSyncOperation.PullFile(
+                                    batchSource,
+                                    batchTarget,
+                                    sourceDevice,
+                                    dispatcher);
+                                pullOp.IsBatch = true;
+                            }
+
+                            async void pullCompleted(object s, PropertyChangedEventArgs e)
                             {
                                 if (e.PropertyName != nameof(FileSyncOperation.Status)
-                                    || pushOp.Status is not FileOperation.OperationStatus.Completed)
+                                    || pullOp.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress)
                                     return;
 
-                                // Once the second part is done, delete the file from the source device if needed, and notify if its another window
-                                ShellFileOperation.SilentDelete(sourceDevice, item.FullName);
-                                if (IsDragFromMaster)
-                                    IpcService.NotifyFileMoved(MasterPid, sourceDevice, item);
-                            };
-                        };
+                                pullOp.PropertyChanged -= pullCompleted;
+                                if (pullOp.Status is not FileOperation.OperationStatus.Completed
+                                    || pullOp.StatusInfo is not CompletedSyncProgressViewModel { FilesSkipped: 0 })
+                                    return;
 
-                        pullOps.Add(pullOp);
-                    }
+                                if (isAppDrive)
+                                {
+                                    if (allFilesAreApks)
+                                        ShellFileOperation.PushPackages(
+                                            targetDevice,
+                                            transfers.Select(transfer => transfer.TargetPath),
+                                            dispatcher);
 
-                    Data.FileOpQ.AddOperations(pullOps);
+                                    return;
+                                }
+
+                                var targetPaths = transfers.Select(transfer => transfer.TargetPath).ToArray();
+                                var pushOps = await VerifyAndPush(
+                                    targetFolder,
+                                    targetPaths,
+                                    targetDevice,
+                                    dropEffect);
+
+                                if (dropEffect is not DragDropEffects.Move)
+                                    return;
+
+                                var queuedItems = pushOps.Sum(op => op.IsBatch ? op.FilePath.Children.Count : 1);
+                                if (queuedItems != targetPaths.Length)
+                                    return;
+
+                                await Task.WhenAll(pushOps.Select(op => Task.Run(op.WaitForCompletion)));
+                                if (pushOps.Any(op => op.Status is not FileOperation.OperationStatus.Completed
+                                    || op.StatusInfo is not CompletedSyncProgressViewModel { FilesSkipped: 0 }))
+                                {
+                                    return;
+                                }
+
+                                // Delete source roots only after every queued upload has fully succeeded.
+                                _ = Task.Run(() =>
+                                {
+                                    foreach (var transfer in transfers)
+                                    {
+                                        try
+                                        {
+                                            ShellFileOperation.SilentDelete(sourceDevice, transfer.Item.FullPath);
+                                            if (dragFromMaster)
+                                                IpcService.NotifyFileMoved(sourceMasterPid, sourceDevice, transfer.Item);
+                                        }
+                                        catch
+                                        { }
+                                    }
+                                });
+                            }
+
+                            pullOp.PropertyChanged += pullCompleted;
+                            pullOps.Add(pullOp);
+                        }
+
+                        if (pullOps.Count > 0 && !dispatcher.HasShutdownStarted)
+                        {
+                            _ = dispatcher.BeginInvoke(
+                                new Action(() => Data.FileOpQ.AddOperations(pullOps)),
+                                DispatcherPriority.Background);
+                        }
+                    });
+
                 }
                 // From archives, UNC paths, & DLNA servers
                 else if (dataObject.GetDataPresent(AdbDataFormats.ShellidList))
                 {
-                    ShellFolder tempDrag = new(Data.RuntimeSettings.TempDragPath);
-                    var shItems = ShellItemArray.FromDataObject((System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
-
-                    ShellFileOperations shFileOp = new(NativeMethods.InterceptClipboard.MainWindowHandle);
-                    shItems.ForEach(shia => shFileOp.QueueCopyOperation(shia, tempDrag));
-
-                    ShellItem lastTopItem = null;
-                    ShellItem lastTopSource = null;
-                    shFileOp.PostCopyItem += (s, e) =>
+                    RunInBackgroundSta(() =>
                     {
-                        // Skip non top level items
-                        if (e.DestItem.Parent.ParsingName != Data.RuntimeSettings.TempDragPath)
-                            return;
+                        using ShellFolder tempDrag = new(tempDragPath);
+                        using var shItems = ShellItemArray.FromDataObject(
+                            (System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
 
-                        // A new top level item means the previous one is done
-                        if (lastTopItem is not null && lastTopItem.ParsingName != e.DestItem.ParsingName)
+                        using ShellFileOperations shFileOp = new(NativeMethods.InterceptClipboard.MainWindowHandle);
+                        shItems.ForEach(shia => shFileOp.QueueCopyOperation(shia, tempDrag));
+
+                        ShellItem lastTopItem = null;
+                        ShellItem lastTopSource = null;
+                        shFileOp.PostCopyItem += (s, e) =>
                         {
-                            if (Data.FileActions.IsAppDrive)
+                            // Skip non top level items
+                            if (e.DestItem.Parent.ParsingName != tempDragPath)
+                                return;
+
+                            // A new top level item means the previous one is done
+                            if (lastTopItem is not null && lastTopItem.ParsingName != e.DestItem.ParsingName)
                             {
-                                if (FileHelper.AllFilesAreApks(DragFiles))
-                                    ShellFileOperation.PushPackages(Data.CurrentADBDevice, [lastTopItem], App.Current.Dispatcher);
+                                if (isAppDrive)
+                                {
+                                    if (allFilesAreApks)
+                                        ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
+                                }
+                                else
+                                    _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
                             }
-                            else
-                                VerifyAndPush(targetFolder, new FileClass(lastTopItem), CurrentEffect, lastTopSource);
-                        }
 
-                        lastTopItem = e.DestItem;
-                        lastTopSource = e.SourceItem;
-                    };
+                            lastTopItem = e.DestItem;
+                            lastTopSource = e.SourceItem;
+                        };
 
-                    shFileOp.FinishOperations += (s, e) =>
-                    {
-                        // The last item is not caught by the PostCopyItem event
-                        if (lastTopItem is not null)
+                        shFileOp.FinishOperations += (s, e) =>
                         {
-                            if (Data.FileActions.IsAppDrive)
+                            // The last item is not caught by the PostCopyItem event
+                            if (lastTopItem is not null)
                             {
-                                if (FileHelper.AllFilesAreApks(DragFiles))
-                                    ShellFileOperation.PushPackages(Data.CurrentADBDevice, [lastTopItem], App.Current.Dispatcher);
+                                if (isAppDrive)
+                                {
+                                    if (allFilesAreApks)
+                                        ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
+                                }
+                                else
+                                    _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
                             }
-                            else
-                                VerifyAndPush(targetFolder, new FileClass(lastTopItem), CurrentEffect, lastTopSource);
-                        }
-                    };
+                        };
 
-                    shFileOp.PerformOperations();
+                        shFileOp.PerformOperations();
+                    });
                 }
                 // Was supposed to be the main method for zip archives, but Vanara covers that in ShellItemArray.
                 // Will be left in to support any virtual files that don't provide ShellID List Array.
                 else if (dataObject.GetDataPresent(AdbDataFormats.FileContents))
                 {
-                    Task.Run(() =>
+                    var dragDescriptors = Descriptors.ToArray();
+                    RunInBackgroundSta(() =>
                     {
-                        string[] files = new string[Descriptors.Length];
+                        string[] files = new string[dragDescriptors.Length];
                         List<FileOperation> failedOps = [];
 
-                        for (int i = 0; i < Descriptors.Length; i++)
+                        for (int i = 0; i < dragDescriptors.Length; i++)
                         {
-                            files[i] = FileHelper.ConcatPaths(Data.RuntimeSettings.TempDragPath, Descriptors[i].Name, '\\');
-                            if (Descriptors[i].IsDirectory)
-                                continue;
-
-                            System.Runtime.InteropServices.ComTypes.IStream stream;
+                            files[i] = FileHelper.ConcatPaths(tempDragPath, dragDescriptors[i].Name, '\\');
                             try
                             {
-                                // Try to acquire the stream of each descriptor
-                                stream = VirtualFileDataObject.GetFileContents(dataObject, i);
+                                if (dragDescriptors[i].IsDirectory)
+                                {
+                                    Directory.CreateDirectory(files[i]);
+                                    continue;
+                                }
+
+                                // Save the stream of each descriptor and release its COM storage medium.
+                                Directory.CreateDirectory(FileHelper.GetParentPath(files[i]));
+                                VirtualFileDataObject.SaveFileContents(dataObject, i, files[i]);
+
+                                if (dragDescriptors[i].ChangeTimeUtc is not null)
+                                    File.SetLastWriteTime(files[i], dragDescriptors[i].ChangeTimeUtc.Value.ToLocalTime());
                             }
-                            catch (COMException e)
+                            catch (Exception e)
                             {
+                                if (!dragDescriptors[i].IsDirectory)
+                                {
+                                    try
+                                    {
+                                        File.Delete(files[i]);
+                                    }
+                                    catch
+                                    { }
+                                }
+
+                                files[i] = null;
+
                                 // If failed, add a failed operation to the queue
                                 failedOps.Add(
                                     new FileSyncOperation(
                                         FileOperation.OperationType.Push,
-                                        Descriptors[i],
+                                        dragDescriptors[i],
                                         new(targetFolder),
-                                        Data.CurrentADBDevice,
+                                        targetDevice,
                                         new FailedOpProgressViewModel(e.Message)));
 
                                 continue;
                             }
-
-                            // Save the stream to the temp folder, create the parent folder if it doesn't exist
-                            Directory.CreateDirectory(FileHelper.GetParentPath(files[i]));
-
-                            NativeMethods.SaveComStreamToFile(stream, files[i]);
-                            if (Descriptors[i].ChangeTimeUtc is not null)
-                                File.SetLastWriteTime(files[i], Descriptors[i].ChangeTimeUtc.Value.ToLocalTime());
                         }
 
                         if (failedOps.Count > 0)
-                            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.FileOpQ.AddOperations(failedOps)));
+                            _ = App.Current.Dispatcher.BeginInvoke(
+                                new Action(() => Data.FileOpQ.AddOperations(failedOps)), DispatcherPriority.Background);
 
-                        IEnumerable<FileClass> shItems = [];
-                        try
-                        {
-                            shItems = files
-                                .Where(d => FileHelper.GetParentPath(d) == Data.RuntimeSettings.TempDragPath)
-                                .Select(d => new FileClass(ShellItem.Open(d)));
-                        }
-                        catch
-                        {
-                        }
+                        var topLevelFiles = files.Where(d => d is not null
+                            && FileHelper.GetParentPath(d) == tempDragPath
+                            && (File.Exists(d) || Directory.Exists(d))).ToList();
                         
-                        if (shItems.Any())
+                        if (topLevelFiles.Count > 0)
                         {
-                            if (Data.FileActions.IsAppDrive)
+                            if (isAppDrive)
                             {
-                                if (FileHelper.AllFilesAreApks(DragFiles))
-                                    ShellFileOperation.PushPackages(Data.CurrentADBDevice, shItems.Select(f => f.ShellItem), App.Current.Dispatcher);
+                                if (allFilesAreApks)
+                                    ShellFileOperation.PushPackages(targetDevice, topLevelFiles, App.Current.Dispatcher);
                             }
                             else
-                                VerifyAndPush(targetFolder, shItems, CurrentEffect);
+                                _ = VerifyAndPush(targetFolder, topLevelFiles, targetDevice, dropEffect);
                         }
                     });
                 }
             }
             else if (IsWindows) // FileDrop format
             {
-                if (Data.FileActions.IsAppDrive)
+                if (isAppDrive)
                 {
-                    if (FileHelper.AllFilesAreApks(DragFiles))
-                        ShellFileOperation.PushPackages(Data.CurrentADBDevice, CurrentFiles.Select(f => f.ShellItem), App.Current.Dispatcher);
+                    if (allFilesAreApks)
+                        ShellFileOperation.PushPackages(targetDevice, CurrentFiles.Select(f => f.FullPath), App.Current.Dispatcher);
                 }
                 else
-                    VerifyAndPush(targetFolder, CurrentFiles, CurrentEffect);
+                    _ = VerifyAndPush(targetFolder, CurrentFiles, targetDevice, dropEffect);
             }
             else if (IsSelf)
             {
@@ -715,19 +1033,19 @@ public class CopyPasteService : ViewModelBase
                 if (DragFiles.Length == 1 && DragFiles[0] == targetFolder && IsDrag)
                     return;
 
-                if (Data.FileActions.IsAppDrive)
+                if (isAppDrive)
                 {
-                    if (FileHelper.AllFilesAreApks(DragFiles))
-                        ShellFileOperation.InstallPackages(Data.CurrentADBDevice, CurrentFiles, App.Current.Dispatcher);
+                    if (allFilesAreApks)
+                        ShellFileOperation.InstallPackages(targetDevice, CurrentFiles, App.Current.Dispatcher);
                 }
                 else
                 {
-                    var masterPid = IsDragFromMaster ? MasterPid : 0;
-                    VerifyAndPaste(isLink ? DragDropEffects.Link : CurrentEffect,
+                    var masterPid = dragFromMaster ? sourceMasterPid : 0;
+                    VerifyAndPaste(isLink ? DragDropEffects.Link : dropEffect,
                                targetFolder,
                                CurrentFiles,
                                App.Current.Dispatcher,
-                               Data.CurrentADBDevice,
+                               targetDevice,
                                Data.CurrentPath,
                                masterPid);
                 }
@@ -738,7 +1056,7 @@ public class CopyPasteService : ViewModelBase
                 return;
             }
 
-            if (CurrentEffect is DragDropEffects.Move)
+            if (dropEffect is DragDropEffects.Move)
                 Clear();
         }
 
@@ -748,36 +1066,77 @@ public class CopyPasteService : ViewModelBase
             ClearDrag();
     }
 
-    public static async void VerifyAndPush(string targetPath, IEnumerable<ShellItem> pasteItems)
+    public static async Task<IReadOnlyList<FileSyncOperation>> VerifyAndPush(
+        string targetPath,
+        IEnumerable<string> itemPaths,
+        ADBService.AdbDevice device,
+        DragDropEffects dropEffects = DragDropEffects.Copy)
     {
-        var files = await MergeFiles(pasteItems.Select(f => f.ParsingName), targetPath);
-        if (!files.Any())
-            return;
-
-        if (files.Count() < pasteItems.Count())
+        try
         {
-            pasteItems = pasteItems.Where(f => files.Contains(f.ParsingName));
+            var paths = itemPaths.ToList();
+            var files = (await MergeFiles(paths, targetPath, device)).ToList();
+            if (files.Count == 0)
+                return [];
+
+            if (files.Count < paths.Count)
+                paths = paths.Where(files.Contains).ToList();
+
+            return await FileActionLogic.PushShellObjects(paths, targetPath, device, dropEffects);
         }
-
-        FileActionLogic.PushShellObjects(pasteItems, targetPath);
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to prepare upload: {e.Message}");
+            return [];
+        }
     }
 
-    public static async void VerifyAndPush(string targetPath, IEnumerable<FileClass> pasteItems, DragDropEffects dropEffects = DragDropEffects.Copy)
+    public static async Task VerifyAndPush(string targetPath, IEnumerable<FileClass> pasteItems, ADBService.AdbDevice device, DragDropEffects dropEffects = DragDropEffects.Copy)
     {
-        pasteItems = await MergeFiles(targetPath, pasteItems);
-        if (!pasteItems.Any())
-            return;
+        try
+        {
+            var items = await MergeFiles(targetPath, device, pasteItems.ToList());
+            if (!items.Any())
+                return;
 
-        FileActionLogic.PushShellObjects(pasteItems.Select(f => f.ShellItem), targetPath, dropEffects);
+            await FileActionLogic.PushShellObjects(items.Select(f => f.FullPath), targetPath, device, dropEffects);
+        }
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to prepare upload: {e.Message}");
+        }
     }
 
-    public static FileSyncOperation VerifyAndPush(string targetPath, FileClass pasteItem, DragDropEffects dropEffects = DragDropEffects.Copy, ShellItem originalShellItem = null)
+    public static async Task<FileSyncOperation> VerifyAndPush(string targetPath, string itemPath, ADBService.AdbDevice device, DragDropEffects dropEffects = DragDropEffects.Copy, ShellItem originalShellItem = null)
     {
-        var items = MergeFiles(targetPath, pasteItem).Result;
-        if (!items.Any())
+        var transferred = false;
+        try
+        {
+            var items = await MergeFiles([itemPath], targetPath, device);
+            if (!items.Any())
+                return null;
+
+            var operation = await FileActionLogic.PushShellObject(itemPath, targetPath, device, dropEffects, originalShellItem);
+            transferred = true;
+            return operation;
+        }
+        catch (Exception e)
+        {
+            Data.AddCommandLog($"@ADB Explorer: failed to prepare upload: {e.Message}");
             return null;
-
-        return FileActionLogic.PushShellObject(pasteItem.ShellItem, targetPath, dropEffects, originalShellItem);
+        }
+        finally
+        {
+            if (!transferred)
+            {
+                try
+                {
+                    originalShellItem?.Dispose();
+                }
+                catch
+                { }
+            }
+        }
     }
 
     public async void VerifyAndPaste(DragDropEffects cutType,
@@ -792,11 +1151,11 @@ public class CopyPasteService : ViewModelBase
         if (!pasteItems.Any())
             return;
 
-        pasteItems = await MergeFiles(targetPath, pasteItems);
+        pasteItems = await MergeFiles(targetPath, device, pasteItems);
         if (!pasteItems.Any())
             return;
 
-        ShellFileOperation.MoveItems(device: device,
+        await ShellFileOperation.MoveItems(device: device,
                   items: pasteItems,
                   targetPath: targetPath,
                   currentPath: currentPath,
@@ -817,10 +1176,18 @@ public class CopyPasteService : ViewModelBase
     /// The original list if user selected Merge or Replace. <br />
     /// The file list excluding the top level conflicting items if user selected Skip.
     /// </returns>
-    public static async Task<IEnumerable<string>> MergeFiles(IEnumerable<string> filePaths, string targetPath)
+    public static async Task<IEnumerable<string>> MergeFiles(IEnumerable<string> filePaths, string targetPath, ADBService.AdbDevice device)
     {
         if (filePaths is null || targetPath is null)
             return [];
+
+        if (!App.Current.Dispatcher.CheckAccess())
+        {
+            var mergeTask = await App.Current.Dispatcher.InvokeAsync(() => MergeFiles(filePaths, targetPath, device));
+            return await mergeTask;
+        }
+
+        var fileList = filePaths.ToList();
 
         // Figure out whether the target is Windows or Android
         var sep = FileHelper.GetSeparator(targetPath);
@@ -834,32 +1201,39 @@ public class CopyPasteService : ViewModelBase
         // Prepare a set with file system dependent comparison. Currently we only check for top level conflicts.
         // We receive full paths of the top level items in AdbDragList and FileDrop.
 
-        HashSet<string> fileNames = new(filePaths.Select(FileHelper.GetFullName), comparer);
+        HashSet<string> fileNames = await Task.Run(() =>
+            new HashSet<string>(fileList.Select(FileHelper.GetFullName), comparer));
         HashSet<string> existingItems;
 
         if (sep is '/') // Android
         {
-            if (targetPath == Data.CurrentPath)
+            if (targetPath == Data.CurrentPath
+                && device.ID == Data.CurrentADBDevice?.ID
+                && Data.DirList is not null)
             {
-                existingItems = Data.DirList.FileList.Select(f => f.FullPath).Intersect(fileNames).ToHashSet(comparer);
+                var currentFileNames = Data.DirList.FileList.Select(f => f.FullName).ToArray();
+                existingItems = await Task.Run(() =>
+                    currentFileNames.Intersect(fileNames, comparer).ToHashSet(comparer));
             }
             else
             {
-                var foundFiles = ADBService.FindFilesInPath(Data.CurrentADBDevice.ID, targetPath, includeNames: fileNames, caseSensitive: isUnix);
+                var foundFiles = await Task.Run(() => ADBService.FindFilesInPath(
+                    device.ID, targetPath, includeNames: fileNames, caseSensitive: isUnix));
                 existingItems = foundFiles.Select(FileHelper.GetFullName).ToHashSet(comparer);
             }
         }
         else // Windows
         {
-            var files = Directory.GetFiles(targetPath);
-            var dirs = Directory.GetDirectories(targetPath);
-
-            existingItems = dirs.Concat(files).Select(Path.GetFileName).Intersect(fileNames).ToHashSet(comparer);
+            existingItems = await Task.Run(() => Directory.GetDirectories(targetPath)
+                .Concat(Directory.GetFiles(targetPath))
+                .Select(Path.GetFileName)
+                .Intersect(fileNames, comparer)
+                .ToHashSet(comparer));
         }
 
         var count = existingItems.Count;
         if (count < 1)
-            return filePaths;
+            return fileList;
 
         string destination = FileHelper.GetFullName(targetPath);
         if (Data.CurrentDisplayNames.TryGetValue(targetPath, out var drive))
@@ -873,7 +1247,7 @@ public class CopyPasteService : ViewModelBase
             message,
             Strings.Resources.S_PASTE_CONFLICTS_TITLE,
             primaryText: Strings.Resources.S_MERGE_OR_REPLACE,
-            secondaryText: count == filePaths.Count() ? "" : Strings.Resources.S_SKIP,
+            secondaryText: count == fileList.Count ? "" : Strings.Resources.S_SKIP,
             cancelText: Strings.Resources.S_CANCEL,
             icon: DialogService.DialogIcon.Exclamation);
 
@@ -883,10 +1257,12 @@ public class CopyPasteService : ViewModelBase
         }
         if (result.Item1 is ContentDialogResult.Secondary) // Skip
         {
-            filePaths = [.. filePaths.Where(item => !existingItems.Contains(FileHelper.GetFullName(item)))];
+            fileList = await Task.Run(() => fileList
+                .Where(item => !existingItems.Contains(FileHelper.GetFullName(item)))
+                .ToList());
         }
 
-        return filePaths;
+        return fileList;
     }
 
     /// <summary>
@@ -900,10 +1276,18 @@ public class CopyPasteService : ViewModelBase
     /// The original list if user selected Merge or Replace. <br />
     /// The file list excluding the top level conflicting items if user selected Skip.
     /// </returns>
-    public static async Task<IEnumerable<FileClass>> MergeFiles(string targetPath, params IEnumerable<FileClass> filePaths)
+    public static async Task<IEnumerable<FileClass>> MergeFiles(string targetPath, ADBService.AdbDevice device, params IEnumerable<FileClass> filePaths)
     {
         if (filePaths is null || targetPath is null)
             return [];
+
+        if (!App.Current.Dispatcher.CheckAccess())
+        {
+            var mergeTask = await App.Current.Dispatcher.InvokeAsync(() => MergeFiles(targetPath, device, filePaths));
+            return await mergeTask;
+        }
+
+        var fileList = filePaths.ToList();
 
         // Figure out whether the target is Windows or Android
         var sep = FileHelper.GetSeparator(targetPath);
@@ -917,32 +1301,39 @@ public class CopyPasteService : ViewModelBase
         // Prepare a set with file system dependent comparison. Currently we only check for top level conflicts.
         // We receive full paths of the top level items in AdbDragList and FileDrop.
 
-        HashSet<string> fileNames = new(filePaths.Select(f => f.FullName), comparer);
+        var sourceNames = fileList.Select(file => file.FullName).ToArray();
+        HashSet<string> fileNames = await Task.Run(() => new HashSet<string>(sourceNames, comparer));
         HashSet<string> existingItems;
 
         if (sep is '/') // Android
         {
-            if (targetPath == Data.CurrentPath)
+            if (targetPath == Data.CurrentPath
+                && device.ID == Data.CurrentADBDevice?.ID
+                && Data.DirList is not null)
             {
-                existingItems = Data.DirList.FileList.Select(f => f.FullPath).Intersect(fileNames).ToHashSet(comparer);
+                var currentFileNames = Data.DirList.FileList.Select(f => f.FullName).ToArray();
+                existingItems = await Task.Run(() =>
+                    currentFileNames.Intersect(fileNames, comparer).ToHashSet(comparer));
             }
             else
             {
-                var foundFiles = ADBService.FindFilesInPath(Data.CurrentADBDevice.ID, targetPath, includeNames: fileNames, caseSensitive: isUnix);
+                var foundFiles = await Task.Run(() => ADBService.FindFilesInPath(
+                    device.ID, targetPath, includeNames: fileNames, caseSensitive: isUnix));
                 existingItems = foundFiles.Select(FileHelper.GetFullName).ToHashSet(comparer);
             }
         }
         else // Windows
         {
-            var files = Directory.GetFiles(targetPath);
-            var dirs = Directory.GetDirectories(targetPath);
-
-            existingItems = dirs.Concat(files).Select(Path.GetFileName).Intersect(fileNames).ToHashSet(comparer);
+            existingItems = await Task.Run(() => Directory.GetDirectories(targetPath)
+                .Concat(Directory.GetFiles(targetPath))
+                .Select(Path.GetFileName)
+                .Intersect(fileNames, comparer)
+                .ToHashSet(comparer));
         }
 
         var count = existingItems.Count;
         if (count <= 0)
-            return filePaths;
+            return fileList;
 
         string destination = FileHelper.GetFullName(targetPath);
         if (Data.CurrentDisplayNames.TryGetValue(targetPath, out var drive))
@@ -956,7 +1347,7 @@ public class CopyPasteService : ViewModelBase
             message,
             Strings.Resources.S_PASTE_CONFLICTS_TITLE,
             primaryText: Strings.Resources.S_MERGE_OR_REPLACE,
-            secondaryText: count == filePaths.Count() ? "" : Strings.Resources.S_SKIP,
+            secondaryText: count == fileList.Count ? "" : Strings.Resources.S_SKIP,
             cancelText: Strings.Resources.S_CANCEL,
             icon: DialogService.DialogIcon.Exclamation);
 
@@ -966,10 +1357,12 @@ public class CopyPasteService : ViewModelBase
         }
         if (result.Item1 is ContentDialogResult.Secondary) // Skip
         {
-            filePaths = [.. filePaths.Where(item => !existingItems.Contains(item.FullName))];
+            fileList = await Task.Run(() => fileList
+                .Where(item => !existingItems.Contains(item.FullName))
+                .ToList());
         }
 
-        return filePaths;
+        return fileList;
     }
 
     /// <summary>
@@ -997,15 +1390,4 @@ public class CopyPasteService : ViewModelBase
             : [];
     }
 
-    public static void ClearTempFolder()
-    {
-        try
-        {
-            Directory.Delete(Data.RuntimeSettings.TempDragPath, true);
-        }
-        catch
-        { }
-
-        Directory.CreateDirectory(Data.RuntimeSettings.TempDragPath);
-    }
 }

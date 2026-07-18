@@ -60,18 +60,9 @@ internal class ThemeService : ViewModelBase
     {
         ThemeManager.Current.ApplicationTheme = theme;
 
-        Task.Run(() =>
-        {
-            var keys = ((ResourceDictionary)Application.Current.Resources["DynamicBrushes"]).Keys;
-            string[] brushes = new string[keys.Count];
-            keys.CopyTo(brushes, 0);
-
-            Parallel.ForEach(brushes, (brush) => SetResourceColor(theme, brush));
-        });
+        var keys = ((ResourceDictionary)Application.Current.Resources["DynamicBrushes"]).Keys;
+        foreach (string resource in keys)
+            Application.Current.Resources[resource] = new SolidColorBrush(
+                (Color)Application.Current.Resources[$"{theme}{resource}"]);
     });
-
-    public static void SetResourceColor(ApplicationTheme theme, string resource)
-    {
-        App.Current.Dispatcher.Invoke(() => Application.Current.Resources[resource] = new SolidColorBrush((Color)Application.Current.Resources[$"{theme}{resource}"]));
-    }
 }

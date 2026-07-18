@@ -48,7 +48,8 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
     private CancellationTokenSource LinkListCancellation { get; set; }
     private Func<FileClass, FileClass> FileManipulator { get; } = fileManipulator;
 
-    private ConcurrentQueue<FileStat> currentFileQueue;
+    private ConcurrentQueue<FileClass> currentFileQueue;
+    private int currentListVersion;
 
     public void Navigate(string path)
     {
@@ -57,19 +58,22 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
     public void Stop()
     {
+        Interlocked.Increment(ref currentListVersion);
         LinkListCancellation?.Cancel();
-        StopDirectoryList();
+        StopDirectoryList(false);
         IsLinkListingFinished = true;
     }
 
     private void StartDirectoryList(string path)
     {
+        int listVersion = Interlocked.Increment(ref currentListVersion);
+
         void resetState()
         {
             IsLinkListingFinished = false;
 
             LinkListCancellation?.Cancel();
-            StopDirectoryList();
+            StopDirectoryList(false);
             FileList.RemoveAll();
 
             InProgress = true;
@@ -84,23 +88,38 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
         CurrentCancellationToken = new();
         LinkListCancellation = new();
-        currentFileQueue = new ConcurrentQueue<FileStat>();
+        currentFileQueue = new ConcurrentQueue<FileClass>();
 
-        ReadTask = Task.Run(() => Device.ListDirectory(CurrentPath, ref currentFileQueue, Dispatcher, CurrentCancellationToken.Token), CurrentCancellationToken.Token);
-        ReadTask.ContinueWith((t) =>
+        var cancellation = CurrentCancellationToken;
+        var queue = currentFileQueue;
+        var readTask = Task.Run(
+            () => Device.ListDirectory(path, queue, Dispatcher, cancellation.Token), cancellation.Token);
+        ReadTask = readTask;
+        readTask.ContinueWith((t) =>
         {
-            _ = Dispatcher.BeginInvoke(new Action(() => StopDirectoryList()));
-        }, CurrentCancellationToken.Token);
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (listVersion == Volatile.Read(ref currentListVersion)
+                    && ReferenceEquals(ReadTask, readTask))
+                {
+                    StopDirectoryList(true);
+                }
+            }));
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
 
         Task.Delay(DIR_LIST_VISIBLE_PROGRESS_DELAY).ContinueWith((t) =>
         {
-            _ = Dispatcher.BeginInvoke(new Action(() => IsProgressVisible = InProgress));
-        }, CurrentCancellationToken.Token);
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (listVersion == Volatile.Read(ref currentListVersion))
+                    IsProgressVisible = InProgress;
+            }));
+        }, cancellation.Token);
 
-        ScheduleUpdate();
+        ScheduleUpdate(listVersion, cancellation.Token);
     }
 
-    private void ScheduleUpdate()
+    private void ScheduleUpdate(int listVersion, CancellationToken cancellationToken)
     {
         UpdateDelays(currentFileQueue.Count);
 
@@ -108,9 +127,13 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
         UpdateTask.ContinueWith(
             (t) =>
             {
-                _ = Dispatcher.BeginInvoke(new Action(() => UpdateDirectoryList(!InProgress)));
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (listVersion == Volatile.Read(ref currentListVersion))
+                        UpdateDirectoryList(!InProgress, listVersion, cancellationToken);
+                }));
             },
-            CurrentCancellationToken.Token,
+            cancellationToken,
             TaskContinuationOptions.OnlyOnRanToCompletion,
             TaskScheduler.Default);
     }
@@ -132,7 +155,7 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
         }
     }
 
-    private void UpdateDirectoryList(bool finish)
+    private void UpdateDirectoryList(bool finish, int listVersion, CancellationToken cancellationToken)
     {
         List<FileClass> itemsToAdd = [];
 
@@ -140,12 +163,10 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
         {
             for (int i = 0; finish || (i < DIR_LIST_UPDATE_THRESHOLD_MAX); i++)
             {
-                if (!currentFileQueue.TryDequeue(out FileStat fileStat))
+                if (!currentFileQueue.TryDequeue(out FileClass item))
                 {
                     break;
                 }
-
-                FileClass item = FileClass.GenerateAndroidFile(fileStat);
 
                 if (FileManipulator is not null)
                 {
@@ -161,11 +182,11 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
         if (!finish)
         {
-            ScheduleUpdate();
+            ScheduleUpdate(listVersion, cancellationToken);
         }
     }
 
-    private void StopDirectoryList()
+    private void StopDirectoryList(bool applyPendingItems)
     {
         if (ReadTask == null)
         {
@@ -174,63 +195,79 @@ public class DirectoryLister(Dispatcher dispatcher, ADBService.AdbDevice adbDevi
 
         CurrentCancellationToken.Cancel();
 
-        if (ReadTask.IsCompleted)
-        {
-            try
-            {
-                ReadTask.Wait();
-            }
-            catch (AggregateException e) when (e.InnerException is TaskCanceledException)
-            { }
-        }
-        else
+        if (ReadTask.IsFaulted)
+            _ = ReadTask.Exception;
+        else if (!ReadTask.IsCompleted)
         {
             _ = ReadTask.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
         }
 
-        UpdateDirectoryList(true);
+        int listVersion = Volatile.Read(ref currentListVersion);
+        var linkCancellation = LinkListCancellation;
+        if (applyPendingItems)
+            UpdateDirectoryList(true, listVersion, CurrentCancellationToken.Token);
 
         InProgress = false;
         IsProgressVisible = false;
         ReadTask = null;
         CurrentCancellationToken = null;
 
+        if (!applyPendingItems)
+            return;
+
         if (currentFileQueue.IsEmpty && !FileList.Any())
         {
-            isLinkListingFinished = true;
+            IsLinkListingFinished = true;
             return;
         }
 
-        Task.Run(ListLinks, LinkListCancellation.Token);
-    }
-
-    private async void ListLinks()
-    {
-        await AsyncHelper.WaitUntil(() => FileList.Count > 0, DIR_LIST_UPDATE_INTERVAL, TimeSpan.FromMilliseconds(20), LinkListCancellation.Token);
-
         var items = FileList.Where(f => f.IsLink && f.Type is FileType.Unknown).ToList();
-        if (items.Count < 1)
+        if (items.Count == 0)
         {
             IsLinkListingFinished = true;
+            return;
+        }
+
+        if (linkCancellation is not null)
+            _ = Task.Run(() => ListLinks(listVersion, linkCancellation.Token, items), linkCancellation.Token);
+    }
+
+    private void ListLinks(int listVersion, CancellationToken cancellationToken, IReadOnlyList<FileClass> items)
+    {
+        if (cancellationToken.IsCancellationRequested
+            || listVersion != Volatile.Read(ref currentListVersion))
+        {
             return;
         }
 
         List<(string, FileType)> result = null;
         try
         {
-            result = [.. Device.GetLinkType(items.Select(f => f.FullPath), LinkListCancellation.Token)];
+            result = [.. Device.GetLinkType(items.Select(f => f.FullPath), cancellationToken)];
         }
+        catch (OperationCanceledException)
+        { }
         catch (AggregateException e) when (e.InnerException is TaskCanceledException)
         { }
 
         if (result is null)
         {
-            IsLinkListingFinished = true;
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (listVersion == Volatile.Read(ref currentListVersion))
+                    IsLinkListingFinished = true;
+            }));
             return;
         }
 
         _ = Dispatcher.BeginInvoke(new Action(() =>
         {
+            if (cancellationToken.IsCancellationRequested
+                || listVersion != Volatile.Read(ref currentListVersion))
+            {
+                return;
+            }
+
             for (var i = 0; i < items.Count; i++)
             {
                 var file = items[i];

@@ -9,9 +9,20 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
     protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
     {
         if (!suppressOnCollectionChanged)
-        {
             base.OnCollectionChanged(e);
-        }
+    }
+
+    protected override void OnPropertyChanged(PropertyChangedEventArgs e)
+    {
+        if (!suppressOnCollectionChanged)
+            base.OnPropertyChanged(e);
+    }
+
+    private void NotifyReset()
+    {
+        OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+        OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
     }
 
     /// <summary>
@@ -33,29 +44,33 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
 
         // When adding more than one item, we suppress the notification mechanism while items are being added
         suppressOnCollectionChanged = true;
-
-        foreach (T item in itemsList)
+        try
         {
-            Add(item);
+            foreach (T item in itemsList)
+                Items.Add(item);
         }
-
-        suppressOnCollectionChanged = false;
-
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        finally
+        {
+            suppressOnCollectionChanged = false;
+            NotifyReset();
+        }
     }
 
     public void RemoveAll()
     {
+        if (Count == 0)
+            return;
+
         suppressOnCollectionChanged = true;
-
-        while (Count > 0)
+        try
         {
-            RemoveAt(0);
+            Items.Clear();
         }
-
-        suppressOnCollectionChanged = false;
-
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        finally
+        {
+            suppressOnCollectionChanged = false;
+            NotifyReset();
+        }
     }
 
     public T Find(Func<T, bool> predicate)
@@ -63,10 +78,13 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
         if (Count == 0 || predicate is null)
             return default;
 
-        var resultList = this.Where(predicate).ToArray();
-        return resultList.Length > 0
-            ? resultList[0]
-            : default;
+        foreach (var item in this)
+        {
+            if (predicate(item))
+                return item;
+        }
+
+        return default;
     }
 
     /// <summary>
@@ -87,17 +105,19 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
                 return true;
         }
 
-        // When removing more than one item, we suppress the notification mechanism while items are being removed
+        var remainingItems = this.Except(resultList).ToArray();
         suppressOnCollectionChanged = true;
-
-        foreach (T item in resultList)
+        try
         {
-            Remove(item);
+            Items.Clear();
+            foreach (T item in remainingItems)
+                Items.Add(item);
         }
-
-        suppressOnCollectionChanged = false;
-
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        finally
+        {
+            suppressOnCollectionChanged = false;
+            NotifyReset();
+        }
 
         return true;
 
@@ -105,7 +125,8 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
 
     public void RemoveAll(IEnumerable<T> items)
     {
-        var resultList = items.ToArray();
+        var itemsToRemove = items.ToHashSet();
+        var resultList = this.Where(itemsToRemove.Contains).ToArray();
         switch (resultList.Length)
         {
             case < 1:
@@ -116,29 +137,33 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
                 return;
         }
 
-        // When removing more than one item, we suppress the notification mechanism while items are being removed
+        var remainingItems = this.Where(item => !itemsToRemove.Contains(item)).ToArray();
         suppressOnCollectionChanged = true;
-
-        foreach (var item in resultList)
+        try
         {
-            Remove(item);
+            Items.Clear();
+            foreach (T item in remainingItems)
+                Items.Add(item);
         }
-
-        suppressOnCollectionChanged = false;
-
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        finally
+        {
+            suppressOnCollectionChanged = false;
+            NotifyReset();
+        }
     }
 
     public void ForEach(Action<T> action)
     {
         suppressOnCollectionChanged = true;
-
-        foreach (var item in this)
+        try
         {
-            action(item);
+            foreach (var item in this)
+                action(item);
         }
-
-        suppressOnCollectionChanged = false;
-        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        finally
+        {
+            suppressOnCollectionChanged = false;
+            NotifyReset();
+        }
     }
 }

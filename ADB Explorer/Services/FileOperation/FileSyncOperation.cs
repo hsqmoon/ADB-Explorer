@@ -10,14 +10,21 @@ namespace ADB_Explorer.Services;
 
 public class FileSyncOperation : FileOperation
 {
-    private static readonly TimeSpan PROGRESS_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(75);
+    private const int PROGRESS_UPDATE_INTERVAL_MS = 100;
+    private static readonly TimeSpan PROGRESS_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(PROGRESS_UPDATE_INTERVAL_MS);
     private const int MAX_LOCAL_SYNC_PARALLELISM = 4;
     private const int MAX_REMOTE_SYNC_PARALLELISM = 2;
 
     private CancellationTokenSource cancelTokenSource;
-    private readonly ConcurrentQueue<FileOpProgressInfo> pendingProgressUpdates = [];
+    private readonly Dictionary<string, (SyncFile File, FileOpProgressInfo Update)> pendingProgressUpdates = [];
     private readonly object progressFlushLock = new();
     private int progressFlushScheduled = 0;
+    private long progressTotalBytes;
+    private long progressTransferredBytes;
+    private int progressActiveCount;
+    private double progressActivePercentage;
+    private IReadOnlyList<SyncFile> files;
+    private readonly TaskCompletionSource<bool> transferCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public override SyncFile FilePath { get; }
 
@@ -42,12 +49,13 @@ public class FileSyncOperation : FileOperation
 
     public ShellItem OriginalShellItem { get; set; }
 
+    public bool IsBatch { get; set; }
+
     public DateTime TransferStart { get; private set; }
     public DateTime TransferEnd { get; private set; }
 
-    IEnumerable<SyncFile> Files => [FilePath, .. FilePath.AllChildren()];
+    private IReadOnlyList<SyncFile> Files => files ??= [FilePath, .. FilePath.AllChildren()];
     private long? TotalBytes => Files.Sum(f => f.Size);
-    private IEnumerable<SyncFile> ActiveFiles => Files.Where(f => f.CurrentPercentage is > 0 and < 100);
 
     private bool isCanceled = false;
 
@@ -85,29 +93,37 @@ public class FileSyncOperation : FileOperation
         Status = OperationStatus.InProgress;
         StatusInfo = new InProgSyncProgressViewModel();
         cancelTokenSource = new CancellationTokenSource();
+        isCanceled = false;
 
         if (OperationName is OperationType.Push &&
             !File.Exists(FilePath.FullPath) && !Directory.Exists(FilePath.FullPath))
         {
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: Strings.Resources.S_SYNC_FILE_NOT_FOUND, total: true));
-
+            try
+            {
+                StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: Strings.Resources.S_SYNC_FILE_NOT_FOUND, total: true));
+                Status = OperationStatus.Failed;
+            }
+            finally
+            {
+                ReleaseTransferResources();
+            }
             return;
         }
 
         UnixFileStatus fileMode = UnixFileStatus.AllPermissions | UnixFileStatus.Regular;
 
-        var task = Task.Run(() =>
+        var task = Task.Run(async () =>
         {
             TransferStart = DateTime.Now;
 
             if (OperationName is OperationType.Push)
             {
                 var paths = FolderHelper.GetBottomMostFolders(Files)
-                    .Select(f => FileHelper.ConcatPaths(TargetPath.FullPath, FileHelper.ExtractRelativePath(f.FullPath, FilePath.FullPath, false)));
+                    .Select(f => FileHelper.ConcatPaths(TargetPath.FullPath, FileHelper.ExtractRelativePath(f.FullPath, FilePath.FullPath, false)))
+                    .ToList();
 
-                if (paths.Any())
-                    ShellFileOperation.MakeDirs(Device, paths);
+                if (paths.Count > 0)
+                    await ShellFileOperation.MakeDirs(Device, paths, cancelTokenSource.Token);
             }
             else
             {
@@ -115,32 +131,48 @@ public class FileSyncOperation : FileOperation
                 {
                     var targetDirPath = FileHelper.ConcatPaths(TargetPath, FileHelper.ExtractRelativePath(dir.FullPath, FilePath.FullPath, false));
                     Directory.CreateDirectory(targetDirPath);
-
-                    Data.AddCommandLog($"@Windows: mkdir {targetDirPath}");
                 }
             }
 
+            var transferFiles = Files.Where(f => !f.IsDirectory).ToList();
+            lock (progressFlushLock)
+            {
+                progressTotalBytes = transferFiles.Sum(f => f.Size ?? 0);
+                progressTransferredBytes = 0;
+                progressActiveCount = 0;
+                progressActivePercentage = 0;
+            }
+
+            Data.AddCommandLog($"@AdvancedSharpAdbClient: {OperationName.ToString().ToLowerInvariant()} "
+                + $"{FilePath.FullPath} -> {TargetPath.FullPath} ({transferFiles.Count} files)");
+
             ParallelOptions options = new()
             {
-                MaxDegreeOfParallelism = GetMaxDegreeOfParallelism()
+                MaxDegreeOfParallelism = GetMaxDegreeOfParallelism(),
+                CancellationToken = cancelTokenSource.Token,
             };
             bool useV2 = Device.AndroidVersion >= 11;
 
-            Parallel.ForEach(Files.Where(f => !f.IsDirectory), options, (item) =>
+            Parallel.ForEach(transferFiles, options, (item) =>
             {
-                void SyncProgressCallback(SyncProgressChangedEventArgs eventArgs) => QueueProgressUpdate(item, eventArgs);
+                long transferredBytes = 0;
+                double percentage = 0;
+                long lastProgressUpdate = 0;
+                void SyncProgressCallback(SyncProgressChangedEventArgs eventArgs)
+                    => QueueProgressUpdate(
+                        item,
+                        eventArgs,
+                        ref transferredBytes,
+                        ref percentage,
+                        ref lastProgressUpdate);
 
                 // Open a new connection for each file to allow parallel transfers, maximizing throughput of the medium.
                 // Connecting by both USB and WiFi at the same time causes instability and doesn't seem to improve the speed further.
                 using SyncService service = new(ADBService.AdbServerEndPoint, Device.Device.DeviceData);
-                var targetPath = FilePath.IsDirectory
-                        ? FileHelper.ConcatPaths(TargetPath, FileHelper.ExtractRelativePath(item.FullPath, FilePath.FullPath))
-                        : TargetPath.FullPath;
+                var targetPath = ResolveTargetPath(FilePath, TargetPath, item);
 
                 if (OperationName is OperationType.Push)
                 {
-                    Data.AddCommandLog($"@AdvancedSharpAdbClient: push {item.FullPath} -> {targetPath}");
-
                     var lastWriteTime = item.DateModified ?? DateTime.Now;
 
                     try
@@ -151,13 +183,16 @@ public class FileSyncOperation : FileOperation
                     }
                     catch (Exception e)
                     {
-                        QueueProgressUpdate(new SyncErrorInfo(item.FullPath, e.Message));
+                        QueueProgressUpdate(
+                            item,
+                            new SyncErrorInfo(item.FullPath, e.Message),
+                            -transferredBytes,
+                            percentage,
+                            0);
                     }
                 }
                 else
                 {
-                    Data.AddCommandLog($"@AdvancedSharpAdbClient: pull {item.FullPath} -> {targetPath}");
-
                     try
                     {
                         // target = [Windows parent folder]\[relative path from Android parent folder to current item]
@@ -169,111 +204,228 @@ public class FileSyncOperation : FileOperation
                     }
                     catch (Exception e)
                     {
-                        QueueProgressUpdate(new SyncErrorInfo(item.FullPath, e.Message));
+                        QueueProgressUpdate(
+                            item,
+                            new SyncErrorInfo(item.FullPath, e.Message),
+                            -transferredBytes,
+                            percentage,
+                            0);
                     }
                 }
             });
 
             FlushPendingProgressUpdates(true);
+            cancelTokenSource.Token.ThrowIfCancellationRequested();
 
         });
 
         task.ContinueWith((t) =>
         {
-            FlushPendingProgressUpdates(true);
-
-            var files = Files.Where(f => !f.IsDirectory);
-            int filesCount = files.Count();
-            var completed = files.Count(f => f.CurrentPercentage == 100);
-            if (filesCount == 0 && Files.First().IsDirectory)
+            try
             {
-                filesCount = 1;
-                completed = 1;
-            }
+                FlushPendingProgressUpdates(true);
 
-            if (filesCount == 1 && completed == 0)
+                var files = Files.Where(f => !f.IsDirectory);
+                int filesCount = files.Count();
+                var completed = files.Count(f => f.CurrentPercentage == 100);
+                if (filesCount == 0 && Files.First().IsDirectory)
+                {
+                    filesCount = 1;
+                    completed = 1;
+                }
+
+                if (filesCount == 1 && completed == 0)
+                {
+                    string message = FilePath.LastUpdate is SyncErrorInfo errorInfo
+                        ? errorInfo.Message
+                        : Strings.Resources.S_SYNC_FILE_NOT_FOUND;
+
+                    StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: message, total: true));
+                    Status = OperationStatus.Failed;
+                }
+                else
+                {
+                    var totalSeconds = TransferEnd.Subtract(TransferStart).TotalSeconds;
+                    if (totalSeconds < 0)
+                        totalSeconds = 0;
+
+                    AdbSyncStatsInfo adbInfo = new(FilePath.FullPath, TotalBytes, totalSeconds, completed, filesCount - completed);
+                    StatusInfo = new CompletedSyncProgressViewModel(adbInfo);
+                    Status = OperationStatus.Completed;
+                }
+            }
+            finally
             {
-                string message = FilePath.LastUpdate is SyncErrorInfo errorInfo
-                    ? errorInfo.Message
-                    : Strings.Resources.S_SYNC_FILE_NOT_FOUND;
-
-                Status = OperationStatus.Failed;
-                StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: message, total: true));
+                ReleaseTransferResources();
             }
-            else
-            {
-                Status = OperationStatus.Completed;
-
-                var totalSeconds = TransferEnd.Subtract(TransferStart).TotalSeconds;
-                if (totalSeconds < 0)
-                    totalSeconds = 0;
-
-                AdbSyncStatsInfo adbInfo = new(FilePath.FullPath, TotalBytes, totalSeconds, completed, filesCount - completed);
-                StatusInfo = new CompletedSyncProgressViewModel(adbInfo);
-            }
-
-            ReleaseTransferResources();
-
         }, TaskContinuationOptions.OnlyOnRanToCompletion);
 
         task.ContinueWith((t) =>
         {
-            FlushPendingProgressUpdates(true);
-            Status = OperationStatus.Canceled;
-            StatusInfo = new CanceledOpProgressViewModel();
-
-            ReleaseTransferResources();
+            try
+            {
+                FlushPendingProgressUpdates(true);
+                StatusInfo = new CanceledOpProgressViewModel();
+                Status = OperationStatus.Canceled;
+            }
+            finally
+            {
+                ReleaseTransferResources();
+            }
         }, TaskContinuationOptions.OnlyOnCanceled);
 
         task.ContinueWith((t) =>
         {
-            FlushPendingProgressUpdates(true);
+            try
+            {
+                FlushPendingProgressUpdates(true);
 
-            string message = string.IsNullOrEmpty(t.Exception.InnerException.Message)
-                ? (FilePath.LastUpdate as SyncErrorInfo)?.Message ?? Strings.Resources.S_SYNC_FILE_NOT_FOUND
-                : t.Exception.InnerException.Message;
+                string message = string.IsNullOrEmpty(t.Exception.InnerException.Message)
+                    ? (FilePath.LastUpdate as SyncErrorInfo)?.Message ?? Strings.Resources.S_SYNC_FILE_NOT_FOUND
+                    : t.Exception.InnerException.Message;
 
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: message, total: true));
-
-            ReleaseTransferResources();
+                StatusInfo = new FailedOpProgressViewModel(FileOpStatusConverter.StatusString(typeof(SyncErrorInfo), message: message, total: true));
+                Status = OperationStatus.Failed;
+            }
+            finally
+            {
+                ReleaseTransferResources();
+            }
         }, TaskContinuationOptions.OnlyOnFaulted);
     }
 
+    internal void WaitForCompletion() => transferCompletion.Task.GetAwaiter().GetResult();
+
     private int GetMaxDegreeOfParallelism()
+        => CalculateMaxDegreeOfParallelism(
+            Data.Settings.AllowMultiOp,
+            Device.Type,
+            Environment.ProcessorCount,
+            Files.Count(f => !f.IsDirectory));
+
+    internal static int CalculateMaxDegreeOfParallelism(
+        bool allowMultiOp,
+        AbstractDevice.DeviceType deviceType,
+        int processorCount,
+        int fileCount)
     {
-        if (!Data.Settings.AllowMultiOp)
+        if (!allowMultiOp)
             return 1;
 
-        int deviceLimit = Device.Type switch
+        int deviceLimit = deviceType switch
         {
             AbstractDevice.DeviceType.Remote or AbstractDevice.DeviceType.WSA or AbstractDevice.DeviceType.Emulator
                 => MAX_REMOTE_SYNC_PARALLELISM,
             _ => MAX_LOCAL_SYNC_PARALLELISM,
         };
 
-        int processorLimit = Math.Clamp(Environment.ProcessorCount / 2, 2, deviceLimit);
-        int fileCount = Math.Max(1, Files.Count(f => !f.IsDirectory));
+        int processorLimit = Math.Clamp(processorCount / 2, 2, deviceLimit);
 
-        return Math.Min(fileCount, processorLimit);
+        return Math.Min(Math.Max(1, fileCount), processorLimit);
     }
 
-    private void QueueProgressUpdate(SyncFile item, SyncProgressChangedEventArgs eventArgs)
+    internal static string ResolveTargetPath(SyncFile sourceRoot, SyncFile targetRoot, SyncFile item)
+        => sourceRoot.IsDirectory
+            ? FileHelper.ConcatPaths(
+                targetRoot,
+                FileHelper.ExtractRelativePath(item.FullPath, sourceRoot.FullPath))
+            : targetRoot.FullPath;
+
+    private void QueueProgressUpdate(
+        SyncFile item,
+        SyncProgressChangedEventArgs eventArgs,
+        ref long previousTransferredBytes,
+        ref double previousPercentage,
+        ref long lastProgressUpdate)
     {
-        item.Size ??= (long)eventArgs.TotalBytesToReceive;
+        long totalBytesIncrease = 0;
+        if (item.Size is null)
+        {
+            item.Size = (long)eventArgs.TotalBytesToReceive;
+            totalBytesIncrease = item.Size.Value;
+        }
 
-        QueueProgressUpdate(new AdbSyncProgressInfo(item.FullPath, null, eventArgs.ProgressPercentage, (long)eventArgs.ReceivedBytesSize));
+        long transferredBytes = (long)eventArgs.ReceivedBytesSize;
+        double percentage = eventArgs.ProgressPercentage;
+        long now = Environment.TickCount64;
+
+        if (!ShouldReportProgress(now, percentage, ref lastProgressUpdate))
+            return;
+
+        QueueProgressUpdate(
+            item,
+            new AdbSyncProgressInfo(item.FullPath, null, percentage, transferredBytes),
+            transferredBytes - previousTransferredBytes,
+            previousPercentage,
+            percentage,
+            totalBytesIncrease);
+
+        previousTransferredBytes = transferredBytes;
+        previousPercentage = percentage;
     }
 
-    private void QueueProgressUpdate(FileOpProgressInfo update)
+    internal static bool ShouldReportProgress(long timestamp, double percentage, ref long lastProgressUpdate)
+    {
+        if (percentage < 100 && timestamp - lastProgressUpdate < PROGRESS_UPDATE_INTERVAL_MS)
+            return false;
+
+        lastProgressUpdate = timestamp;
+        return true;
+    }
+
+    private void QueueProgressUpdate(
+        SyncFile item,
+        FileOpProgressInfo update,
+        long transferredBytesIncrease = 0,
+        double previousPercentage = 0,
+        double percentage = 0,
+        long totalBytesIncrease = 0)
     {
         if (update is null)
             return;
 
-        pendingProgressUpdates.Enqueue(update);
+        lock (progressFlushLock)
+        {
+            pendingProgressUpdates[item.FullPath] = (item, update);
+            progressTotalBytes += totalBytesIncrease;
+            (progressTransferredBytes, progressActiveCount, progressActivePercentage) =
+                CalculateProgressTotals(
+                    progressTransferredBytes,
+                    progressActiveCount,
+                    progressActivePercentage,
+                    transferredBytesIncrease,
+                    previousPercentage,
+                    percentage);
+        }
+
         TransferEnd = DateTime.Now;
 
         ScheduleProgressFlush();
+    }
+
+    internal static (long TransferredBytes, int ActiveCount, double ActivePercentage) CalculateProgressTotals(
+        long transferredBytes,
+        int activeCount,
+        double activePercentage,
+        long transferredBytesIncrease,
+        double previousPercentage,
+        double percentage)
+    {
+        transferredBytes = Math.Max(0, transferredBytes + transferredBytesIncrease);
+
+        if (previousPercentage is > 0 and < 100)
+        {
+            activeCount--;
+            activePercentage -= previousPercentage;
+        }
+
+        if (percentage is > 0 and < 100)
+        {
+            activeCount++;
+            activePercentage += percentage;
+        }
+
+        return (transferredBytes, activeCount, activePercentage);
     }
 
     private void ScheduleProgressFlush()
@@ -295,60 +447,96 @@ public class FileSyncOperation : FileOperation
 
     private void FlushPendingProgressUpdates(bool invokeSynchronously = false)
     {
-        List<FileOpProgressInfo> updates = [];
-
-        lock (progressFlushLock)
+        if (Dispatcher.HasShutdownStarted)
         {
             Interlocked.Exchange(ref progressFlushScheduled, 0);
-
-            while (pendingProgressUpdates.TryDequeue(out var update))
-            {
-                updates.Add(update);
-            }
+            return;
         }
 
-        if (updates.Count == 0 || Dispatcher.HasShutdownStarted)
-            return;
+        void applyUpdates()
+        {
+            List<(SyncFile File, FileOpProgressInfo Update)> updates = [];
+            long totalBytes;
+            long transferredBytes;
+            int activeCount;
+            double activePercentage;
 
-        void applyUpdates() => ApplyProgressUpdates(updates);
+            lock (progressFlushLock)
+            {
+                updates.AddRange(pendingProgressUpdates.Values);
+                pendingProgressUpdates.Clear();
+                totalBytes = progressTotalBytes;
+                transferredBytes = progressTransferredBytes;
+                activeCount = progressActiveCount;
+                activePercentage = progressActivePercentage;
+            }
+
+            try
+            {
+                if (updates.Count > 0)
+                {
+                    ApplyProgressUpdates(
+                        updates,
+                        totalBytes,
+                        transferredBytes,
+                        activeCount,
+                        activePercentage);
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref progressFlushScheduled, 0);
+
+                lock (progressFlushLock)
+                {
+                    if (pendingProgressUpdates.Count > 0)
+                        ScheduleProgressFlush();
+                }
+            }
+        }
 
         if (Dispatcher.CheckAccess())
             applyUpdates();
         else if (invokeSynchronously)
             Dispatcher.InvokeAsync(new Action(applyUpdates)).Task.Wait();
         else
-            _ = Dispatcher.BeginInvoke(new Action(applyUpdates));
+            _ = Dispatcher.BeginInvoke(new Action(applyUpdates), DispatcherPriority.Background);
 
-        if (!pendingProgressUpdates.IsEmpty)
-            ScheduleProgressFlush();
     }
 
-    private void ApplyProgressUpdates(IEnumerable<FileOpProgressInfo> updates)
+    private void ApplyProgressUpdates(
+        IReadOnlyList<(SyncFile File, FileOpProgressInfo Update)> updates,
+        long totalBytes,
+        long transferredBytes,
+        int activeCount,
+        double activePercentage)
     {
-        var updateList = updates.ToList();
-        AddUpdates(updateList);
+        AdbSyncProgressInfo currProgress = null;
+        foreach (var (file, update) in updates)
+        {
+            file.AddUpdates(update);
+            if (update is AdbSyncProgressInfo progress)
+                currProgress = progress;
+        }
 
         if (Status is not OperationStatus.InProgress)
             return;
 
-        if (updateList.LastOrDefault(update => update is AdbSyncProgressInfo) is AdbSyncProgressInfo currProgress)
+        if (currProgress is not null)
         {
-            var totalBytes = TotalBytes;
-            var total = totalBytes is > 0
-                ? (double)Files.Sum(f => f.BytesTransferred) / totalBytes.Value
-                : 0;
+            var total = totalBytes > 0 ? (double)transferredBytes / totalBytes : 0;
             currProgress.TotalPercentage = total * 100;
 
             AdbSyncProgressInfo info = currProgress;
 
             // Total percentage is displayed for single file
-            if (Files.Count() == 1)
+            if (Files.Count == 1)
                 info = new(currProgress.AndroidPath, currProgress.TotalPercentage, null, currProgress.CurrentFileBytesTransferred);
-            else if(ActiveFiles.Count() > 1)
+            else if (activeCount > 1)
             {
-                info = new(string.Format(Strings.Resources.S_FILES_PLURAL, ActiveFiles.Count()),
+                info = new(string.Format(Strings.Resources.S_FILES_PLURAL, activeCount),
                            currProgress.TotalPercentage,
-                           (int)ActiveFiles.Average(f => f.CurrentPercentage),
+                           (int)(activePercentage / activeCount),
                            currProgress.TotalBytesTransferred);
             }
 
@@ -371,40 +559,86 @@ public class FileSyncOperation : FileOperation
     {
         FilePath.ClearAll();
 
-        while (pendingProgressUpdates.TryDequeue(out _))
-        { }
+        lock (progressFlushLock)
+        {
+            pendingProgressUpdates.Clear();
+            progressTotalBytes = 0;
+            progressTransferredBytes = 0;
+            progressActiveCount = 0;
+            progressActivePercentage = 0;
+        }
+
+        files = null;
     }
 
     private void ReleaseTransferResources()
     {
-        if (StatusInfo is CompletedSyncProgressViewModel completed && completed.FilesSkipped > 0)
+        try
         {
-            var faultyFiles = Files.Where(f => !f.IsDirectory && f.LastUpdate is SyncErrorInfo)
-                                   .Take(20)
-                                   .Select(f => (File: f, Update: f.LastUpdate))
-                                   .ToList();
-
-            FilePath.ClearAll();
-
-            foreach (var (file, update) in faultyFiles)
+            void detachFileTree()
             {
-                file.ProgressUpdates.Add(update);
+                if (StatusInfo is CompletedSyncProgressViewModel completed && completed.FilesSkipped > 0)
+                {
+                    var faultyFiles = Files.Where(file => !file.IsDirectory && file.LastUpdate is SyncErrorInfo)
+                        .Take(20)
+                        .Select(file => (
+                            File: new SyncFile(file.FullPath)
+                            {
+                                PathType = file.PathType,
+                                Size = file.Size,
+                                UnixTime = file.UnixTime,
+                            },
+                            Update: file.LastUpdate))
+                        .ToList();
+
+                    FilePath.ClearAll();
+                    foreach (var (file, update) in faultyFiles)
+                        file.ProgressUpdates.Add(update);
+
+                    FilePath.Children.AddRange(faultyFiles.Select(item => item.File));
+                    return;
+                }
+
+                FilePath.ClearAll();
             }
 
-            FilePath.Children.AddRange(faultyFiles.Select(f => f.File));
+            if (!Dispatcher.HasShutdownStarted && !Dispatcher.CheckAccess())
+                Dispatcher.Invoke(detachFileTree);
+            else
+                detachFileTree();
         }
-        else
+        finally
         {
-            FilePath.ClearAll();
-        }
+            try
+            {
+                lock (progressFlushLock)
+                {
+                    pendingProgressUpdates.Clear();
+                    progressTotalBytes = 0;
+                    progressTransferredBytes = 0;
+                    progressActiveCount = 0;
+                    progressActivePercentage = 0;
+                }
 
-        while (pendingProgressUpdates.TryDequeue(out _))
-        { }
+                files = null;
 
-        if (OriginalShellItem is IDisposable disposable)
-        {
-            disposable.Dispose();
-            OriginalShellItem = null;
+                var cancellation = cancelTokenSource;
+                cancelTokenSource = null;
+                cancellation?.Dispose();
+            }
+            finally
+            {
+                try
+                {
+                    var originalShellItem = OriginalShellItem;
+                    OriginalShellItem = null;
+                    (originalShellItem as IDisposable)?.Dispose();
+                }
+                finally
+                {
+                    transferCompletion.TrySetResult(true);
+                }
+            }
         }
     }
 

@@ -46,15 +46,13 @@ public static class AdbExplorerConst
     public static readonly TimeSpan CONNECT_TIMER_INIT = TimeSpan.FromMilliseconds(50);
     public static readonly TimeSpan DRIVE_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(2000);
     public static readonly TimeSpan BATTERY_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(8000);
-    public static readonly TimeSpan MDNS_STATUS_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(15);
+    public static readonly TimeSpan MDNS_STATUS_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(100);
     public static readonly TimeSpan RESPONSE_TIMER_INTERVAL = TimeSpan.FromMilliseconds(1000);
     public static readonly TimeSpan SERVER_RESPONSE_TIMEOUT = TimeSpan.FromMilliseconds(13000);
     public static readonly TimeSpan ADB_POLL_COMMAND_TIMEOUT = TimeSpan.FromMilliseconds(2500);
     public static readonly TimeSpan MDNS_DOWN_RESPONSE_TIME = TimeSpan.FromMilliseconds(12000);
     public static readonly TimeSpan SERVICE_DISPLAY_DELAY = TimeSpan.FromMilliseconds(2000);
-    public static readonly TimeSpan EMPTY_FOLDER_NOTICE_DELAY = TimeSpan.FromMilliseconds(1500);
     public static readonly TimeSpan MDNS_FORCE_CONNECT_TIME = TimeSpan.FromMilliseconds(2500);
-    public static readonly TimeSpan DISK_USAGE_INTERVAL_ACTIVE = TimeSpan.FromMilliseconds(200);
     public static readonly TimeSpan DISK_USAGE_INTERVAL_IDLE = TimeSpan.FromMilliseconds(1000);
 
     public const sbyte MIN_SUPPORTED_ANDROID_VER = 6;

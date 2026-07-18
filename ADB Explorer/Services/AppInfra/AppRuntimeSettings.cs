@@ -110,14 +110,7 @@ public class AppRuntimeSettings : ViewModelBase
     public LogicalDeviceViewModel DeviceToOpen
     {
         get => deviceToBrowse;
-        set
-        {
-            if (Set(ref deviceToBrowse, value))
-            {
-                if (value is not null)
-                    DeviceHelper.OpenDevice(value);
-            }
-        }
+        set => Set(ref deviceToBrowse, value);
     }
 
     private bool isManualPairingInProgress = false;
@@ -432,14 +425,31 @@ public class AppRuntimeSettings : ViewModelBase
     public IPEndPoint AdbServerEndPoint => new(IPAddress.Loopback, AdbServerPort);
 
     private string tempDragPath = null;
+    private readonly object tempDragPathLock = new();
     public string TempDragPath
     {
         get
         {
-            tempDragPath ??= Directory.CreateTempSubdirectory().FullName;
-
-            return tempDragPath; 
+            lock (tempDragPathLock)
+            {
+                return tempDragPath ??= CreateTempDragPath();
+            }
         }
+    }
+
+    public string ResetTempDragPath()
+    {
+        lock (tempDragPathLock)
+        {
+            tempDragPath = CreateTempDragPath();
+            return tempDragPath;
+        }
+    }
+
+    private static string CreateTempDragPath()
+    {
+        Directory.CreateDirectory(Data.AppDataPath);
+        return Directory.CreateDirectory(Path.Combine(Data.AppDataPath, $"drag-{Guid.NewGuid():N}")).FullName;
     }
 
     public bool IsAppDeployed => Environment.CurrentDirectory.ToUpper() == @"C:\WINDOWS\SYSTEM32";

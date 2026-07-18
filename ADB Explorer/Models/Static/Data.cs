@@ -10,7 +10,7 @@ internal static class Data
     private const int MAX_COMMAND_LOG_ENTRIES = 2000;
     private static readonly object commandLogLock = new();
     private static readonly Queue<Log> pendingCommandLogs = new();
-    private static bool isCommandLogFlushScheduled;
+    private static int isCommandLogFlushScheduled;
 
     public static ADBService.AdbDevice CurrentADBDevice { get; set; } = null;
 
@@ -41,6 +41,9 @@ internal static class Data
         var log = new Log(content);
         lock (commandLogLock)
         {
+            while (pendingCommandLogs.Count >= MAX_COMMAND_LOG_ENTRIES)
+                pendingCommandLogs.Dequeue();
+
             pendingCommandLogs.Enqueue(log);
         }
 
@@ -49,23 +52,16 @@ internal static class Data
 
     private static void ScheduleCommandLogFlush()
     {
+        if (Interlocked.Exchange(ref isCommandLogFlushScheduled, 1) == 1)
+            return;
+
         if (Application.Current?.Dispatcher is not { HasShutdownStarted: false, HasShutdownFinished: false } dispatcher)
         {
             FlushPendingCommandLogs();
             return;
         }
 
-        if (dispatcher.CheckAccess())
-        {
-            if (isCommandLogFlushScheduled)
-                return;
-
-            isCommandLogFlushScheduled = true;
-            _ = dispatcher.BeginInvoke(FlushPendingCommandLogs, DispatcherPriority.Background);
-            return;
-        }
-
-        _ = dispatcher.BeginInvoke(new Action(ScheduleCommandLogFlush), DispatcherPriority.Background);
+        _ = dispatcher.BeginInvoke(FlushPendingCommandLogs, DispatcherPriority.Background);
     }
 
     private static void FlushPendingCommandLogs()
@@ -78,7 +74,7 @@ internal static class Data
                 logsToAdd.Add(pendingCommandLogs.Dequeue());
             }
 
-            isCommandLogFlushScheduled = false;
+            Interlocked.Exchange(ref isCommandLogFlushScheduled, 0);
         }
 
         if (logsToAdd.Count > 0)

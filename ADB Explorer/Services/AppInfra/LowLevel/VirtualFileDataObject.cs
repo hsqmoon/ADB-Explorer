@@ -21,16 +21,23 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     public static FileGroup SelfFileGroup { get; private set; }
     public static IEnumerable<FileClass> SelfFiles { get; private set; }
     public static string DummyFileName { get; private set; }
+    private static VirtualFileDataObject clipboardOwner;
 
     /// <summary>
     /// In-order list of registered data objects.
     /// </summary>
     private readonly List<DataObject> dataObjects = [];
+    private readonly object dataObjectsLock = new();
+    private readonly object selfDataLock = new();
+    private readonly CancellationTokenSource preparationCancellation = new();
+    private IReadOnlyList<FileClass> selfFiles;
+    private FileGroup selfFileGroup;
+    private bool selfDataReleased;
 
     /// <summary>
     /// Tracks whether an asynchronous operation is ongoing.
     /// </summary>
-    private bool inOperation;
+    private volatile bool inOperation;
 
     public DataObjectMethod Method { get; private set; }
 
@@ -88,14 +95,20 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         if (direction != DATADIR.DATADIR_GET)
             throw new NotImplementedException();
 
-        if (0 == dataObjects.Count)
+        FORMATETC[] formats;
+        lock (dataObjectsLock)
+        {
+            formats = [.. dataObjects.Select(dataObject => dataObject.FORMATETC)];
+        }
+
+        if (formats.Length == 0)
         {
             // Note: SHCreateStdEnumFmtEtc fails for a count of 0; throw helpful exception
             throw new InvalidOperationException("VirtualFileDataObject requires at least one data object to enumerate.");
         }
 
         // Create enumerator and return it
-        var res = NativeMethods.SHCreateStdEnumFmtEtc(dataObjects.Count, dataObjects.Select(d => d.FORMATETC), out IEnumFORMATETC enumerator);
+        var res = NativeMethods.SHCreateStdEnumFmtEtc(formats.Length, formats, out IEnumFORMATETC enumerator);
         if (res is NativeMethods.HResult.Ok)
         {
             return enumerator;
@@ -140,11 +153,15 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         if (hr is NativeMethods.HResult.Ok)
         {
             // Find the best match
-            var dataObject = dataObjects.FirstOrDefault(d =>
-                    d.FORMATETC.cfFormat == formatCopy.cfFormat
-                    && d.FORMATETC.dwAspect == formatCopy.dwAspect
-                    && 0 != (d.FORMATETC.tymed & formatCopy.tymed)
-                    && d.FORMATETC.lindex == formatCopy.lindex);
+            DataObject dataObject;
+            lock (dataObjectsLock)
+            {
+                dataObject = dataObjects.FirstOrDefault(d =>
+                        d.FORMATETC.cfFormat == formatCopy.cfFormat
+                        && d.FORMATETC.dwAspect == formatCopy.dwAspect
+                        && 0 != (d.FORMATETC.tymed & formatCopy.tymed)
+                        && d.FORMATETC.lindex == formatCopy.lindex);
+            }
 
             if (dataObject is not null)
             {
@@ -210,7 +227,13 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         NativeMethods.HResult GetError(FORMATETC format)
         {
             var formatCopy = format; // Cannot use ref or out parameter inside an anonymous method, lambda expression, or query expression
-            var formatMatches = dataObjects.Where(d => d.FORMATETC.cfFormat == formatCopy.cfFormat);
+            DataObject[] objects;
+            lock (dataObjectsLock)
+            {
+                objects = [.. dataObjects];
+            }
+
+            var formatMatches = objects.Where(d => d.FORMATETC.cfFormat == formatCopy.cfFormat);
             if (!formatMatches.Any())
             {
                 return NativeMethods.HResult.DV_E_FORMATETC;
@@ -284,7 +307,12 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
 #endregion
 
     public string[] GetFormats()
-        => [.. dataObjects.Select(o => AdbDataFormats.GetFormatName(o.FORMATETC.cfFormat))];
+    {
+        lock (dataObjectsLock)
+        {
+            return [.. dataObjects.Select(o => AdbDataFormats.GetFormatName(o.FORMATETC.cfFormat))];
+        }
+    }
 
     public static FORMATETC CreateFormat(AdbDataFormat dataFormat, int index = -1) => new()
     {
@@ -297,23 +325,30 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
 
     public void UpdateData(AdbDataFormat dataFormat, IEnumerable<byte> data)
     {
-        var query = dataObjects.Where(dataObject => dataObject.FORMATETC.cfFormat == dataFormat);
-        if (!query.Any())
+        var dataArray = data as byte[] ?? data.ToArray();
+        Func<(HANDLE, NativeMethods.HResult)> getData = () =>
         {
-            SetData(dataFormat, data);
-            return;
-        }
-
-        var dataObject = query.First();
-        Marshal.FreeHGlobal(dataObject.GetData().Item1);
-
-        dataObject.GetData = () =>
-        {
-            var dataArray = data.ToArray();
             var ptr = Marshal.AllocHGlobal(dataArray.Length);
             Marshal.Copy(dataArray, 0, ptr, dataArray.Length);
             return (ptr, NativeMethods.HResult.Ok);
         };
+
+        lock (dataObjectsLock)
+        {
+            var dataObject = dataObjects.FirstOrDefault(item => item.FORMATETC.cfFormat == dataFormat);
+            if (dataObject is null)
+            {
+                dataObjects.Add(new()
+                {
+                    FORMATETC = CreateFormat(dataFormat),
+                    GetData = getData,
+                });
+            }
+            else
+            {
+                dataObject.GetData = getData;
+            }
+        }
     }
 
     /// <summary>
@@ -322,29 +357,39 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     /// <param name="dataFormat">Data format.</param>
     /// <param name="data">Sequence of data.</param>
     public void SetData(AdbDataFormat dataFormat, IEnumerable<byte> data)
-        => dataObjects.Add(new()
     {
-        FORMATETC = CreateFormat(dataFormat),
-        GetData = () =>
+        var dataArray = data as byte[] ?? data.ToArray();
+        DataObject dataObject = new()
         {
-            var dataArray = data.ToArray();
-            var ptr = Marshal.AllocHGlobal(dataArray.Length);
-            Marshal.Copy(dataArray, 0, ptr, dataArray.Length);
-            return (ptr, NativeMethods.HResult.Ok);
-        },
-    });
+            FORMATETC = CreateFormat(dataFormat),
+            GetData = () =>
+            {
+                var ptr = Marshal.AllocHGlobal(dataArray.Length);
+                Marshal.Copy(dataArray, 0, ptr, dataArray.Length);
+                return (ptr, NativeMethods.HResult.Ok);
+            },
+        };
+
+        lock (dataObjectsLock)
+        {
+            dataObjects.Add(dataObject);
+        }
+    }
 
     public void UpdateData(AdbDataFormat dataFormat, IEnumerable<StreamContents> dataStreams)
     {
-        // Remove all previous streams
-        dataObjects.RemoveAll(d => d.FORMATETC.cfFormat == dataFormat);
-
-        // Set n CFSTR_FILECONTENTS
-        var index = 0;
-        foreach (var stream in dataStreams)
+        lock (dataObjectsLock)
         {
-            SetData(dataFormat, index, stream);
-            index++;
+            // Remove all previous streams
+            dataObjects.RemoveAll(d => d.FORMATETC.cfFormat == dataFormat);
+
+            // Set n CFSTR_FILECONTENTS
+            var index = 0;
+            foreach (var stream in dataStreams)
+            {
+                SetData(dataFormat, index, stream);
+                index++;
+            }
         }
     }
 
@@ -359,23 +404,33 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     /// to be natural for the expected scenarios.
     /// </remarks>
     public void SetData(AdbDataFormat dataFormat, int index, StreamContents streamData)
-        => dataObjects.Add(new()
     {
-        FORMATETC = CreateFormat(dataFormat, index),
-        GetData = () =>
+        DataObject dataObject = new()
         {
-            var iStream = streamData();
-            var ptr = Marshal.GetComInterfaceForObject(iStream, typeof(IStream));
-            Marshal.ReleaseComObject(iStream);
+            FORMATETC = CreateFormat(dataFormat, index),
+            GetData = () =>
+            {
+                var iStream = streamData();
+                if (iStream is null)
+                    return (IntPtr.Zero, NativeMethods.HResult.Fail);
 
-            return (ptr, NativeMethods.HResult.Ok);
-        },
-    });
+                var ptr = Marshal.GetComInterfaceForObject(iStream, typeof(IStream));
+                Marshal.ReleaseComObject(iStream);
+
+                return (ptr, NativeMethods.HResult.Ok);
+            },
+        };
+
+        lock (dataObjectsLock)
+        {
+            dataObjects.Add(dataObject);
+        }
+    }
 
     public void SetFileDescriptors(IEnumerable<FileDescriptor> fileDescriptors, bool includeContent = true)
     {
         FileGroup group = new(fileDescriptors);
-        SelfFileGroup = group;
+        SetSelfFileGroup(group);
 
         UpdateData(AdbDataFormats.FileDescriptor, group.GroupDescriptorBytes);
 
@@ -385,15 +440,64 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
 
     public void SetAdbDrag(IEnumerable<FileClass> files, ADBService.AdbDevice device)
     {
-        SelfFiles = [.. files];
-        NativeMethods.ADBDRAGLIST adbDrag = new(device, files);
+        var fileList = files.ToArray();
+        lock (selfDataLock)
+        {
+            selfFiles = fileList;
+            if (!selfDataReleased)
+                SelfFiles = fileList;
+        }
+
+        NativeMethods.ADBDRAGLIST adbDrag = new(device, fileList);
         SetData(AdbDataFormats.AdbDrop, adbDrag.Bytes);
     }
+
+    private void SetSelfFileGroup(FileGroup group)
+    {
+        lock (selfDataLock)
+        {
+            if (selfDataReleased)
+                return;
+
+            selfFileGroup = group;
+            SelfFileGroup = group;
+        }
+    }
+
+    private void ReleaseDragData()
+    {
+        try
+        {
+            preparationCancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        { }
+
+        lock (selfDataLock)
+        {
+            if (selfDataReleased)
+                return;
+
+            selfDataReleased = true;
+            if (ReferenceEquals(SelfFiles, selfFiles))
+                SelfFiles = null;
+            if (ReferenceEquals(SelfFileGroup, selfFileGroup))
+                SelfFileGroup = null;
+
+            selfFiles = null;
+            selfFileGroup = null;
+        }
+
+        Interlocked.CompareExchange(ref clipboardOwner, null, this);
+    }
+
+    internal static void ReleaseClipboardData()
+        => Volatile.Read(ref clipboardOwner)?.ReleaseDragData();
 
     public void SetFileDrop(params IEnumerable<string> files)
         => SetData(AdbDataFormats.FileDrop, new NativeMethods.CFHDROP(files).Bytes);
 
-    public List<FileSyncOperation> Operations { get; private set; }
+    public List<FileSyncOperation> Operations { get; private set; } = [];
 
     private DragDropEffects currentEffect = DragDropEffects.None;
     public DragDropEffects CurrentEffect
@@ -444,37 +548,49 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     private DragDropEffects? GetDropEffect(short format)
     {
         // Get the most recent setting
-        var dataObject = dataObjects.LastOrDefault(d =>
-            format == d.FORMATETC.cfFormat
-            && d.FORMATETC is {
-                dwAspect: DVASPECT.DVASPECT_CONTENT,
-                tymed: TYMED.TYMED_HGLOBAL
-            });
+        DataObject dataObject;
+        lock (dataObjectsLock)
+        {
+            dataObject = dataObjects.LastOrDefault(d =>
+                format == d.FORMATETC.cfFormat
+                && d.FORMATETC is {
+                    dwAspect: DVASPECT.DVASPECT_CONTENT,
+                    tymed: TYMED.TYMED_HGLOBAL
+                });
+        }
 
         if (dataObject is not null)
         {
             // Read the value and return it
             var result = dataObject.GetData();
-            if (result.Item2 is NativeMethods.HResult.Ok)
+            try
             {
-                var ptr = NativeMethods.MGlobalLock(result.Item1);
-                if (IntPtr.Zero != ptr)
+                if (result.Item2 is NativeMethods.HResult.Ok)
                 {
-                    try
+                    var ptr = NativeMethods.MGlobalLock(result.Item1);
+                    if (IntPtr.Zero != ptr)
                     {
-                        var length = NativeMethods.MGlobalSize(ptr).ToInt32();
-                        if (4 == length)
+                        try
                         {
-                            var data = new byte[length];
-                            Marshal.Copy(ptr, data, 0, length);
-                            return (DragDropEffects)(BitConverter.ToUInt32(data, 0));
+                            var length = NativeMethods.MGlobalSize(result.Item1).ToInt32();
+                            if (4 == length)
+                            {
+                                var data = new byte[length];
+                                Marshal.Copy(ptr, data, 0, length);
+                                return (DragDropEffects)(BitConverter.ToUInt32(data, 0));
+                            }
+                        }
+                        finally
+                        {
+                            NativeMethods.MGlobalUnlock(result.Item1);
                         }
                     }
-                    finally
-                    {
-                        NativeMethods.MGlobalUnlock(result.Item1);
-                    }
                 }
+            }
+            finally
+            {
+                if (result.Item1 != IntPtr.Zero)
+                    Marshal.FreeHGlobal(result.Item1);
             }
         }
         return null;
@@ -529,6 +645,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     void IAsyncOperation.EndOperation(int hResult, IBindCtx pbcReserved, uint dwEffects)
     {
         inOperation = false;
+        ReleaseDragData();
     }
 
     #endregion
@@ -552,16 +669,63 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     public static VirtualFileDataObject PrepareTransfer(IEnumerable<Package> packages,
                                                         DataObjectMethod method = DataObjectMethod.DragDrop)
     {
+        var packageList = packages.ToList();
+        var device = Data.CurrentADBDevice;
         Data.FileActions.IsSelectionIllegalOnWindows =
         Data.FileActions.IsSelectionConflictingOnFuse = false;
 
-        CopyPasteService.ClearTempFolder();
+        var tempDragPath = Data.RuntimeSettings.ResetTempDragPath();
         VirtualFileDataObject vfdo = new(DragDropEffects.Copy, method);
 
-        var files = FileHelper.GetFilesFromTree(FileHelper.GetFolderTree(packages.Select(p => p.Path), false)).ToList();
-        vfdo.Operations = [.. files.Select(f => f.PrepareDescriptors(vfdo))];
-        vfdo.SetFileDescriptors(files.SelectMany(f => f.Descriptors));
-        vfdo.SetAdbDrag(files, Data.CurrentADBDevice);
+        var files = packageList
+            .Select(package => new FileClass(
+                FileHelper.GetFullName(package.Path),
+                package.Path,
+                AbstractFile.FileType.File,
+                loadIcon: false))
+            .ToList();
+        vfdo.SetAdbDrag(files, device);
+        vfdo.SetData(AdbDataFormats.FileDescriptor, []);
+        vfdo.SetData(AdbDataFormats.FileContents, []);
+        vfdo.SetSelfFileGroup(new([]));
+
+        Data.RuntimeSettings.MainCursor = Cursors.AppStarting;
+        Task.Run(() =>
+        {
+            var cancellationToken = vfdo.preparationCancellation.Token;
+            return files.Zip(packageList).Select(item =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return item.First.PrepareDescriptors(
+                    vfdo,
+                    tempDragPath,
+                    device,
+                    item.Second.Name + ".apk");
+            }).ToList();
+        }, vfdo.preparationCancellation.Token).ContinueWith(t =>
+        {
+            if (!t.IsCompletedSuccessfully || vfdo.preparationCancellation.IsCancellationRequested)
+            {
+                _ = t.Exception;
+                files.ForEach(file => file.ClearDescriptors());
+                _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow));
+                return;
+            }
+
+            vfdo.Operations = t.Result;
+            try
+            {
+                vfdo.SetFileDescriptors(files.SelectMany(file => file.Descriptors));
+            }
+            finally
+            {
+                files.ForEach(file => file.ClearDescriptors());
+            }
+
+            _ = App.Current.Dispatcher.BeginInvoke(
+                new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow),
+                DispatcherPriority.Background);
+        });
 
         return vfdo;
     }
@@ -570,7 +734,9 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                                                         DragDropEffects preferredEffect = DragDropEffects.Copy,
                                                         DataObjectMethod method = DataObjectMethod.DragDrop)
     {
-        CopyPasteService.ClearTempFolder();
+        var fileList = files.ToList();
+        var device = Data.CurrentADBDevice;
+        var tempDragPath = Data.RuntimeSettings.ResetTempDragPath();
 
         Data.FileActions.IsSelectionIllegalOnWindows = !FileHelper.FileNameLegal(Data.SelectedFiles, FileHelper.RenameTarget.Windows);
         Data.FileActions.IsSelectionConflictingOnFuse = Data.SelectedFiles.Select(f => f.FullName)
@@ -578,6 +744,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
             .Count() != Data.SelectedFiles.Count();
 
         VirtualFileDataObject vfdo = new(preferredEffect, method);
+        vfdo.SetAdbDrag(fileList, device);
 
         var includeContent =
             !Data.FileActions.IsSelectionIllegalOnWindows
@@ -586,41 +753,88 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
 
         if (includeContent)
         {
+            // Add placeholders before starting preparation so a fast background task cannot be overwritten by empty data.
+            vfdo.SetData(AdbDataFormats.FileDescriptor, []);
+            vfdo.SetData(AdbDataFormats.FileContents, []);
+            vfdo.SetSelfFileGroup(new([]));
+
             Data.RuntimeSettings.MainCursor = Cursors.AppStarting;
             Task.Run(() =>
             {
                 // Prepare file ops recursively for folders
-                return files.Select(f => f.PrepareDescriptors(vfdo)).ToList();
-            }).ContinueWith(t =>
-            {
-                App.Current.Dispatcher.Invoke(() =>
+                var cancellationToken = vfdo.preparationCancellation.Token;
+                var treesBySource = FileHelper.GetFolderTrees(
+                    fileList.Where(file => file.IsDirectory).Select(file => file.FullPath),
+                    device,
+                    cancellationToken);
+                return fileList.Select(file =>
                 {
-                    vfdo.SetFileDescriptors(files.SelectMany(f => f.Descriptors));
-                    Data.RuntimeSettings.MainCursor = Cursors.Arrow;
-                });
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return file.PrepareDescriptors(
+                        vfdo,
+                        tempDragPath,
+                        device,
+                        file.FullName,
+                        children: file.IsDirectory && treesBySource.TryGetValue(file.FullPath, out var tree)
+                            ? tree.Skip(1)
+                            : null);
+                }).ToList();
+            }, vfdo.preparationCancellation.Token).ContinueWith(t =>
+            {
+                if (!t.IsCompletedSuccessfully || vfdo.preparationCancellation.IsCancellationRequested)
+                {
+                    _ = t.Exception;
+                    fileList.ForEach(file => file.ClearDescriptors());
+                    _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow));
+                    return;
+                }
 
                 vfdo.Operations = t.Result;
+                try
+                {
+                    vfdo.SetFileDescriptors(fileList.SelectMany(f => f.Descriptors));
+                }
+                finally
+                {
+                    fileList.ForEach(file => file.ClearDescriptors());
+                }
+                _ = App.Current.Dispatcher.BeginInvoke(
+                    new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow),
+                    DispatcherPriority.Background);
             });
 
-            // We add these empty formats as placeholders, the data will be replaced once it is ready.
-            // This is done even when no folders are selected and we have all files beforehand.
-            // When sending data to the clipboard, if all data is available immediately,
-            // File Explorer will read the file contents to memory as soon as they appear in the clipboard.
-            vfdo.SetData(AdbDataFormats.FileDescriptor, []);
-            vfdo.SetData(AdbDataFormats.FileContents, []);
-            SelfFileGroup = new([]);
         }
         else // When the selection is illegal for Windows
         {
-            // Next we provide the real file descriptors and file contents.
-            // File Explorer isn't supposed to use them, but since it's already implemented,
-            // might as well leave it for any other app to use.
-            files.ForEach(f => f.PrepareDescriptors(vfdo, false));
-            vfdo.SetFileDescriptors(files.SelectMany(f => f.Descriptors), false);
-        }
+            vfdo.SetData(AdbDataFormats.FileDescriptor, []);
+            vfdo.SetSelfFileGroup(new([]));
 
-        // Finally we provide the ADB drag data, which only we recongize
-        vfdo.SetAdbDrag(files, Data.CurrentADBDevice);
+            Task.Run(() =>
+            {
+                var cancellationToken = vfdo.preparationCancellation.Token;
+                foreach (var file in fileList)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    file.PrepareDescriptors(vfdo, tempDragPath, device, file.FullName, false);
+                }
+
+                return fileList.SelectMany(file => file.Descriptors).ToArray();
+            }, vfdo.preparationCancellation.Token).ContinueWith(t =>
+            {
+                try
+                {
+                    if (t.IsCompletedSuccessfully && !vfdo.preparationCancellation.IsCancellationRequested)
+                        vfdo.SetFileDescriptors(t.Result, false);
+                    else
+                        _ = t.Exception;
+                }
+                finally
+                {
+                    fileList.ForEach(file => file.ClearDescriptors());
+                }
+            });
+
+        }
 
         return vfdo;
     }
@@ -646,6 +860,10 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                 CurrentEffect = allowedEffects;
                 PerformedDropEffect = allowedEffects;
                 Clipboard.SetDataObject(this);
+
+                var previousOwner = Interlocked.Exchange(ref clipboardOwner, this);
+                if (previousOwner is not null && !ReferenceEquals(previousOwner, this))
+                    previousOwner.ReleaseDragData();
             }
             else
                 throw new NotSupportedException();
@@ -653,6 +871,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         catch (COMException)
         {
             // Failure; no way to recover
+            ReleaseDragData();
         }
     }
 
@@ -688,6 +907,11 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
 #if !DEPLOY
             DebugLog.PrintLine($"Exception in DoDragDrop: {e.Message}");
 #endif
+        }
+        finally
+        {
+            if (!inOperation)
+                ReleaseDragData();
         }
     }
 
@@ -735,10 +959,6 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
             var dragDropEffects = (DragDropEffects)dwEffect & ~DragDropEffects.Scroll;
             onFeedback?.Invoke(dragDropEffects);
 
-#if !DEPLOY
-            DebugLog.PrintLine($"GiveFeedback dwEffect: {dragDropEffects}");
-#endif
-
             if (dragDropEffects is DragDropEffects.None)
                 return (int)NativeMethods.HResult.DRAGDROP_S_USEDEFAULTCURSORS;
 
@@ -748,16 +968,24 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         }
     }
 
-    public static IStream GetFileContents(System.Windows.IDataObject dataObject, int index)
-        => GetFileContents((System.Runtime.InteropServices.ComTypes.IDataObject)dataObject, index);
-
-    public static IStream GetFileContents(System.Runtime.InteropServices.ComTypes.IDataObject dataObject, int index)
+    public static void SaveFileContents(System.Windows.IDataObject dataObject, int index, string filePath)
     {
         var fmtEtc = CreateFormat(AdbDataFormats.FileContents, index);
 
-        dataObject.GetData(ref fmtEtc, out STGMEDIUM medium);
+        ((System.Runtime.InteropServices.ComTypes.IDataObject)dataObject).GetData(ref fmtEtc, out STGMEDIUM medium);
 
-        var stream = (IStream)Marshal.GetObjectForIUnknown(medium.unionmember);
-        return stream;
+        IStream stream = null;
+        try
+        {
+            stream = (IStream)Marshal.GetObjectForIUnknown(medium.unionmember);
+            NativeMethods.SaveComStreamToFile(stream, filePath);
+        }
+        finally
+        {
+            if (stream is not null && Marshal.IsComObject(stream))
+                Marshal.ReleaseComObject(stream);
+
+            Vanara.PInvoke.Ole32.ReleaseStgMedium(in medium);
+        }
     }
 }

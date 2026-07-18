@@ -2,6 +2,7 @@
 using ADB_Explorer.Models;
 using ADB_Explorer.Resources;
 using ADB_Explorer.Services;
+using AdvancedSharpAdbClient.Models;
 
 namespace ADB_Explorer.ViewModels;
 
@@ -41,7 +42,7 @@ public class Devices : AbstractDevice
     public LogicalDeviceViewModel Current => LogicalDeviceViewModels?.FirstOrDefault(device => device.IsOpen)
         ?? Data.RuntimeSettings.DeviceToOpen;
 
-    public int Count => UIList.Count(d => DeviceHelper.DevicePredicate(d) && d is not HistoryDeviceViewModel and not NewDeviceViewModel);
+    public int Count => DeviceHelper.CountVisibleDevices(UIList);
 
     public ObservableProperty<string> ObservableCount = new();
 
@@ -110,6 +111,7 @@ public class Devices : AbstractDevice
     public void RemoveHistoryDevice(HistoryDeviceViewModel device)
     {
         UIList.Remove(device);
+        device.DetachBaseRuntimeSettings();
         StoreHistoryDevices();
     }
 
@@ -121,12 +123,22 @@ public class Devices : AbstractDevice
 
     public static void UpdateServices(ObservableList<DeviceViewModel> self, IEnumerable<ServiceDeviceViewModel> other)
     {
-        self.RemoveAll(thisDevice => thisDevice is ServiceDeviceViewModel && !other.Any(otherDevice => otherDevice.ID == thisDevice.ID));
+        var incomingDevices = other.ToList();
+        var incomingIds = incomingDevices.Select(device => device.ID).ToHashSet(StringComparer.Ordinal);
+        var devicesToRemove = self.OfType<ServiceDeviceViewModel>()
+            .Where(device => !incomingIds.Contains(device.ID))
+            .ToList();
+        self.RemoveAll(devicesToRemove);
+        devicesToRemove.ForEach(device => device.DetachBaseRuntimeSettings());
+
+        Dictionary<string, ServiceDeviceViewModel> existingById = new(StringComparer.Ordinal);
+        foreach (var device in self.OfType<ServiceDeviceViewModel>())
+            existingById.TryAdd(device.ID, device);
 
         List<ServiceDeviceViewModel> devicesToAdd = [];
-        foreach (var item in other)
+        foreach (var item in incomingDevices)
         {
-            if (self?.Find(thisDevice => thisDevice.ID == item.ID) is ServiceDeviceViewModel service)
+            if (existingById.TryGetValue(item.ID, out var service))
             {
                 service.UpdateService(item);
             }
@@ -136,24 +148,53 @@ public class Devices : AbstractDevice
             }
         }
 
+        devicesToAdd.ForEach(device => device.AttachBaseRuntimeSettings());
         self.AddRange(devicesToAdd);
     }
 
-    public bool ServicesChanged(IEnumerable<ServiceDeviceViewModel> other)
+    public bool ServicesChanged(IEnumerable<ServiceDevice> other)
     {
         // if the list is null, we're probably not ready to update
         if (other is null)
             return false;
 
+        var incomingServices = other.ToList();
+
         // if the list is empty, we need to update (and remove all items)
-        if (!other.Any())
+        if (incomingServices.Count == 0)
             return ServiceDeviceViewModels.Any();
 
-        var pairing = other.OfType<PairingServiceViewModel>();
+        var pairing = incomingServices.OfType<PairingService>().OrderBy(service => service.ID).ToList();
+        var logicalDevices = LogicalDeviceViewModels.ToList();
+        var onlineBaseIds = logicalDevices
+            .Where(device => device.Status == DeviceStatus.Ok)
+            .Select(device => device.BaseID)
+            .ToHashSet(StringComparer.Ordinal);
+        var logicalIpAddresses = logicalDevices
+            .Select(device => device.IpAddress)
+            .ToHashSet(StringComparer.Ordinal);
         // if there's any service whose ID is not found in any logical device,
         // AND an ordering of both new and old lists doesn't match up all IDs
-        return pairing.Any(service => !LogicalDeviceViewModels.Any(device => device.Status == DeviceStatus.Ok && device.BaseID == service.ID || device.IpAddress == service.IpAddress))
-               && !ServiceDeviceViewModels.OrderBy(thisDevice => thisDevice.ID).SequenceEqual(pairing.OrderBy(otherDevice => otherDevice.ID), new ServiceDeviceViewModelEqualityComparer());
+        if (!pairing.Any(service => !onlineBaseIds.Contains(service.ID)
+                && !logicalIpAddresses.Contains(service.IpAddress)))
+        {
+            return false;
+        }
+
+        var currentServices = ServiceDeviceViewModels.OrderBy(service => service.ID).ToList();
+        if (currentServices.Count != pairing.Count)
+            return true;
+
+        for (int i = 0; i < currentServices.Count; i++)
+        {
+            if (currentServices[i].ID != pairing[i].ID
+                || string.IsNullOrEmpty(currentServices[i].PairingPort) != string.IsNullOrEmpty(pairing[i].PairingPort))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     #endregion
@@ -174,30 +215,37 @@ public class Devices : AbstractDevice
     private static bool UpdateDevices(ObservableList<DeviceViewModel> self, IEnumerable<LogicalDeviceViewModel> other)
     {
         bool isCurrentTypeUpdated = false;
+        var incomingDevices = other.ToList();
+        var incomingIds = incomingDevices.Select(device => device.ID).ToHashSet(StringComparer.Ordinal);
 
         // First remove all devices that no longer exist
-        var devicesToRemove = self.Where(thisDevice => thisDevice is LogicalDeviceViewModel && !other.Any(otherDevice => otherDevice.ID == thisDevice.ID));
+        var devicesToRemove = self.OfType<LogicalDeviceViewModel>()
+            .Where(device => !incomingIds.Contains(device.ID))
+            .ToList();
         foreach (var item in devicesToRemove)
         {
             // Set status as offline for file op mechanism
             item.SetStatus(DeviceStatus.Offline);
         }
         self.RemoveAll(devicesToRemove);
+        devicesToRemove.ForEach(item => item.DetachRuntimeSettings());
 
         // Then update existing devices' statuses and names
+        Dictionary<string, LogicalDeviceViewModel> existingById = new(StringComparer.Ordinal);
+        foreach (var device in self.OfType<LogicalDeviceViewModel>())
+            existingById.TryAdd(device.ID, device);
+
         List<LogicalDeviceViewModel> devicesToAdd = [];
-        foreach (var item in other)
+        foreach (var item in incomingDevices)
         {
-            if (self?.Find(thisDevice => thisDevice.ID == item.ID) is LogicalDeviceViewModel device)
+            if (existingById.TryGetValue(item.ID, out var device))
             {
                 // Return (at the end of the function) true if current device status has changed
                 if (device is not null && device.IsOpen && device.Status != item.Status)
                     isCurrentTypeUpdated = true;
 
                 device.UpdateDevice(item);
-
-                if (device.Drives.Count != item.Drives.Count)
-                    device.UpdateDrives(item, App.Current.Dispatcher, true);
+                device.InitializeDrives();
             }
             else
             {
@@ -207,6 +255,8 @@ public class Devices : AbstractDevice
 
         if (devicesToAdd.Count > 0)
         {
+            devicesToAdd.ForEach(item => item.InitializeDrives());
+            devicesToAdd.ForEach(item => item.AttachRuntimeSettings());
             self.AddRange(devicesToAdd);
 
             foreach (var item in devicesToAdd.Where(item => item.Status is DeviceStatus.Ok))
@@ -218,11 +268,46 @@ public class Devices : AbstractDevice
         return isCurrentTypeUpdated;
     }
 
-    public bool DevicesChanged(IEnumerable<LogicalDeviceViewModel> other)
+    public bool DevicesChanged(IEnumerable<LogicalDevice> other)
     {
-        return other is not null
-            && !LogicalDeviceViewModels.OrderBy(thisDevice => thisDevice.ID).SequenceEqual(
-                other.OrderBy(otherDevice => otherDevice.ID), new LogicalDeviceViewModelEqualityComparer());
+        if (other is null)
+            return false;
+
+        var currentDevices = LogicalDeviceViewModels.OrderBy(device => device.ID).ToList();
+        var incomingDevices = other.OrderBy(device => device.ID).ToList();
+        if (currentDevices.Count != incomingDevices.Count)
+            return true;
+
+        for (int i = 0; i < currentDevices.Count; i++)
+        {
+            if (currentDevices[i].ID != incomingDevices[i].ID
+                || currentDevices[i].Status != incomingDevices[i].Status
+                || !DeviceDataEquals(currentDevices[i].DeviceData, incomingDevices[i].DeviceData))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool DeviceDataEquals(DeviceData current, DeviceData incoming)
+    {
+        if (ReferenceEquals(current, incoming))
+            return true;
+
+        if (current is null || incoming is null)
+            return false;
+
+        return current.Serial == incoming.Serial
+            && current.State == incoming.State
+            && current.Model == incoming.Model
+            && current.Product == incoming.Product
+            && current.Name == incoming.Name
+            && (current.Features ?? []).SequenceEqual(incoming.Features ?? [], StringComparer.Ordinal)
+            && current.Usb == incoming.Usb
+            && current.TransportId == incoming.TransportId
+            && current.Message == incoming.Message;
     }
 
     #endregion
@@ -251,18 +336,22 @@ public class Devices : AbstractDevice
     public static bool UpdateHistoryNames(ObservableList<DeviceViewModel> devices)
     {
         var result = false;
+        var logicalByIp = devices.OfType<LogicalDeviceViewModel>()
+            .Where(device => device.Type is DeviceType.Remote or DeviceType.Service)
+            .ToLookup(device => device.IpAddress, StringComparer.Ordinal);
+
         foreach (var item in devices.OfType<HistoryDeviceViewModel>().Where(d => string.IsNullOrEmpty(d.DeviceName)))
         {
-            var logical = devices.OfType<LogicalDeviceViewModel>().Where(l => l.Type is DeviceType.Remote or DeviceType.Service
-                                                                       && l.IpAddress == item.IpAddress);
-            if (logical.Any())
+            var logical = logicalByIp[item.IpAddress].FirstOrDefault();
+            if (logical is not null)
             {
-                item.SetDeviceName(logical.First().Name);
-                StoreHistoryDevices(devices.OfType<HistoryDeviceViewModel>());
-
+                item.SetDeviceName(logical.Name);
                 result = true;
             }
         }
+
+        if (result)
+            StoreHistoryDevices(devices.OfType<HistoryDeviceViewModel>());
 
         return result;
     }
@@ -287,14 +376,20 @@ public class Devices : AbstractDevice
     {
         var result = false;
         var items = devices.OfType<LogicalDeviceViewModel>().Where(d => d.Type is DeviceType.Service or DeviceType.Local && !d.IsIpAddressValid).ToList();
+        var servicesById = devices.OfType<ServiceDeviceViewModel>()
+            .Where(service => service.IsIpAddressValid && !string.IsNullOrEmpty(service.ID))
+            .GroupBy(service => service.ID, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+
         foreach (var item in items)
         {
             if (item.Type is DeviceType.Service)
             {
-                var service = devices.Where(d => d is ServiceDeviceViewModel srv && (srv.ID == item.ID || srv.ID == item.BaseID) && srv.IsIpAddressValid);
-                if (service.Any())
+                if (servicesById.TryGetValue(item.ID, out var service)
+                    || !string.IsNullOrEmpty(item.BaseID) && servicesById.TryGetValue(item.BaseID, out service))
                 {
-                    item.SetIpAddress(service.First().IpAddress);
+                    item.SetIpAddress(service.IpAddress);
+                    result = true;
                     continue;
                 }
             }
@@ -313,9 +408,6 @@ public class Devices : AbstractDevice
                 device => (!current || device.IsOpen)
                 && device.Status is DeviceStatus.Ok);
     }
-
-    public bool SetOpenDevice(string selectedId)
-        => SetOpenDevice(AvailableDevices().FirstOrDefault(device => device.ID == selectedId));
 
     public bool SetOpenDevice(LogicalDeviceViewModel device)
     {

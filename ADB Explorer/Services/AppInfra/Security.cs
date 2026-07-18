@@ -8,6 +8,9 @@ namespace ADB_Explorer.Services;
 
 public static class Security
 {
+    private const int MAX_HASH_PARALLELISM = 2;
+    private static readonly SemaphoreSlim ValidationGate = new(1, 1);
+
     /// <summary>
     /// Verifies that the specified file has a valid Authenticode signature issued to Google LLC.
     /// </summary>
@@ -38,8 +41,14 @@ public static class Security
     {
         try
         {
-            using StreamReader reader = new(path);
-            return CalculateWindowsFileHash(reader.BaseStream, useSHA);
+            using FileStream stream = new(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                128 * 1024,
+                FileOptions.SequentialScan);
+            return CalculateWindowsFileHash(stream, useSHA);
         }
         catch (Exception)
         {
@@ -81,16 +90,27 @@ public static class Security
             return new() { { Path.GetFileName(path), CalculateWindowsFileHash(path) } };
         }
 
-        if (parent == "")
-            parent = path;
+        var root = string.IsNullOrEmpty(parent) ? path : parent;
+        Dictionary<string, string> hashes = new(StringComparer.Ordinal);
+        object hashesLock = new();
+        System.IO.EnumerationOptions enumerationOptions = new()
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        };
+        Parallel.ForEach(
+            Directory.EnumerateFiles(path, "*", enumerationOptions),
+            new ParallelOptions { MaxDegreeOfParallelism = MAX_HASH_PARALLELISM },
+            file =>
+            {
+                string key = FileHelper.ExtractRelativePath(file, root).Replace('\\', '/');
+                string hash = CalculateWindowsFileHash(file);
+                lock (hashesLock)
+                    hashes.TryAdd(key, hash);
+            });
 
-        var folders = Directory.GetDirectories(path);
-        var folderHashes = folders.AsParallel().SelectMany(f => CalculateWindowsFolderHash(f, parent)).AsEnumerable();
-
-        var files = Directory.GetFiles(path);
-        var fileHashes = files.AsParallel().ToDictionary(f => FileHelper.ExtractRelativePath(f, parent).Replace('\\', '/'), f => CalculateWindowsFileHash(f));
-        
-        return new(folderHashes.Concat(fileHashes));
+        return new(hashes);
     }
 
     public static Dictionary<string, string> CalculateAndroidFolderHash(FilePath path, Device device)
@@ -127,71 +147,83 @@ public static class Security
 
     public static async void ValidateOperation(FileOperation op)
     {
-        IOrderedEnumerable<KeyValuePair<string, string>> source = null, target = null;
         op.SetValidation(true);
+        bool gateAcquired = false;
 
-        await Task.Run(() =>
+        try
         {
-            Parallel.Invoke(
-            () =>
+            await ValidationGate.WaitAsync();
+            gateAcquired = true;
+
+            var result = await Task.Run(() =>
             {
-                source = (op.FilePath.PathType is AbstractFile.FilePathType.Android
-                    ? CalculateAndroidFolderHash(op.FilePath, op.Device)
-                    : CalculateWindowsFolderHash(op.FilePath.FullPath)).OrderBy(k => k.Key);
-            },
-            () =>
-            {
-                target = (op.TargetPath.PathType is AbstractFile.FilePathType.Android
-                    ? CalculateAndroidFolderHash(op.TargetPath, op.Device)
-                    : CalculateWindowsFolderHash(op.TargetPath.FullPath)).OrderBy(k => k.Key);
+                Dictionary<string, string> source = null;
+                Dictionary<string, string> target = null;
+                Parallel.Invoke(
+                    new ParallelOptions { MaxDegreeOfParallelism = 2 },
+                    () => source = op.FilePath.PathType is AbstractFile.FilePathType.Android
+                        ? CalculateAndroidFolderHash(op.FilePath, op.Device)
+                        : CalculateWindowsFolderHash(op.FilePath.FullPath),
+                    () => target = op.TargetPath.PathType is AbstractFile.FilePathType.Android
+                        ? CalculateAndroidFolderHash(op.TargetPath, op.Device)
+                        : CalculateWindowsFolderHash(op.TargetPath.FullPath));
+
+                List<FileOpProgressInfo> updates = new(source.Count);
+                int fails = 0;
+                string singleTargetHash = op.OperationName is FileOperation.OperationType.Copy && target.Count == 1
+                    ? target.Values.First()
+                    : null;
+
+                foreach (var item in source.OrderBy(item => item.Key))
+                {
+                    string key = op.AndroidPath.IsDirectory
+                        ? FileHelper.ConcatPaths(op.AndroidPath, item.Key)
+                        : op.AndroidPath.FullPath;
+                    string targetHash = singleTargetHash;
+                    bool targetExists = targetHash is not null || target.TryGetValue(item.Key, out targetHash);
+
+                    FileOpProgressInfo update = !targetExists
+                        ? new HashFailInfo(key, false)
+                        : string.Equals(item.Value, targetHash, StringComparison.Ordinal)
+                            ? new HashSuccessInfo(key)
+                            : new HashFailInfo(key);
+                    updates.Add(update);
+                    if (update is HashFailInfo)
+                        fails++;
+                }
+
+                return (Updates: updates, Fails: fails, SourceCount: source.Count);
             });
-        });
 
-        op.ClearChildren();
-        var fails = 0;
-        FileOpProgressInfo update = null;
+            op.ClearChildren();
+            op.AddUpdates(result.Updates);
 
-        foreach (var item in source)
-        {
-            var key = item.Key;
-            var other = target.Where(f => f.Key == item.Key ||
-                                    (op.OperationName is FileOperation.OperationType.Copy
-                                    && target.Count() == 1));
+            FileOpProgressInfo lastUpdate = result.Updates.LastOrDefault();
+            string message = result.SourceCount == 1
+                ? lastUpdate is HashFailInfo fail
+                    ? string.Format(Strings.Resources.S_VALIDATION_ERROR, fail.Message)
+                    : Strings.Resources.S_FILEOP_VALIDATED
+                : FileOpStatusConverter.StatusString(
+                    typeof(HashFailInfo),
+                    result.SourceCount - result.Fails,
+                    result.Fails,
+                    total: true);
 
-            key = op.AndroidPath.IsDirectory 
-                ? FileHelper.ConcatPaths(op.AndroidPath, key)
-                : op.AndroidPath.FullPath;
-
-            if (!other.Any())
-                update = new HashFailInfo(key, false);
-            else if (item.Value.Equals(other.First().Value))
-                update = new HashSuccessInfo(key);
-            else
-                update = new HashFailInfo(key);
-
-            op.AddUpdates(update);
-
-            if (update is HashFailInfo)
-                fails++;
+            op.StatusInfo = result.Fails > 0
+                ? new FailedOpProgressViewModel(message)
+                : new CompletedShellProgressViewModel(message);
+            op.IsValidated = result.Fails < 1;
         }
-
-        var message = "";
-        if (source.Count() == 1)
+        catch (Exception e)
         {
-            message = update is HashFailInfo fail
-                ? string.Format(Strings.Resources.S_VALIDATION_ERROR, fail.Message)
-                : Strings.Resources.S_FILEOP_VALIDATED;
+            op.StatusInfo = new FailedOpProgressViewModel(e.Message);
+            op.IsValidated = false;
         }
-        else
+        finally
         {
-            message = FileOpStatusConverter.StatusString(typeof(HashFailInfo), source.Count() - fails, fails, total: true);
+            if (gateAcquired)
+                ValidationGate.Release();
+            op.SetValidation(false);
         }
-
-        op.StatusInfo = fails > 0
-            ? new FailedOpProgressViewModel(message)
-            : new CompletedShellProgressViewModel(message);
-
-        op.IsValidated = fails < 1;
-        op.SetValidation(false);
     }
 }

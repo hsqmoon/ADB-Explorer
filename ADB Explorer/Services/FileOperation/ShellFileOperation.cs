@@ -22,10 +22,7 @@ public abstract class AbstractShellFileOperation : FileOperation
     }
 
     public override void ClearChildren()
-    {
-        AndroidPath.Children.Clear();
-        AndroidPath.ProgressUpdates.Clear();
-    }
+        => AndroidPath.ClearAll();
 
     public override void AddUpdates(IEnumerable<FileOpProgressInfo> newUpdates)
         => AndroidPath.AddUpdates(newUpdates);
@@ -146,7 +143,7 @@ public static class ShellFileOperation
         return exitCode == 0;
     }
 
-    public static void MoveItems(ADBService.AdbDevice device,
+    public static Task MoveItems(ADBService.AdbDevice device,
                                  IEnumerable<FileClass> items,
                                  string targetPath,
                                  string currentPath,
@@ -161,7 +158,7 @@ public static class ShellFileOperation
                      dispatcher,
                      cutType);
 
-    public static void MoveItems(ADBService.AdbDevice device,
+    public static async Task MoveItems(ADBService.AdbDevice device,
                                  IEnumerable<FileClass> items,
                                  string targetPath,
                                  string currentPath,
@@ -170,9 +167,37 @@ public static class ShellFileOperation
                                  DragDropEffects cutType = DragDropEffects.None,
                                  int masterPid = 0)
     {
+        var itemList = items.ToList();
+        if (itemList.Count == 0)
+            return;
+
+        var isRestore = itemList[0].ParentPath == AdbExplorerConst.RECYCLE_PATH
+            || currentPath == AdbExplorerConst.RECYCLE_PATH;
+        Dictionary<string, TrashIndexer> recycleIndex = null;
+        if (isRestore && itemList.Any(item => item.TrashIndex is null))
+        {
+            IEnumerable<TrashIndexer> indexers = Data.RecycleIndex;
+            if (Data.RecycleIndex.Count == 0)
+            {
+                try
+                {
+                    indexers = await TrashHelper.GetIndexersAsync(device);
+                }
+                catch (Exception e)
+                {
+                    Data.AddCommandLog($"@ADB Explorer: failed to read recycle index: {e.Message}");
+                    return;
+                }
+            }
+
+            recycleIndex = [];
+            foreach (var indexer in indexers)
+                recycleIndex.TryAdd(indexer.RecycleName, indexer);
+        }
+
         IEnumerable<FileMoveOperation> Recycle()
         {
-            foreach (var item in items)
+            foreach (var item in itemList)
             {
                 SyncFile target = new(FileHelper.ConcatPaths(targetPath, item.FullName), item.Type);
                 yield return new(item, target, device, dispatcher);
@@ -181,20 +206,18 @@ public static class ShellFileOperation
 
         IEnumerable<FileMoveOperation> Restore()
         {
-            if (Data.RecycleIndex.Count == 0)
-                TrashHelper.ParseIndexers();
-
-            foreach (var item in items)
+            foreach (var item in itemList)
             {
                 if (item.Extension == AdbExplorerConst.RECYCLE_INDEX_SUFFIX)
                     continue;
 
-                var recycleName = item.TrashIndex is null
+                var indexer = item.TrashIndex;
+                var recycleName = indexer is null
                     ? item.FullName
-                    : FileHelper.GetFullName(item.TrashIndex.RecycleName);
+                    : FileHelper.GetFullName(indexer.RecycleName);
 
-                var indexer = Data.RecycleIndex.FirstOrDefault(f => f.RecycleName == recycleName);
-                if (indexer is null)
+                if (indexer is null
+                    && (recycleIndex is null || !recycleIndex.TryGetValue(recycleName, out indexer)))
                     continue;
 
                 item.UpdatePath(FileHelper.ConcatPaths(AdbExplorerConst.RECYCLE_PATH, recycleName));
@@ -210,7 +233,7 @@ public static class ShellFileOperation
 
         IEnumerable<FileMoveOperation> Move()
         {
-            foreach (var item in items)
+            foreach (var item in itemList)
             {
                 var targetName = item.FullName;
                 if (currentPath == targetPath)
@@ -222,9 +245,8 @@ public static class ShellFileOperation
         }
 
         List<FileMoveOperation> fileops = [];
-        items = [.. items];
 
-        if (items.First().ParentPath == AdbExplorerConst.RECYCLE_PATH || currentPath == AdbExplorerConst.RECYCLE_PATH)
+        if (isRestore)
             fileops = [.. Restore()];
         else if (targetPath == AdbExplorerConst.RECYCLE_PATH)
             fileops = [.. Recycle()];
@@ -319,7 +341,7 @@ public static class ShellFileOperation
         }
     }
 
-    public static async void MakeDir(ADBService.AdbDevice device, string fullPath)
+    public static async Task MakeDir(ADBService.AdbDevice device, string fullPath)
     {
         var result = await ADBService.ExecuteVoidShellCommand(device.ID,
                                                               CancellationToken.None,
@@ -332,16 +354,40 @@ public static class ShellFileOperation
         }
     }
 
-    public static async void MakeDirs(ADBService.AdbDevice device, IEnumerable<string> paths)
+    public static async Task MakeDirs(ADBService.AdbDevice device, IEnumerable<string> paths, CancellationToken cancellationToken)
     {
-        var result = await ADBService.ExecuteVoidShellCommand(device.ID,
-                                                              CancellationToken.None,
-                                                              "mkdir",
-                                                              ["-p", .. paths.Select(path => ADBService.EscapeAdbShellString(path))]);
-        if (!string.IsNullOrEmpty(result))
+        const int MAX_ARGUMENT_LENGTH = 24_000;
+        List<string> arguments = ["-p"];
+        var argumentLength = 3;
+
+        async Task ExecuteBatch()
         {
-            throw new Exception(result);
+            if (arguments.Count == 1)
+                return;
+
+            var result = await ADBService.ExecuteVoidShellCommand(
+                device.ID, cancellationToken, "mkdir", arguments.ToArray());
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!string.IsNullOrEmpty(result))
+                throw new Exception(result);
         }
+
+        foreach (var path in paths)
+        {
+            var argument = ADBService.EscapeAdbShellString(path);
+            if (arguments.Count > 1 && argumentLength + argument.Length + 1 > MAX_ARGUMENT_LENGTH)
+            {
+                await ExecuteBatch();
+                arguments = ["-p"];
+                argumentLength = 3;
+            }
+
+            arguments.Add(argument);
+            argumentLength += argument.Length + 1;
+        }
+
+        await ExecuteBatch();
     }
 
     public static async void MakeFile(ADBService.AdbDevice device, string fullPath)
@@ -415,18 +461,28 @@ public static class ShellFileOperation
         Data.FileOpQ.AddOperations(operations);
     }
 
-    public static void PushPackages(ADBService.AdbDevice device, IEnumerable<ShellItem> items, Dispatcher dispatcher)
+    public static void PushPackages(ADBService.AdbDevice device, IEnumerable<string> paths, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
-        foreach (var item in items.Select(file => new FilePath(file)))
+        foreach (var path in paths)
         {
-            var op = new PackageInstallOperation(dispatcher, device, new(item), pushPackage: true);
+            FileClass item = new(new FileDescriptor
+            {
+                Name = FileHelper.GetFullName(path),
+                SourcePath = path,
+            });
+            var op = new PackageInstallOperation(dispatcher, device, item, pushPackage: true);
             op.PropertyChanged += InstallOp_PropertyChanged;
             operations.Add(op);
         }
 
-        Data.FileOpQ.AddOperations(operations);
+        void addOperations() => Data.FileOpQ.AddOperations(operations);
+
+        if (dispatcher.CheckAccess())
+            addOperations();
+        else
+            _ = dispatcher.BeginInvoke(new Action(addOperations));
     }
 
     public static void UninstallPackages(ADBService.AdbDevice device, IEnumerable<string> packages, Dispatcher dispatcher)
@@ -447,21 +503,27 @@ public static class ShellFileOperation
     {
         var op = sender as PackageInstallOperation;
 
-        // when operation completes, remove this event handler anyway
-        if (e.PropertyName is not nameof(FileOperation.Status) || op.Status is not FileOperation.OperationStatus.Completed)
+        if (e.PropertyName is not nameof(FileOperation.Status)
+            || op.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress)
             return;
 
-        if (op.Device.ID == Data.CurrentADBDevice.ID
-            && Data.FileActions.IsAppDrive)
+        try
         {
-            // update UI when on current device and current path
-            if (op.IsUninstall)
-                Data.Packages.RemoveAll(pkg => pkg.Name == op.PackageName);
-            else if (op.PushPackage)
-                Data.FileActions.RefreshPackages = true;
+            if (op.Status is FileOperation.OperationStatus.Completed
+                && op.Device.ID == Data.CurrentADBDevice?.ID
+                && Data.FileActions.IsAppDrive)
+            {
+                // update UI when on current device and current path
+                if (op.IsUninstall)
+                    Data.Packages.RemoveAll(pkg => pkg.Name == op.PackageName);
+                else if (op.PushPackage)
+                    Data.FileActions.RefreshPackages = true;
+            }
         }
-
-        op.PropertyChanged -= InstallOp_PropertyChanged;
+        finally
+        {
+            op.PropertyChanged -= InstallOp_PropertyChanged;
+        }
     }
 
     public static ulong? GetPackagesCount(ADBService.AdbDevice device)

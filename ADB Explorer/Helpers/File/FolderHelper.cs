@@ -63,46 +63,6 @@ public static class FolderHelper
         }
     }
 
-    public static IEnumerable<ShellItem> GetEmptySubfoldersRecursively(ShellFolder rootFolder)
-    {
-        var emptyFolders = new List<ShellItem>();
-        FindEmptySubfolders(rootFolder, emptyFolders);
-        return emptyFolders.Where(f => f.ParsingName != rootFolder.ParsingName);
-    }
-
-    private static bool FindEmptySubfolders(ShellFolder folder, List<ShellItem> result)
-    {
-        if (!folder.IsFolder) return false;
-
-        bool hasNonFolder = false;
-        bool hasNonEmptyFolder = false;
-
-        foreach (var child in folder)
-        {
-            if (!child.IsFolder)
-            {
-                hasNonFolder = true;
-                continue;
-            }
-
-            // Recurse into subfolder
-            if (!FindEmptySubfolders((ShellFolder)child, result))
-            {
-                hasNonEmptyFolder = true;
-            }
-        }
-
-        bool isEmpty = !hasNonFolder && !hasNonEmptyFolder && !folder.Any();
-
-        if (isEmpty)
-        {
-            result.Add(folder);
-            return true;
-        }
-
-        return false;
-    }
-
     public static bool IsNonArchiveFolder(this ShellItem self)
     {
         // A regular file has IsFolder = false, so we get a short-circuit here.
@@ -120,9 +80,5 @@ public static class FolderHelper
     /// <returns>An enumerable collection of <see cref="SyncFile"/> objects representing directories that are not ancestors of
     /// any other directory in the collection.</returns>
     public static IEnumerable<SyncFile> GetBottomMostFolders(IEnumerable<SyncFile> files)
-    {
-        var dirs = files.Where(f => f.IsDirectory);
-
-        return dirs.Where(dir => !dirs.Any(f => dir.RelationFrom(f) is AbstractFile.RelationType.Descendant));
-    }
+        => files.Where(file => file.IsDirectory && !file.Children.Any(child => child.IsDirectory));
 }

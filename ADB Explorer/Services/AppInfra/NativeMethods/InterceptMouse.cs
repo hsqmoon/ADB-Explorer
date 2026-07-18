@@ -18,7 +18,6 @@ public static partial class NativeMethods
 
         private static readonly LowLevelMouseProc _mouseProc = HookCallback;
         private static HANDLE _mouseHookID = IntPtr.Zero;
-        private static Action<POINT> _mouseMoveAction;
         private static Action _rButtonAction;
         public static POINT MousePosition { get; private set; }
         
@@ -26,9 +25,8 @@ public static partial class NativeMethods
 
         private delegate HANDLE LowLevelMouseProc(int nCode, MouseMessages wParam, HANDLE lParam);
 
-        public static void Init(Action<POINT> mouseMoveAction, Action rButtonAction)
+        public static void Init(Action rButtonAction)
         {
-            _mouseMoveAction = mouseMoveAction;
             _rButtonAction = rButtonAction;
 
             _mouseHookID = SetHook(_mouseProc);
@@ -64,11 +62,7 @@ public static partial class NativeMethods
             }
             else
             {
-                POINT newPoint = new(hookStruct.pt.X, hookStruct.pt.Y);
-                if (newPoint != MousePosition)
-                    _mouseMoveAction?.Invoke(MousePosition);
-
-                MousePosition = newPoint;
+                MousePosition = new(hookStruct.pt.X, hookStruct.pt.Y);
             }
             
             return CallNextHookEx(_mouseHookID, nCode, wParam, lParam);

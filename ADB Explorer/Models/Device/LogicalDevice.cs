@@ -50,15 +50,26 @@ public class LogicalDevice : Device
         ID = id;
 
         Battery = new Battery();
-
-        InitDeviceDrives();
     }
 
     public static LogicalDevice New(Match match)
+        => New(match, new(match.Value));
+
+    public static LogicalDevice New(DeviceData device)
+        => New(device.Serial, device.State.ToString(), device.Model, device.Name, device);
+
+    private static LogicalDevice New(Match match, DeviceData deviceData)
+        => New(
+            match.Groups["id"].Value,
+            match.Groups["status"].Value,
+            match.Groups["model"].Value,
+            match.Groups["device"].Value,
+            deviceData);
+
+    private static LogicalDevice New(string id, string status, string model, string deviceName, DeviceData deviceData)
     {
-        var name = DeviceHelper.ParseDeviceName(match.Groups["model"].Value, match.Groups["device"].Value);
-        var id = match.Groups["id"].Value;
-        var status = match.Groups["status"].Value;
+        status = status.ToLowerInvariant();
+        var name = DeviceHelper.ParseDeviceName(model ?? "", deviceName ?? "");
 
         var deviceType = DeviceHelper.GetType(id, status);
         var deviceStatus = DeviceHelper.GetStatus(status);
@@ -76,7 +87,7 @@ public class LogicalDevice : Device
             Status = deviceStatus,
             Root = rootStatus,
             IpAddress = ip,
-            DeviceData = new(match.Value)
+            DeviceData = deviceData
         };
     }
 
@@ -112,8 +123,11 @@ public class LogicalDevice : Device
 
     #region Drive handling
 
-    private void InitDeviceDrives()
+    internal void InitializeDrives()
     {
+        if (Drives.Count > 0)
+            return;
+
         Drives.Add(new LogicalDriveViewModel(new(path: AdbExplorerConst.DRIVE_TYPES.First(d => d.Value is AbstractDrive.DriveType.Root).Key)));
         Drives.Add(new LogicalDriveViewModel(new(path: AdbExplorerConst.DRIVE_TYPES.First(d => d.Value is AbstractDrive.DriveType.Internal).Key)));
 
@@ -229,9 +243,13 @@ public class LogicalDevice : Device
         }
 
         // Remove all drives that were not discovered in the last update
-        var removed = Drives.RemoveAll(self => self is LogicalDriveViewModel
-                                               && !drives.Any(other => other.Path == self.Path
-                                                    || (other.Type is AbstractDrive.DriveType.Internal && self.Type is AbstractDrive.DriveType.Internal)));
+        var removedDrives = Drives.OfType<LogicalDriveViewModel>()
+            .Where(self => !drives.Any(other => other.Path == self.Path
+                || other.Type is AbstractDrive.DriveType.Internal && self.Type is AbstractDrive.DriveType.Internal))
+            .ToList();
+        var removed = removedDrives.Count > 0;
+        Drives.RemoveAll(removedDrives);
+        removedDrives.ForEach(drive => drive.DetachRuntimeSettings());
 
         return added || removed;
     }

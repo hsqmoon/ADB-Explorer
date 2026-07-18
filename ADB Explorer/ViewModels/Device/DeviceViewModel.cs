@@ -5,6 +5,8 @@ namespace ADB_Explorer.ViewModels;
 
 public abstract class DeviceViewModel : AbstractDevice
 {
+    private bool runtimeSettingsSubscribed;
+
     #region Full properties
 
     private Device device;
@@ -75,14 +77,33 @@ public abstract class DeviceViewModel : AbstractDevice
 
     public virtual string Tooltip { get; }
 
-    private DeviceViewModel()
+    private DeviceViewModel(bool subscribeRuntimeSettings)
     {
-        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        if (subscribeRuntimeSettings)
+            AttachBaseRuntimeSettings();
     }
 
-    protected DeviceViewModel(Device device) : this()
+    protected DeviceViewModel(Device device, bool subscribeRuntimeSettings = true) : this(subscribeRuntimeSettings)
     {
         Device = device;
+    }
+
+    internal void AttachBaseRuntimeSettings()
+    {
+        if (runtimeSettingsSubscribed)
+            return;
+
+        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        runtimeSettingsSubscribed = true;
+    }
+
+    internal void DetachBaseRuntimeSettings()
+    {
+        if (!runtimeSettingsSubscribed)
+            return;
+
+        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+        runtimeSettingsSubscribed = false;
     }
 
     private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -124,7 +145,7 @@ public abstract class DeviceViewModel : AbstractDevice
 
             if (this is LogicalDeviceViewModel)
             {
-                ShellCommands.DeviceCommands.Remove(ID);
+                ShellCommands.RemoveDevice(ID);
                 if (status is DeviceStatus.Ok)
                     Task.Run(() => ShellCommands.FindCommands(ID));
             }
@@ -180,7 +201,8 @@ public abstract class PairingDeviceViewModel : DeviceViewModel
 
     #endregion
 
-    protected PairingDeviceViewModel(PairingDevice device) : base(device)
+    protected PairingDeviceViewModel(PairingDevice device, bool subscribeRuntimeSettings = true)
+        : base(device, subscribeRuntimeSettings)
     {
         Device = device;
     }

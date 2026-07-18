@@ -174,7 +174,7 @@ public partial class ADBService
             }
         }
 
-        public void ListDirectory(string path, ref ConcurrentQueue<FileStat> output, Dispatcher dispatcher, CancellationToken cancellationToken)
+        public void ListDirectory(string path, ConcurrentQueue<FileClass> output, Dispatcher dispatcher, CancellationToken cancellationToken)
         {
             IEnumerable<string> stdout;
 
@@ -189,8 +189,12 @@ public partial class ADBService
                     if (item is null)
                         continue;
 
-                    output.Enqueue(item);
+                    output.Enqueue(FileClass.GenerateAndroidFile(item));
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
             catch (Exception e)
             {
@@ -198,11 +202,12 @@ public partial class ADBService
                 if (!string.IsNullOrEmpty(message))
                     message += "\n\n";
                 
-                dispatcher.Invoke(() => DialogService.ShowMessage(message + Strings.Resources.S_LS_ERROR,
-                                                                  Strings.Resources.S_LS_ERROR_TITLE,
-                                                                  DialogService.DialogIcon.Critical,
-                                                                  true,
-                                                                  copyToClipboard: true));
+                _ = dispatcher.BeginInvoke(new Action(() => DialogService.ShowMessage(
+                    message + Strings.Resources.S_LS_ERROR,
+                    Strings.Resources.S_LS_ERROR_TITLE,
+                    DialogService.DialogIcon.Critical,
+                    true,
+                    copyToClipboard: true)));
                 return;
             }
         }

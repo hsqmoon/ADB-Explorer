@@ -2,19 +2,37 @@ using ADB_Explorer.Converters;
 using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
 using ADB_Explorer.Services;
+using ADB_Explorer.ViewModels;
+using AdvancedSharpAdbClient.Models;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
+
+[assembly: DoNotParallelize]
 
 namespace ADB_Test
 {
     [TestClass]
     public class Tests
     {
+        [ClassInitialize]
+        public static void Initialize(TestContext _)
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("windir")))
+            {
+                Environment.SetEnvironmentVariable(
+                    "windir",
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+            }
+        }
+
         [TestMethod]
         public void ToSizeTest()
         {
@@ -32,7 +50,7 @@ namespace ADB_Test
 
             foreach (var item in testVals)
             {
-                Assert.IsTrue(item.Key.BytesToSize() == item.Value);
+                Assert.AreEqual(item.Value, item.Key.BytesToSize());
             }
 
         }
@@ -40,8 +58,8 @@ namespace ADB_Test
         [TestMethod]
         public void ToTimeTest()
         {
-            Assert.AreEqual("50ms", UnitConverter.ToTime(.05));
-            Assert.AreEqual("1:00:00h", UnitConverter.ToTime(3600));
+            Assert.AreEqual(string.Format(ADB_Explorer.Strings.Resources.S_MILLISECONDS_SHORT, "50"), UnitConverter.ToTime(.05));
+            Assert.AreEqual(string.Format(ADB_Explorer.Strings.Resources.S_HOURS_SHORT, "1:00:00"), UnitConverter.ToTime(3600));
         }
 
         [TestMethod]
@@ -133,16 +151,17 @@ namespace ADB_Test
             Assert.AreEqual("New File.pdf", FileHelper.DuplicateFile(names, "New File.pdf"));
             Assert.AreEqual("New File 1.txt", FileHelper.DuplicateFile(names, "New File.txt"));
 
-            string[] names2 = ["New File", "New File - Copy 1", "New File.txt"];
-            string[] names3 = ["New File", "New File - Copy 2"];
+            string copyName = string.Format(ADB_Explorer.Strings.Resources.S_ITEM_COPY, "New File");
+            string[] names2 = ["New File", $"{copyName} 1", "New File.txt"];
+            string[] names3 = ["New File", $"{copyName} 2"];
 
             // Copy
             Assert.AreEqual("New File", FileHelper.DuplicateFile(Array.Empty<string>(), "New File", System.Windows.DragDropEffects.Copy));
-            Assert.AreEqual("New File - Copy 1", FileHelper.DuplicateFile(["New File"], "New File", System.Windows.DragDropEffects.Copy));
-            Assert.AreEqual("New File - Copy 2", FileHelper.DuplicateFile(names2, "New File", System.Windows.DragDropEffects.Copy));
-            Assert.AreEqual("New File - Copy 1", FileHelper.DuplicateFile(names3, "New File", System.Windows.DragDropEffects.Copy));
+            Assert.AreEqual($"{copyName} 1", FileHelper.DuplicateFile(["New File"], "New File", System.Windows.DragDropEffects.Copy));
+            Assert.AreEqual($"{copyName} 2", FileHelper.DuplicateFile(names2, "New File", System.Windows.DragDropEffects.Copy));
+            Assert.AreEqual($"{copyName} 1", FileHelper.DuplicateFile(names3, "New File", System.Windows.DragDropEffects.Copy));
             Assert.AreEqual("New File.pdf", FileHelper.DuplicateFile(names2, "New File.pdf", System.Windows.DragDropEffects.Copy));
-            Assert.AreEqual("New File - Copy 1.txt", FileHelper.DuplicateFile(names2, "New File.txt", System.Windows.DragDropEffects.Copy));
+            Assert.AreEqual($"{copyName} 1.txt", FileHelper.DuplicateFile(names2, "New File.txt", System.Windows.DragDropEffects.Copy));
         }
 
         [TestMethod]
@@ -180,11 +199,13 @@ namespace ADB_Test
         [TestMethod]
         public void HashTest()
         {
-            var Adb_33_0_3_path = @"E:\Android_SDK\platform-tools_r33.0.3\adb.exe";
-            var Adb_33_0_3_hash = "3B0C0331799D69225E1BA24E6CB0DFAB";
+            var bytes = Encoding.UTF8.GetBytes("ADB Explorer");
+            using var md5Stream = new System.IO.MemoryStream(bytes);
+            using var shaStream = new System.IO.MemoryStream(bytes);
 
-            var result = Security.CalculateWindowsFileHash(Adb_33_0_3_path);
-            Assert.AreEqual(Adb_33_0_3_hash, result);
+            Assert.AreEqual("D0249C232FBF4184D1AB9E3341618F1B", Security.CalculateWindowsFileHash(md5Stream));
+            Assert.AreEqual("8615421DF7FB952CC657B987DA75EE3092DFF415656BB6D9BB33852DB1435DF2",
+                Security.CalculateWindowsFileHash(shaStream, useSHA: true));
         }
 
         [TestMethod]
@@ -277,7 +298,7 @@ namespace ADB_Test
 
             file.AddUpdates(updates);
 
-            Assert.IsTrue(file.Children.Count > 0);
+            Assert.IsNotEmpty(file.Children);
             Assert.IsTrue(file.Children.All(c => c.RelationFrom(file) is AbstractFile.RelationType.Ancestor));
             Assert.AreEqual(0, file.Children.Count(c => c.ProgressUpdates.Any(u => u is SyncErrorInfo)));
         }
@@ -326,11 +347,23 @@ namespace ADB_Test
             Assert.AreEqual(number, size.GetSize());
         }
 
-        public class TestItem(int value) : INotifyPropertyChanged
+        public class TestItem(int initialValue) : INotifyPropertyChanged
         {
             public event PropertyChangedEventHandler PropertyChanged;
 
-            public int Value { get; set; } = value;
+            private int value = initialValue;
+            public int Value
+            {
+                get => value;
+                set
+                {
+                    if (this.value == value)
+                        return;
+
+                    this.value = value;
+                    PropertyChanged?.Invoke(this, new(nameof(Value)));
+                }
+            }
         }
 
         [TestMethod]
@@ -354,7 +387,7 @@ namespace ADB_Test
             }
             
             // Ensure items were added correctly
-            Assert.AreEqual(10, list.Count);
+            Assert.HasCount(10, list);
 
             var singleItemTime = TimeSpan.Zero;
             for (int i = 0; i < 1000; i++)
@@ -378,7 +411,7 @@ namespace ADB_Test
             Console.WriteLine($"Average for 10 items:           {totalMulti:F3} ns");
 
             // Ensure items were added correctly
-            Assert.AreEqual(1, list.Count);
+            Assert.HasCount(1, list);
         }
 
         [TestMethod]
@@ -388,8 +421,31 @@ namespace ADB_Test
             ObservableList<TestItem> emptyList = [];
 
             Assert.AreEqual(3, list.Find(i => i.Value == 3).Value);
-            Assert.AreEqual(null, list.Find(i => i.Value == 50));
-            Assert.AreEqual(null, emptyList.Find(i => i.Value == 50));
+            Assert.IsNull(list.Find(i => i.Value == 50));
+            Assert.IsNull(emptyList.Find(i => i.Value == 50));
+        }
+
+        [TestMethod]
+        public void ObservableListBatchNotificationsTest()
+        {
+            ObservableList<TestItem> list = [];
+            int collectionChanges = 0;
+            int propertyChanges = 0;
+            list.CollectionChanged += (_, _) => collectionChanges++;
+            ((INotifyPropertyChanged)list).PropertyChanged += (_, _) => propertyChanges++;
+
+            list.AddRange(Enumerable.Range(0, 1000).Select(i => new TestItem(i)));
+
+            Assert.AreEqual(1, collectionChanges);
+            Assert.AreEqual(2, propertyChanges);
+
+            collectionChanges = 0;
+            propertyChanges = 0;
+            list.RemoveAll(item => item.Value < 900);
+
+            Assert.HasCount(100, list);
+            Assert.AreEqual(1, collectionChanges);
+            Assert.AreEqual(2, propertyChanges);
         }
 
         [TestMethod]
@@ -422,6 +478,501 @@ namespace ADB_Test
             Assert.IsTrue(emptyDir.IsDirectory);
             Assert.AreEqual(AbstractFile.FileType.Folder, emptyDir.Type);
             Assert.AreEqual(AbstractFile.FilePathType.Windows, emptyDir.PathType);
+        }
+
+        [TestMethod]
+        public void BottomMostFoldersTest()
+        {
+            SyncFile parent = new("/root/parent", AbstractFile.FileType.Folder);
+            SyncFile leaf = new("/root/parent/leaf", AbstractFile.FileType.Folder);
+            SyncFile empty = new("/root/empty", AbstractFile.FileType.Folder);
+            SyncFile file = new("/root/file.txt");
+            parent.Children.Add(leaf);
+
+            var result = FolderHelper.GetBottomMostFolders([parent, leaf, empty, file]).ToList();
+
+            CollectionAssert.AreEquivalent(new[] { leaf, empty }, result);
+        }
+
+        [TestMethod]
+        public void MergeToWindowsPathTest()
+        {
+            SyncFile source = new("/sdcard/Download/example.txt") { Size = 123, UnixTime = 456 };
+
+            var target = SyncFile.MergeToWindowsPath(source, @"C:\Downloads");
+
+            Assert.AreEqual(@"C:\Downloads\example.txt", target.FullPath);
+            Assert.AreEqual(AbstractFile.FilePathType.Windows, target.PathType);
+            Assert.AreEqual(source.Size, target.Size);
+            Assert.AreEqual(source.UnixTime, target.UnixTime);
+        }
+
+        [TestMethod]
+        public void SyncFileFromWindowsPathTest()
+        {
+            string rootPath = Path.Combine(Path.GetTempPath(), $"ADB_Explorer_SyncFile_{Guid.NewGuid():N}");
+
+            try
+            {
+                string nestedPath = Directory.CreateDirectory(Path.Combine(rootPath, "nested")).FullName;
+                string emptyPath = Directory.CreateDirectory(Path.Combine(rootPath, "empty")).FullName;
+                string rootFilePath = Path.Combine(rootPath, "root.bin");
+                string nestedFilePath = Path.Combine(nestedPath, "nested.txt");
+                File.WriteAllBytes(rootFilePath, [1, 2, 3, 4]);
+                File.WriteAllText(nestedFilePath, "content");
+
+                var root = SyncFile.FromWindowsPath(rootPath);
+                var rootFile = root.Children.Single(file => file.FullPath == rootFilePath);
+                var nested = root.Children.Single(file => file.FullPath == nestedPath);
+                var empty = root.Children.Single(file => file.FullPath == emptyPath);
+                var nestedFile = nested.Children.Single();
+
+                Assert.IsTrue(root.IsDirectory);
+                Assert.AreEqual(AbstractFile.FilePathType.Windows, root.PathType);
+                Assert.AreEqual(4L, rootFile.Size.Value);
+                Assert.IsNotNull(rootFile.UnixTime);
+                Assert.AreEqual(AbstractFile.FilePathType.Windows, rootFile.PathType);
+                Assert.IsTrue(nested.IsDirectory);
+                Assert.AreEqual(nestedFilePath, nestedFile.FullPath);
+                Assert.AreEqual(new FileInfo(nestedFilePath).Length, nestedFile.Size.Value);
+                Assert.AreEqual(AbstractFile.FilePathType.Windows, nestedFile.PathType);
+                Assert.IsTrue(empty.IsDirectory);
+                Assert.IsEmpty(empty.Children);
+                Assert.IsEmpty(SyncFile.FromWindowsPath(rootPath, false).Children);
+            }
+            finally
+            {
+                if (Directory.Exists(rootPath))
+                    Directory.Delete(rootPath, true);
+            }
+        }
+
+        [TestMethod]
+        public void SyncParallelismLimitsTest()
+        {
+            Assert.AreEqual(1, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                false, AbstractDevice.DeviceType.Local, 32, 100));
+            Assert.AreEqual(4, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                true, AbstractDevice.DeviceType.Local, 32, 100));
+            Assert.AreEqual(2, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                true, AbstractDevice.DeviceType.Remote, 32, 100));
+            Assert.AreEqual(2, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                true, AbstractDevice.DeviceType.WSA, 32, 100));
+            Assert.AreEqual(2, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                true, AbstractDevice.DeviceType.Emulator, 32, 100));
+            Assert.AreEqual(1, FileSyncOperation.CalculateMaxDegreeOfParallelism(
+                true, AbstractDevice.DeviceType.Local, 32, 1));
+        }
+
+        [TestMethod]
+        public void DeviceDataValueComparisonTest()
+        {
+            DeviceData current = new()
+            {
+                Serial = "device-1",
+                State = DeviceState.Online,
+                Model = "model",
+                Product = "product",
+                Name = "device",
+                Features = ["shell_v2", "cmd"],
+                Usb = "1-1",
+                TransportId = "7",
+            };
+            DeviceData unchanged = new()
+            {
+                Serial = "device-1",
+                State = DeviceState.Online,
+                Model = "model",
+                Product = "product",
+                Name = "device",
+                Features = ["shell_v2", "cmd"],
+                Usb = "1-1",
+                TransportId = "7",
+            };
+            DeviceData changed = new()
+            {
+                Serial = "device-1",
+                State = DeviceState.Online,
+                Model = "model",
+                Product = "product",
+                Name = "device",
+                Features = ["shell_v2", "cmd", "abb"],
+                Usb = "1-1",
+                TransportId = "7",
+            };
+
+            Assert.IsTrue(Devices.DeviceDataEquals(current, unchanged));
+            Assert.IsFalse(Devices.DeviceDataEquals(current, changed));
+        }
+
+        [TestMethod]
+        public void LogicalDeviceFromDeviceDataTest()
+        {
+            DeviceData source = new()
+            {
+                Serial = "device-1",
+                State = DeviceState.Online,
+                Product = "product",
+                Model = "Test_Model",
+                Name = "test_device",
+                Features = ["shell_v2", "cmd"],
+                TransportId = "7",
+            };
+
+            var device = LogicalDevice.New(source);
+
+            Assert.AreEqual("device-1", device.ID);
+            Assert.AreEqual("Test Model", device.Name);
+            Assert.AreEqual(AbstractDevice.DeviceStatus.Ok, device.Status);
+            Assert.AreSame(source, device.DeviceData);
+        }
+
+        [TestMethod]
+        public void SyncBatchTargetPathTest()
+        {
+            SyncFile windowsRoot = new(@"C:\Source", AbstractFile.FileType.Folder)
+            {
+                PathType = AbstractFile.FilePathType.Windows,
+            };
+            SyncFile windowsFile = new(@"C:\Source\example.txt")
+            {
+                PathType = AbstractFile.FilePathType.Windows,
+            };
+            SyncFile androidTarget = new("/sdcard/Download", AbstractFile.FileType.Folder);
+
+            Assert.AreEqual("/sdcard/Download/example.txt", FileSyncOperation.ResolveTargetPath(
+                windowsRoot, androidTarget, windowsFile));
+
+            SyncFile androidRoot = new("/sdcard/Source", AbstractFile.FileType.Folder);
+            SyncFile androidFile = new("/sdcard/Source/example.txt");
+            SyncFile windowsTarget = new(@"C:\Downloads", AbstractFile.FileType.Folder)
+            {
+                PathType = AbstractFile.FilePathType.Windows,
+            };
+
+            Assert.AreEqual(@"C:\Downloads\example.txt", FileSyncOperation.ResolveTargetPath(
+                androidRoot, windowsTarget, androidFile));
+            Assert.AreEqual("/sdcard/renamed.txt", FileSyncOperation.ResolveTargetPath(
+                androidFile, new SyncFile("/sdcard/renamed.txt"), androidFile));
+        }
+
+        [TestMethod]
+        public void SyncProgressAggregationTest()
+        {
+            var totals = FileSyncOperation.CalculateProgressTotals(0, 0, 0, 50, 0, 50);
+            Assert.AreEqual(50L, totals.TransferredBytes);
+            Assert.AreEqual(1, totals.ActiveCount);
+            Assert.AreEqual(50d, totals.ActivePercentage);
+
+            totals = FileSyncOperation.CalculateProgressTotals(
+                totals.TransferredBytes,
+                totals.ActiveCount,
+                totals.ActivePercentage,
+                50,
+                50,
+                100);
+            Assert.AreEqual(100L, totals.TransferredBytes);
+            Assert.AreEqual(0, totals.ActiveCount);
+            Assert.AreEqual(0d, totals.ActivePercentage);
+
+            totals = FileSyncOperation.CalculateProgressTotals(
+                totals.TransferredBytes,
+                totals.ActiveCount,
+                totals.ActivePercentage,
+                -100,
+                100,
+                0);
+            Assert.AreEqual(0L, totals.TransferredBytes);
+            Assert.AreEqual(0, totals.ActiveCount);
+        }
+
+        [TestMethod]
+        public void SyncProgressSourceThrottleTest()
+        {
+            long lastProgressUpdate = 0;
+            int reports = 0;
+
+            for (long timestamp = 100; timestamp <= 1_100; timestamp++)
+            {
+                if (FileSyncOperation.ShouldReportProgress(timestamp, 50, ref lastProgressUpdate))
+                    reports++;
+            }
+
+            Assert.AreEqual(11, reports);
+            Assert.IsTrue(FileSyncOperation.ShouldReportProgress(1_101, 100, ref lastProgressUpdate));
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void SyncProgressLargeBatchPerformanceTest()
+        {
+            const int fileCount = 10_000;
+            SyncFile root = new("/sdcard/Download", AbstractFile.FileType.Folder);
+            root.Children.AddRange(Enumerable.Range(0, fileCount)
+                .Select(i => new SyncFile($"/sdcard/Download/file_{i}.bin")));
+            var updates = Enumerable.Range(0, fileCount)
+                .Select(i => new AdbSyncProgressInfo($"/sdcard/Download/file_{i}.bin", 100, 100, 1))
+                .ToArray();
+
+            var stopwatch = Stopwatch.StartNew();
+            root.AddUpdates(updates, executeInDispatcher: false);
+            stopwatch.Stop();
+
+            Console.WriteLine($"Applied {fileCount:N0} progress updates in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(500d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.IsTrue(root.Children.All(file => file.CurrentPercentage == 100));
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void SyncFileLargeTreeDetachPerformanceTest()
+        {
+            const int fileCount = 100_000;
+            SyncFile root = new("/sdcard/Download", AbstractFile.FileType.Folder);
+            root.Children.AddRange(Enumerable.Range(0, fileCount)
+                .Select(i => new SyncFile($"/sdcard/Download/file_{i}.bin")));
+
+            var stopwatch = Stopwatch.StartNew();
+            root.ClearAll();
+            stopwatch.Stop();
+
+            Console.WriteLine($"Detached a {fileCount:N0}-item sync tree in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(100d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.IsEmpty(root.Children);
+            Assert.IsEmpty(root.ProgressUpdates);
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void SyncFileLargeWindowsTreePerformanceTest()
+        {
+            const int directoryCount = 20;
+            const int filesPerDirectory = 100;
+            string rootPath = Path.Combine(Path.GetTempPath(), $"ADB_Explorer_SyncTree_{Guid.NewGuid():N}");
+
+            try
+            {
+                for (int directoryIndex = 0; directoryIndex < directoryCount; directoryIndex++)
+                {
+                    string directory = Directory.CreateDirectory(
+                        Path.Combine(rootPath, $"folder_{directoryIndex}")).FullName;
+                    for (int fileIndex = 0; fileIndex < filesPerDirectory; fileIndex++)
+                        File.WriteAllBytes(Path.Combine(directory, $"file_{fileIndex}.bin"), []);
+                }
+
+                var stopwatch = Stopwatch.StartNew();
+                var root = SyncFile.FromWindowsPath(rootPath);
+                stopwatch.Stop();
+                var descendants = root.AllChildren().ToList();
+
+                Console.WriteLine($"Built a {directoryCount * filesPerDirectory:N0}-file Windows tree in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+                Assert.IsLessThan(2_000d, stopwatch.Elapsed.TotalMilliseconds);
+                Assert.AreEqual(directoryCount * filesPerDirectory, descendants.Count(file => !file.IsDirectory));
+                Assert.IsTrue(descendants.All(file => file.PathType is AbstractFile.FilePathType.Windows));
+                Assert.IsTrue(descendants.All(file => file.ShellItem is null));
+            }
+            finally
+            {
+                if (Directory.Exists(rootPath))
+                    Directory.Delete(rootPath, true);
+            }
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void WindowsFolderHashPerformanceTest()
+        {
+            const int directoryCount = 10;
+            const int filesPerDirectory = 50;
+            string rootPath = Path.Combine(Path.GetTempPath(), $"ADB_Explorer_HashTree_{Guid.NewGuid():N}");
+
+            try
+            {
+                for (int directoryIndex = 0; directoryIndex < directoryCount; directoryIndex++)
+                {
+                    string directory = Directory.CreateDirectory(
+                        Path.Combine(rootPath, $"folder_{directoryIndex}")).FullName;
+                    for (int fileIndex = 0; fileIndex < filesPerDirectory; fileIndex++)
+                        File.WriteAllText(Path.Combine(directory, $"file_{fileIndex}.txt"), $"{directoryIndex}:{fileIndex}");
+                }
+
+                var stopwatch = Stopwatch.StartNew();
+                var hashes = Security.CalculateWindowsFolderHash(rootPath);
+                stopwatch.Stop();
+
+                Console.WriteLine($"Hashed {directoryCount * filesPerDirectory:N0} files in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+                Assert.IsLessThan(2_000d, stopwatch.Elapsed.TotalMilliseconds);
+                Assert.HasCount(directoryCount * filesPerDirectory, hashes);
+                Assert.IsTrue(hashes.Keys.All(path => path.Contains('/') && !path.Contains('\\')));
+            }
+            finally
+            {
+                if (Directory.Exists(rootPath))
+                    Directory.Delete(rootPath, true);
+            }
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void SyncFileLargeAndroidTreePerformanceTest()
+        {
+            const int directoryCount = 100;
+            const int filesPerDirectory = 100;
+            List<(string, long?, double?)> tree = new(directoryCount * (filesPerDirectory + 1));
+            for (int directoryIndex = 0; directoryIndex < directoryCount; directoryIndex++)
+            {
+                string directory = $"/root/folder_{directoryIndex}";
+                tree.Add((directory, null, null));
+                for (int fileIndex = 0; fileIndex < filesPerDirectory; fileIndex++)
+                    tree.Add(($"{directory}/file_{fileIndex}.bin", fileIndex, 1_700_000_000));
+            }
+
+            FileClass rootFile = new("root", "/root", AbstractFile.FileType.Folder, loadIcon: false);
+            var stopwatch = Stopwatch.StartNew();
+            SyncFile root = new(rootFile, tree);
+            stopwatch.Stop();
+            var descendants = root.AllChildren().ToList();
+
+            Console.WriteLine($"Built a {directoryCount * filesPerDirectory:N0}-file Android tree in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(1_000d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.HasCount(directoryCount, root.Children);
+            Assert.AreEqual(directoryCount, descendants.Count(file => file.IsDirectory));
+            Assert.AreEqual(directoryCount * filesPerDirectory, descendants.Count(file => !file.IsDirectory));
+            Assert.IsTrue(descendants.Where(file => !file.IsDirectory).All(file => file.Size is not null));
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void FileGroupLargeDescriptorPerformanceTest()
+        {
+            const int descriptorCount = 10_000;
+            var descriptors = Enumerable.Range(0, descriptorCount)
+                .Select(i => new FileDescriptor
+                {
+                    Name = $"folder/file_{i}.bin",
+                    Length = i,
+                    ChangeTimeUtc = DateTime.UnixEpoch,
+                })
+                .ToArray();
+
+            var stopwatch = Stopwatch.StartNew();
+            FileGroup group = new(descriptors);
+            stopwatch.Stop();
+
+            int expectedLength = sizeof(UInt32) + descriptorCount * Marshal.SizeOf<FILEDESCRIPTOR>();
+            Console.WriteLine($"Serialized {descriptorCount:N0} virtual file descriptors in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(1_000d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.HasCount(expectedLength, group.GroupDescriptorBytes);
+            Assert.HasCount(descriptorCount, group.FileDescriptors);
+        }
+
+        [TestMethod]
+        public void StructureSerializationValidationTest()
+        {
+            const long value = 0x1234567890;
+            byte[] bytes = NativeMethods.BytesFromStructure(value);
+
+            Assert.AreEqual(value, NativeMethods.StructureFromBytes<long>(bytes));
+            Assert.ThrowsExactly<ArgumentException>(() =>
+                NativeMethods.StructureFromBytes<long>(bytes.Take(bytes.Length - 1)));
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void ObservableListLargeBatchPerformanceTest()
+        {
+            const int itemCount = 50_000;
+            ObservableList<TestItem> list = [];
+            int collectionChanges = 0;
+            list.CollectionChanged += (_, _) => collectionChanges++;
+            var items = Enumerable.Range(0, itemCount).Select(i => new TestItem(i)).ToArray();
+
+            var stopwatch = Stopwatch.StartNew();
+            list.AddRange(items);
+            stopwatch.Stop();
+            double addMilliseconds = stopwatch.Elapsed.TotalMilliseconds;
+
+            stopwatch.Restart();
+            list.RemoveAll(item => item.Value % 2 == 0);
+            stopwatch.Stop();
+            double removeMilliseconds = stopwatch.Elapsed.TotalMilliseconds;
+
+            Console.WriteLine($"Added {itemCount:N0} items in {addMilliseconds:F1} ms and removed half in {removeMilliseconds:F1} ms");
+            Assert.IsLessThan(1_000d, addMilliseconds);
+            Assert.IsLessThan(1_000d, removeMilliseconds);
+            Assert.HasCount(itemCount / 2, list);
+            Assert.AreEqual(2, collectionChanges);
+        }
+
+        [TestMethod]
+        [TestCategory("Performance")]
+        public void DeviceServiceMergePerformanceTest()
+        {
+            const int serviceCount = 5_000;
+            ObservableList<DeviceViewModel> current = [];
+            current.AddRange(Enumerable.Range(0, serviceCount)
+                .Select(i => (DeviceViewModel)new PairingServiceViewModel(
+                    new PairingService($"service_{i}", $"10.0.{i / 256}.{i % 256}", "37000"), false)));
+            var incoming = Enumerable.Range(0, serviceCount)
+                .Select(i => (ServiceDeviceViewModel)new PairingServiceViewModel(
+                    new PairingService($"service_{i}", $"10.0.{i / 256}.{i % 256}", "37000"), false))
+                .ToArray();
+
+            var stopwatch = Stopwatch.StartNew();
+            Devices.UpdateServices(current, incoming);
+            stopwatch.Stop();
+
+            Console.WriteLine($"Merged {serviceCount:N0} stable services in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(250d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.HasCount(serviceCount, current);
+        }
+
+        [STATestMethod]
+        [TestCategory("Performance")]
+        public async Task DeviceLogicalIpMergePerformanceTest()
+        {
+            const int deviceCount = 5_000;
+            ObservableList<DeviceViewModel> devices = [];
+            List<LogicalDeviceViewModel> logicalDevices = new(deviceCount);
+            for (int i = 0; i < deviceCount; i++)
+            {
+                string id = $"service_{i}._adb-tls-connect._tcp.";
+                var logical = new LogicalDeviceViewModel(LogicalDevice.New(
+                    AdbRegEx.RE_DEVICE_NAME().Match($"{id} device model:model_{i} device:device_{i}")), false);
+                logicalDevices.Add(logical);
+                devices.Add(logical);
+                devices.Add(new PairingServiceViewModel(
+                    new PairingService(id, $"10.0.{i / 256}.{i % 256}", "37000"), false));
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            bool updated = await Devices.UpdateLogicalIp(devices);
+            stopwatch.Stop();
+
+            Console.WriteLine($"Merged IP addresses for {deviceCount:N0} logical devices in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(500d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.IsTrue(updated);
+            Assert.IsTrue(logicalDevices.All(device => device.IsIpAddressValid));
+
+            stopwatch.Restart();
+            var predicate = DeviceHelper.CreateDevicePredicate(devices);
+            int visibleCount = devices.Count(device => predicate(device));
+            stopwatch.Stop();
+
+            Console.WriteLine($"Filtered {devices.Count:N0} device rows in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            Assert.IsLessThan(500d, stopwatch.Elapsed.TotalMilliseconds);
+            Assert.AreEqual(deviceCount, visibleCount);
+        }
+
+        [TestMethod]
+        public void FileOperationQueueConcurrencyGateTest()
+        {
+            Assert.IsTrue(FileOperationQueue.ShouldWaitForRunningGroup(true, null, 1));
+            Assert.IsTrue(FileOperationQueue.ShouldWaitForRunningGroup(
+                false, FileOperation.OperationType.Move, 1));
+            Assert.IsFalse(FileOperationQueue.ShouldWaitForRunningGroup(
+                true, FileOperation.OperationType.Move, 1));
+            Assert.IsFalse(FileOperationQueue.ShouldWaitForRunningGroup(true, null, 0));
         }
     }
 }

@@ -1,7 +1,6 @@
 ﻿using ADB_Explorer.Converters;
 using ADB_Explorer.Helpers;
 using ADB_Explorer.Services;
-using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Models;
 
@@ -21,7 +20,6 @@ public class SyncFile : FilePath
 
     public double? UnixTime { get; set; }
 
-    private readonly DateTime? dateModified;
     public DateTime? DateModified
     {
         get
@@ -29,7 +27,7 @@ public class SyncFile : FilePath
             if (!Data.Settings.KeepDateModified)
                 return null;
 
-            return dateModified ?? UnixTime.FromUnixTime();
+            return UnixTime.FromUnixTime();
         }
     }
 
@@ -37,17 +35,6 @@ public class SyncFile : FilePath
         : base(androidPath, fileType: fileType)
     {
 
-    }
-
-    public SyncFile(ShellItem windowsPath, bool includeContent = false)
-        : base(windowsPath)
-    {
-        (Size, dateModified) = FileHelper.GetShellSizeDate(windowsPath, IsDirectory);
-
-        if (includeContent && IsDirectory)
-        {
-            Children = [.. GetFolderTree((ShellFolder)windowsPath)];
-        }
     }
 
     public SyncFile(FileClass fileClass, IEnumerable<(string, long?, double?)> tree = null)
@@ -60,63 +47,82 @@ public class SyncFile : FilePath
             Children = [.. GetFolderTree(tree, FullPath)];
     }
 
-    public SyncFile(SyncFile other) : this(new FileClass(other))
-    { }
-
-    static IEnumerable<SyncFile> GetFolderTree(ShellFolder rootFolder)
+    public static SyncFile FromWindowsPath(string path, bool includeContent = true)
     {
-        foreach (var child in rootFolder)
+        var attributes = File.GetAttributes(path);
+        FileSystemInfo root = attributes.HasFlag(FileAttributes.Directory)
+            ? new DirectoryInfo(path)
+            : new FileInfo(path);
+
+        return createFile(root, includeContent, false);
+
+        static SyncFile createFile(FileSystemInfo info, bool includeChildren, bool addProgress)
         {
-            if (child.IsNonArchiveFolder())
+            var attributes = info.Attributes;
+            bool isDirectory = attributes.HasFlag(FileAttributes.Directory);
+            SyncFile file = new(info.FullName, isDirectory ? FileType.Folder : FileType.File)
             {
-                yield return new(child)
-                {
-                    Children = [.. GetFolderTree((ShellFolder)child)],
-                    ProgressUpdates = [new AdbSyncProgressInfo(child.ParsingName, null, null, null)]
-                };
-            }
-            else
+                PathType = FilePathType.Windows,
+                Size = isDirectory ? null : ((FileInfo)info).Length,
+                UnixTime = ((DateTime?)info.LastWriteTime).ToUnixTime(),
+            };
+
+            if (addProgress)
+                file.ProgressUpdates = [new AdbSyncProgressInfo(info.FullName, null, null, null)];
+
+            if (includeChildren
+                && isDirectory
+                && !attributes.HasFlag(FileAttributes.ReparsePoint))
             {
-                yield return new(child)
-                {
-                    ProgressUpdates = [new AdbSyncProgressInfo(child.ParsingName, null, null, null)]
-                };
+                file.Children =
+                [
+                    .. ((DirectoryInfo)info).EnumerateFileSystemInfos()
+                        .Select(child => createFile(child, true, true))
+                ];
             }
+
+            return file;
         }
     }
 
     static IEnumerable<SyncFile> GetFolderTree(IEnumerable<(string, long?, double?)> tree, string parent)
     {
-        // empty folder
-        if (!tree.Any())
-            yield break;
+        string rootPath = parent.Length > 1 ? parent.TrimEnd('/') : parent;
+        string rootPrefix = rootPath == "/" ? rootPath : rootPath + '/';
+        Dictionary<string, SyncFile> filesByPath = new(StringComparer.Ordinal);
+        List<(string Path, SyncFile File)> files = [];
 
-        var groups = tree.GroupBy(f => f.Item1.Split(parent)[1].Trim('/').Split('/')[0]);
-
-        foreach (var group in groups.Where(g => g.Key is not null))
+        foreach (var item in tree)
         {
-            var fullPath = FileHelper.ConcatPaths(parent, group.Key);
+            if (string.IsNullOrEmpty(item.Item1))
+                continue;
 
-            if (group.First().Item2 is null)
-            {
-                var children = GetFolderTree(group.Skip(1), fullPath);
+            string fullPath = item.Item1.Length > 1 ? item.Item1.TrimEnd('/') : item.Item1;
+            if (fullPath == rootPath || !fullPath.StartsWith(rootPrefix, StringComparison.Ordinal))
+                continue;
 
-                yield return new(fullPath, FileType.Folder)
-                {
-                    Children = [.. children],
-                    ProgressUpdates = [new AdbSyncProgressInfo(fullPath, null, null, null)]
-                };
-            }
-            else
+            SyncFile file = new(fullPath, item.Item2 is null ? FileType.Folder : FileType.File)
             {
-                yield return new(fullPath, FileType.File)
-                {
-                    Size = group.First().Item2,
-                    UnixTime = group.First().Item3,
-                    ProgressUpdates = [new AdbSyncProgressInfo(fullPath, null, null, null)]
-                };
-            }
+                Size = item.Item2,
+                UnixTime = item.Item3,
+                ProgressUpdates = [new AdbSyncProgressInfo(fullPath, null, null, null)]
+            };
+
+            if (filesByPath.TryAdd(fullPath, file))
+                files.Add((fullPath, file));
         }
+
+        List<SyncFile> rootChildren = [];
+        foreach (var (path, file) in files)
+        {
+            string parentPath = FileHelper.GetParentPath(path);
+            if (parentPath == rootPath)
+                rootChildren.Add(file);
+            else if (filesByPath.TryGetValue(parentPath, out var parentFile) && parentFile.IsDirectory)
+                parentFile.Children.Add(file);
+        }
+
+        return rootChildren;
     }
 
     public void AddUpdates(params FileOpProgressInfo[] newUpdates)
@@ -149,14 +155,18 @@ public class SyncFile : FilePath
             newUpdates = newUpdates.Where(u => !string.IsNullOrEmpty(u.AndroidPath));
 
         var groups = newUpdates.GroupBy(update => DirectChildPath(update.AndroidPath));
+        Dictionary<string, SyncFile> childrenByPath = new(StringComparer.Ordinal);
+        foreach (var child in Children)
+            childrenByPath.TryAdd(child.FullPath, child);
         
         foreach (var group in groups.Where(g => g.Key is not null))
         {
-            SyncFile file = Children.FirstOrDefault(child => child.FullPath.Equals(group.Key));
+            childrenByPath.TryGetValue(group.Key, out SyncFile file);
             
             if (file is null)
             {
-                bool isDir = !group.Key.Equals(group.First().AndroidPath) || group.Key[^1] is '/' or '\\';
+                var firstUpdate = group.First();
+                bool isDir = !group.Key.Equals(firstUpdate.AndroidPath) || group.Key[^1] is '/' or '\\';
                 file = new(group.Key, isDir ? FileType.Folder : FileType.File)
                 {
                     PathType = PathType
@@ -166,6 +176,7 @@ public class SyncFile : FilePath
                 {
                     Children.Add(file);
                 }, executeInDispatcher);
+                childrenByPath[group.Key] = file;
             }
 
             file.AddUpdates(group);
@@ -188,32 +199,38 @@ public class SyncFile : FilePath
         }
     }
 
-    public static SyncFile MergeToWindowsPath(SyncFile syncFile, ShellItem windowsPath)
+    public static SyncFile MergeToWindowsPath(SyncFile syncFile, string windowsPath)
     {
-        SyncFile copy = new(syncFile);
-
-        copy.UpdatePath(FileHelper.ConcatPaths(windowsPath.ParsingName, syncFile.FullName, '\\'));
-        copy.PathType = FilePathType.Windows;
-
-        return copy;
+        return new(FileHelper.ConcatPaths(windowsPath, syncFile.FullName, '\\'),
+            syncFile.IsDirectory ? FileType.Folder : FileType.File)
+        {
+            PathType = FilePathType.Windows,
+            Size = syncFile.Size,
+            UnixTime = syncFile.UnixTime,
+        };
     }
 
     /// <summary>
-    /// Recursively clears progress updates for this file and all children,
-    /// and disposes any ShellItem COM wrappers to free unmanaged memory.
+    /// Detaches progress updates and the complete child tree in constant time.
     /// </summary>
     public void ClearAll()
     {
-        ProgressUpdates.Clear();
-        ShellItem?.Dispose();
+        ProgressUpdates = [];
+        Children = [];
+        OnPropertyChanged(nameof(ProgressUpdates));
+        OnPropertyChanged(nameof(Children));
+        OnPropertyChanged(nameof(LastUpdate));
+        OnPropertyChanged(nameof(CurrentPercentage));
+        OnPropertyChanged(nameof(BytesTransferred));
+
+        var shellItem = ShellItem;
         ShellItem = null;
-
-        foreach (var child in Children)
+        try
         {
-            child.ClearAll();
+            shellItem?.Dispose();
         }
-
-        Children.Clear();
+        catch
+        { }
     }
 }
 

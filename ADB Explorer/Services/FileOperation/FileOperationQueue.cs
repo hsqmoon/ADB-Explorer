@@ -7,6 +7,7 @@ namespace ADB_Explorer.Services;
 public class FileOperationQueue : ViewModelBase
 {
     private static readonly TimeSpan PROGRESS_REFRESH_INTERVAL = TimeSpan.FromMilliseconds(100);
+    private const int MAX_PAST_OPERATIONS = 500;
 
     #region Full properties
 
@@ -35,11 +36,7 @@ public class FileOperationQueue : ViewModelBase
         set
         {
             if (Set(ref progress, value))
-            {
-                OnPropertyChanged(nameof(AnyFailedOperations));
-                OnPropertyChanged(nameof(StringProgress));
                 FileOpRingVisibility();
-            }
         }
     }
 
@@ -51,25 +48,34 @@ public class FileOperationQueue : ViewModelBase
 
     public bool CurrentChanged { get => false; set => OnPropertyChanged(); }
 
-    public static string[] NotifyProperties => [nameof(IsActive), nameof(AnyFailedOperations), nameof(Progress)];
+    public static readonly string[] NotifyProperties = [nameof(IsActive), nameof(AnyFailedOperations), nameof(Progress)];
 
-    public bool HasIncompleteOperations => Operations.Any(op => op.Status
-        is FileOperation.OperationStatus.Waiting
-        or FileOperation.OperationStatus.InProgress);
+    public bool HasIncompleteOperations => pendingCount + runningCount > 0;
 
-    public bool HasRunningSyncOperations => Operations.Any(op => op is FileSyncOperation
-        && op.Status is FileOperation.OperationStatus.InProgress);
+    public bool HasRunningSyncOperations => runningSyncCount > 0;
 
-    public int TotalCount => Operations.Count(op => !op.IsPastOp);
+    public int TotalCount => totalCount;
 
-    public string StringProgress => $"{Operations.Count(op => op.Status is FileOperation.OperationStatus.Completed)} / {TotalCount}";
+    public string StringProgress => $"{completedCount} / {TotalCount}";
 
-    public bool AnyFailedOperations => Operations.Any(op => !op.IsPastOp && op.Status is FileOperation.OperationStatus.Failed);
+    public bool AnyFailedOperations => failedCount > 0;
 
     #endregion
 
-    private readonly Mutex mutex = new();
+    private readonly object operationLock = new();
     private int progressRefreshScheduled;
+    private readonly HashSet<(FileOperation.OperationType? Type, string DeviceId)> pendingGroupKeys = [];
+    private readonly Dictionary<(FileOperation.OperationType? Type, string DeviceId), int> nextPendingIndexes = [];
+    private readonly Dictionary<(FileOperation.OperationType? Type, string DeviceId), int> runningGroupCounts = [];
+    private readonly Dictionary<(string DeviceId, string TargetPath), int> pendingPushTargetCounts = [];
+    private readonly HashSet<(string DeviceId, string TargetPath)> scheduledMediaScans = [];
+    private int totalCount;
+    private int completedCount;
+    private int failedCount;
+    private int pendingCount;
+    private int runningCount;
+    private int runningSyncCount;
+    private double runningProgress;
 
     public FileOperationQueue()
     {
@@ -80,7 +86,10 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
+
+            if (!IsActive && !HasIncompleteOperations)
+                MoveOperationsToPast();
 
             Operations.Add(fileOp);
             OnPropertyChanged(nameof(HasIncompleteOperations));
@@ -89,7 +98,7 @@ public class FileOperationQueue : ViewModelBase
         } 
         finally
         {
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
     }
 
@@ -97,7 +106,10 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
+
+            if (!IsActive && !HasIncompleteOperations)
+                MoveOperationsToPast();
 
             Operations.AddRange(operations);
             OnPropertyChanged(nameof(HasIncompleteOperations));
@@ -106,7 +118,7 @@ public class FileOperationQueue : ViewModelBase
         }
         finally
         {
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
     }
 
@@ -114,7 +126,7 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
 
             if (fileOp.Status is FileOperation.OperationStatus.InProgress)
             {
@@ -126,7 +138,7 @@ public class FileOperationQueue : ViewModelBase
         }
         finally
         {
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
     }
 
@@ -134,7 +146,7 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
 
             Func<FileOperation, bool> predicate = op => {
                 if (device is not null && op.Device.ID != device.ID)
@@ -145,43 +157,38 @@ public class FileOperationQueue : ViewModelBase
                     and not FileOperation.OperationStatus.InProgress;
             };
 
-            foreach (var op in Operations.Where(predicate))
-            {
+            var operationsToMove = Operations.Where(predicate).ToList();
+            var operationsToMoveSet = operationsToMove.ToHashSet();
+            var retainedPastOperations = Operations
+                .Where(op => op.IsPastOp)
+                .Concat(operationsToMove)
+                .Distinct()
+                .OrderByDescending(op => op.TimeStamp)
+                .Take(MAX_PAST_OPERATIONS)
+                .ToHashSet();
+            var operationsToRemove = Operations
+                .Where(op => (op.IsPastOp || operationsToMoveSet.Contains(op))
+                    && !retainedPastOperations.Contains(op))
+                .ToList();
+
+            if (operationsToRemove.Count > 0)
+                Operations.RemoveAll(operationsToRemove);
+
+            foreach (var op in operationsToMove.Where(retainedPastOperations.Contains))
                 op.IsPastOp = true;
-            }
+
+            RebuildOperationCounts();
+            NotifyOperationCounts();
+            ScheduleProgressRefresh(immediate: true);
         }
         finally
         {
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
     }
 
     private void UpdateProgress()
     {
-        int totalCount = 0;
-        int pendingCount = 0;
-        int runningCount = 0;
-        double runningProgress = 0;
-
-        foreach (var op in Operations)
-        {
-            if (op.IsPastOp)
-                continue;
-
-            totalCount++;
-
-            switch (op.Status)
-            {
-                case FileOperation.OperationStatus.Waiting:
-                    pendingCount++;
-                    break;
-                case FileOperation.OperationStatus.InProgress:
-                    runningCount++;
-                    runningProgress += op.LastProgress;
-                    break;
-            }
-        }
-
         if (totalCount == 0)
         {
             Progress = 0;
@@ -199,39 +206,49 @@ public class FileOperationQueue : ViewModelBase
 
     private void ScheduleProgressRefresh(bool immediate = false)
     {
-        if (immediate)
-        {
-            if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher && !dispatcher.CheckAccess())
-                _ = dispatcher.BeginInvoke(new Action(UpdateProgress));
-            else
-                UpdateProgress();
-
-            return;
-        }
-
         if (Interlocked.Exchange(ref progressRefreshScheduled, 1) == 1)
             return;
 
-        _ = Task.Run(async () =>
+        void refresh()
         {
+            Interlocked.Exchange(ref progressRefreshScheduled, 0);
+            UpdateProgress();
+        }
+
+        void dispatchRefresh()
+        {
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+            {
+                refresh();
+                return;
+            }
+
+            if (dispatcher.CheckAccess())
+            {
+                refresh();
+                return;
+            }
+
             try
             {
-                await Task.Delay(PROGRESS_REFRESH_INTERVAL);
+                _ = dispatcher.BeginInvoke(new Action(refresh), DispatcherPriority.Background);
             }
-            finally
+            catch (InvalidOperationException)
             {
                 Interlocked.Exchange(ref progressRefreshScheduled, 0);
             }
+        }
 
-            if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher)
-            {
-                if (dispatcher.CheckAccess())
-                    UpdateProgress();
-                else
-                    _ = dispatcher.BeginInvoke(new Action(UpdateProgress));
-            }
-            else
-                UpdateProgress();
+        if (immediate)
+        {
+            dispatchRefresh();
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(PROGRESS_REFRESH_INTERVAL);
+            dispatchRefresh();
         });
     }
 
@@ -241,10 +258,7 @@ public class FileOperationQueue : ViewModelBase
             return;
 
         if (!IsActive)
-        {
             IsActive = true;
-            MoveOperationsToPast();
-        }
 
         MoveToNextOperation();
 
@@ -270,17 +284,16 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
 
             op.PropertyChanged -= CurrentOperation_PropertyChanged;
             ScheduleProgressRefresh(immediate: true);
 
-            OnPropertyChanged(nameof(HasIncompleteOperations));
             FileOpRingVisibility();
         }
         finally
         { 
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
     }
 
@@ -288,36 +301,44 @@ public class FileOperationQueue : ViewModelBase
     {
         try
         {
-            mutex.WaitOne();
+            Monitor.Enter(operationLock);
 
-            var pending = Operations.Where(op => op.Status is FileOperation.OperationStatus.Waiting);
-            if (pending.Any())
+            foreach (var groupKey in pendingGroupKeys.ToList())
             {
-                // Group by operation type and device
-                var groups = pending.GroupBy(op => op.TypeOnDevice);
-                foreach (var item in groups)
+                runningGroupCounts.TryGetValue(groupKey, out int runningInGroup);
+                if (ShouldWaitForRunningGroup(Data.Settings.AllowMultiOp, groupKey.Type, runningInGroup))
                 {
-                    List<FileOperation> operations = [item.First()];
-                    if (!Data.Settings.AllowMultiOp)
-                    {
-                        // Skip if there's already an operation in progress on the same device and of the same type
-                        if (Operations.Any(op => op.Status
-                            is FileOperation.OperationStatus.InProgress
-                            && op.TypeOnDevice == item.Key))
-                        {
-                            continue;
-                        }
-                    }
-                    foreach (var op in operations)
-                    {
-                        op.PropertyChanged += CurrentOperation_PropertyChanged;
-                        op.Start();
-                    }
-
-                    CurrentChanged = true;
+                    continue;
                 }
+
+                int startIndex = nextPendingIndexes.GetValueOrDefault(groupKey);
+                FileOperation nextOperation = null;
+                for (int i = startIndex; i < Operations.Count; i++)
+                {
+                    var candidate = Operations[i];
+                    if (!candidate.IsPastOp
+                        && candidate.Status is FileOperation.OperationStatus.Waiting
+                        && GetOperationGroup(candidate) == groupKey)
+                    {
+                        nextOperation = candidate;
+                        nextPendingIndexes[groupKey] = i + 1;
+                        break;
+                    }
+                }
+
+                if (nextOperation is null)
+                {
+                    pendingGroupKeys.Remove(groupKey);
+                    nextPendingIndexes.Remove(groupKey);
+                    continue;
+                }
+
+                nextOperation.PropertyChanged += CurrentOperation_PropertyChanged;
+                nextOperation.Start();
+                CurrentChanged = true;
             }
-            else if (!Operations.Any(op => op.Status is FileOperation.OperationStatus.InProgress))
+
+            if (pendingGroupKeys.Count == 0 && runningCount == 0)
             {
                 IsActive = false;
                 CurrentChanged = true;
@@ -325,23 +346,8 @@ public class FileOperationQueue : ViewModelBase
         }
         finally
         {
-            mutex.ReleaseMutex();
+            Monitor.Exit(operationLock);
         }
-    }
-
-    private void CheckForRescan(FileOperation fileOp)
-    {
-        var target = fileOp.TargetPath.ParentPath;
-        if (fileOp.Device.Device.AndroidVersion < AdbExplorerConst.MIN_MEDIA_SCAN_ANDROID_VER
-            || Operations.Any(op =>
-                op.TypeOnDevice == fileOp.TypeOnDevice
-                && op.TargetPath.ParentPath == target
-                && op.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress))
-        {
-            return;
-        }
-
-        ADBService.AdbDevice.ForceMediaScan(fileOp.Device.Device);
     }
 
     private void CurrentOperation_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -350,6 +356,9 @@ public class FileOperationQueue : ViewModelBase
         
         if (e.PropertyName is nameof(FileOperation.Status))
         {
+            if (!op.IsPastOp)
+                UpdateOperationStatusCounts(op);
+
             Data.RuntimeSettings.IsPollingStopped = Data.Settings.StopPollingOnSync && HasRunningSyncOperations;
 
             if (op.Status
@@ -360,10 +369,6 @@ public class FileOperationQueue : ViewModelBase
 
                 if (IsAutoPlayOn)
                     MoveToNextOperation();
-
-                if (op.OperationName is FileOperation.OperationType.Push
-                    && Data.Settings.RescanOnPush)
-                    Task.Run(() => CheckForRescan(op));
             }
         }
 
@@ -371,6 +376,7 @@ public class FileOperationQueue : ViewModelBase
             && op.Status is FileOperation.OperationStatus.InProgress
             && op.StatusInfo is InProgSyncProgressViewModel { TotalPercentage: double percentage })
         {
+            runningProgress += percentage - op.LastProgress;
             op.LastProgress = percentage;
             ScheduleProgressRefresh();
         }
@@ -383,15 +389,179 @@ public class FileOperationQueue : ViewModelBase
 
     private void Operations_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
     {
-        OnPropertyChanged(nameof(TotalCount));
-        ScheduleProgressRefresh(immediate: true);
+        if (e.Action is NotifyCollectionChangedAction.Add && e.NewItems is not null)
+        {
+            foreach (FileOperation item in e.NewItems)
+            {
+                item.BeginWaiting();
+                AddOperationCounts(item);
+            }
+        }
+        else
+        {
+            foreach (FileOperation item in Operations.Where(op => op.Status is FileOperation.OperationStatus.None))
+                item.BeginWaiting();
 
-        if (e.Action is not NotifyCollectionChangedAction.Reset && e.NewItems is null)
+            RebuildOperationCounts();
+        }
+
+        NotifyOperationCounts();
+        ScheduleProgressRefresh(immediate: true);
+    }
+
+    private void AddOperationCounts(FileOperation op)
+    {
+        if (op.IsPastOp)
             return;
 
-        foreach (FileOperation item in Operations.Where(op => op.Status is FileOperation.OperationStatus.None))
+        totalCount++;
+        switch (op.Status)
         {
-            item.BeginWaiting();
+            case FileOperation.OperationStatus.Waiting:
+                pendingCount++;
+                pendingGroupKeys.Add(GetOperationGroup(op));
+                break;
+            case FileOperation.OperationStatus.InProgress:
+                runningCount++;
+                runningProgress += op.LastProgress;
+                if (op is FileSyncOperation)
+                    runningSyncCount++;
+                var runningKey = GetOperationGroup(op);
+                runningGroupCounts[runningKey] = runningGroupCounts.GetValueOrDefault(runningKey) + 1;
+                break;
+            case FileOperation.OperationStatus.Completed:
+                completedCount++;
+                break;
+            case FileOperation.OperationStatus.Failed:
+                failedCount++;
+                break;
         }
+
+        if (op.OperationName is FileOperation.OperationType.Push
+            && op.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress)
+        {
+            var key = (op.Device.ID, GetPushTargetDirectory(op));
+            pendingPushTargetCounts[key] = pendingPushTargetCounts.GetValueOrDefault(key) + 1;
+        }
+    }
+
+    private void RebuildOperationCounts()
+    {
+        totalCount = 0;
+        completedCount = 0;
+        failedCount = 0;
+        pendingCount = 0;
+        runningCount = 0;
+        runningSyncCount = 0;
+        runningProgress = 0;
+        pendingGroupKeys.Clear();
+        nextPendingIndexes.Clear();
+        runningGroupCounts.Clear();
+        pendingPushTargetCounts.Clear();
+
+        foreach (var op in Operations)
+            AddOperationCounts(op);
+    }
+
+    private void UpdateOperationStatusCounts(FileOperation op)
+    {
+        if (op.Status is FileOperation.OperationStatus.InProgress)
+        {
+            pendingCount = Math.Max(0, pendingCount - 1);
+            runningCount++;
+            if (op is FileSyncOperation)
+                runningSyncCount++;
+
+            var runningKey = GetOperationGroup(op);
+            runningGroupCounts[runningKey] = runningGroupCounts.GetValueOrDefault(runningKey) + 1;
+        }
+        else if (op.Status is not FileOperation.OperationStatus.Waiting)
+        {
+            runningCount = Math.Max(0, runningCount - 1);
+            runningProgress = Math.Max(0, runningProgress - op.LastProgress);
+            if (op is FileSyncOperation)
+                runningSyncCount = Math.Max(0, runningSyncCount - 1);
+
+            var runningKey = GetOperationGroup(op);
+            int runningInGroup = runningGroupCounts.GetValueOrDefault(runningKey) - 1;
+            if (runningInGroup > 0)
+                runningGroupCounts[runningKey] = runningInGroup;
+            else
+                runningGroupCounts.Remove(runningKey);
+
+            if (op.Status is FileOperation.OperationStatus.Completed)
+                completedCount++;
+            else if (op.Status is FileOperation.OperationStatus.Failed)
+                failedCount++;
+
+            if (op.OperationName is FileOperation.OperationType.Push)
+            {
+                var key = (op.Device.ID, GetPushTargetDirectory(op));
+                if (pendingPushTargetCounts.TryGetValue(key, out int pendingForTarget))
+                {
+                    pendingForTarget--;
+                    if (pendingForTarget > 0)
+                        pendingPushTargetCounts[key] = pendingForTarget;
+                    else
+                    {
+                        pendingPushTargetCounts.Remove(key);
+                        ScheduleMediaScan(op, key);
+                    }
+                }
+            }
+        }
+
+        NotifyOperationCounts();
+    }
+
+    private static (FileOperation.OperationType? Type, string DeviceId) GetOperationGroup(FileOperation op)
+        => (op is FileSyncOperation ? null : op.OperationName, op.Device.ID);
+
+    private static string GetPushTargetDirectory(FileOperation op)
+        => op is FileSyncOperation { IsBatch: true }
+            ? op.TargetPath.FullPath
+            : op.TargetPath.ParentPath;
+
+    internal static bool ShouldWaitForRunningGroup(
+        bool allowMultiOperation,
+        FileOperation.OperationType? groupType,
+        int runningInGroup)
+        => runningInGroup > 0 && (groupType is null || !allowMultiOperation);
+
+    private void NotifyOperationCounts()
+    {
+        OnPropertyChanged(nameof(TotalCount));
+        OnPropertyChanged(nameof(StringProgress));
+        OnPropertyChanged(nameof(AnyFailedOperations));
+        OnPropertyChanged(nameof(HasIncompleteOperations));
+        OnPropertyChanged(nameof(HasRunningSyncOperations));
+    }
+
+    private void ScheduleMediaScan(
+        FileOperation op,
+        (string DeviceId, string TargetPath) key)
+    {
+        if (!Data.Settings.RescanOnPush
+            || op.Device.Device.AndroidVersion < AdbExplorerConst.MIN_MEDIA_SCAN_ANDROID_VER
+            || !scheduledMediaScans.Add(key))
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(250);
+
+            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+                return;
+
+            var stillPending = await dispatcher.InvokeAsync(() =>
+            {
+                scheduledMediaScans.Remove(key);
+                return pendingPushTargetCounts.GetValueOrDefault(key) > 0;
+            });
+            if (!stillPending)
+                ADBService.AdbDevice.ForceMediaScan(op.Device.Device);
+        });
     }
 }

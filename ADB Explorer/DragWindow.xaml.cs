@@ -14,7 +14,8 @@ public partial class DragWindow : INotifyPropertyChanged
     public event PropertyChangedEventHandler PropertyChanged;
     protected void OnPropertyChanged([CallerMemberName] string propertyName = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
-    private readonly DispatcherTimer DragTimer = new() { Interval = TimeSpan.FromMilliseconds(200) };
+    private static readonly TimeSpan DRAG_TOOLTIP_UPDATE_INTERVAL = TimeSpan.FromMilliseconds(200);
+    private readonly DispatcherTimer DragTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
 
     private HANDLE dragWindowHandle;
 
@@ -32,33 +33,47 @@ public partial class DragWindow : INotifyPropertyChanged
 
     private void DragTimer_Tick(object sender, EventArgs e)
     {
-        if (Data.RuntimeSettings.DragBitmap is not null)
-        {
-            if (imageEmpty)
-                UpdateMouse(InterceptMouse.MousePosition);
+        if (Data.RuntimeSettings.DragBitmap is null)
+            return;
 
+        UpdateMouse(InterceptMouse.MousePosition);
+        if (DateTime.Now - lastTooltipUpdate >= DRAG_TOOLTIP_UPDATE_INTERVAL)
+        {
+            lastTooltipUpdate = DateTime.Now;
             GetPathUnderMouse();
         }
     }
 
-    private DateTime lastUpdate;
-    private bool waitingForUpdate = false;
-    private bool imageEmpty = false;
+    private DateTime lastTooltipUpdate;
     private readonly SolidColorBrush blueBrush = new(Colors.DodgerBlue);
 
-    private async void GetPathUnderMouse()
+    private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        if (waitingForUpdate)
+        if (e.PropertyName != nameof(Data.RuntimeSettings.DragBitmap))
             return;
 
-        if (DateTime.Now - lastUpdate < TimeSpan.FromMilliseconds(50))
-        {
-            waitingForUpdate = true;
-            await Task.Delay(50);
-            waitingForUpdate = false;
-        }
-        lastUpdate = DateTime.Now;
+        if (Dispatcher.CheckAccess())
+            UpdateDragTimerState();
+        else
+            _ = Dispatcher.BeginInvoke(new Action(UpdateDragTimerState));
+    }
 
+    private void UpdateDragTimerState()
+    {
+        if (Data.RuntimeSettings.DragBitmap is null)
+        {
+            DragTimer.Stop();
+            return;
+        }
+
+        lastTooltipUpdate = DateTime.MinValue;
+        UpdateMouse(InterceptMouse.MousePosition);
+        if (Data.RuntimeSettings.DragBitmap is not null)
+            DragTimer.Start();
+    }
+
+    private void GetPathUnderMouse()
+    {
         void updateTooltip()
         {
             DragTooltip.Inlines.Clear();
@@ -220,6 +235,7 @@ public partial class DragWindow : INotifyPropertyChanged
                 GetPathUnderMouse();
             }
         };
+        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
 
         dragWindowHandle = new WindowInteropHelper(this).Handle;
 
@@ -228,10 +244,10 @@ public partial class DragWindow : INotifyPropertyChanged
 #if DEBUG
         MouseWithinApp = true;
 #else
-        InterceptMouse.Init(UpdateMouse, CancelDrag);
+        InterceptMouse.Init(CancelDrag);
 #endif
 
-        DragTimer.Start();
+        UpdateDragTimerState();
     }
 
     private void CancelDrag() => Data.RuntimeSettings.DragBitmap = null;
@@ -243,8 +259,7 @@ public partial class DragWindow : INotifyPropertyChanged
 
         var actualPoint = MonitorInfo.MousePositionToDpi(point, dragWindowHandle);
 
-        imageEmpty = DragImage.ActualHeight < 1;
-        if (!imageEmpty)
+        if (DragImage.ActualHeight >= 1)
         {
             Top = actualPoint.Y - DragImage.ActualHeight - 2;
             Left = actualPoint.X - DragImage.ActualWidth / 2;
@@ -273,6 +288,9 @@ public partial class DragWindow : INotifyPropertyChanged
 
     private void Window_Closing(object sender, CancelEventArgs e)
     {
+        DragTimer.Stop();
+        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+
 #if !DEBUG
         InterceptMouse.Close();
 #endif

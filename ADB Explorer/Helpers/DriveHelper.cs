@@ -13,7 +13,9 @@ internal class DriveHelper
 
     public static void ClearDrives()
     {
-        Data.DevicesObject.Current?.Drives.Clear();
+        var drives = Data.DevicesObject.Current?.Drives;
+        drives?.ForEach(drive => drive.DetachRuntimeSettings());
+        drives?.Clear();
         Data.FileActions.IsDriveViewVisible = false;
     }
 

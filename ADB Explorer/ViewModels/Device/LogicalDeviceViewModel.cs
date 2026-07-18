@@ -7,6 +7,8 @@ namespace ADB_Explorer.ViewModels;
 
 public class LogicalDeviceViewModel : DeviceViewModel
 {
+    private bool runtimeSettingsSubscribed;
+
     #region Full properties
 
     private LogicalDevice device;
@@ -27,8 +29,11 @@ public class LogicalDeviceViewModel : DeviceViewModel
         {
             if (Set(ref isOpen, value) && Root is RootStatus.Enabled)
             {
-                if (!value && Data.Settings.UnrootOnDisconnect is true)
-                    ADBService.Unroot(Device);
+                if (!value && Status is DeviceStatus.Ok && Data.Settings.UnrootOnDisconnect is true)
+                {
+                    var currentDevice = Device;
+                    _ = Task.Run(() => ADBService.Unroot(currentDevice));
+                }
 
                 if (value)
                     Data.RuntimeSettings.IsRootActive = true;
@@ -131,7 +136,7 @@ public class LogicalDeviceViewModel : DeviceViewModel
 
     #endregion
 
-    public LogicalDeviceViewModel(LogicalDevice device) : base(device)
+    public LogicalDeviceViewModel(LogicalDevice device, bool subscribeRuntimeSettings = true) : base(device, subscribeRuntimeSettings)
     {
         DiscoverTime = DateTime.Now;
 
@@ -157,7 +162,37 @@ public class LogicalDeviceViewModel : DeviceViewModel
         SideloadCommand = new(() => Device.Type is DeviceType.Sideload or DeviceType.Recovery && device.Status is DeviceStatus.Ok,
                               () => DeviceHelper.SideloadDeviceAction(this));
 
+        if (subscribeRuntimeSettings)
+        {
+            InitializeDrives();
+            AttachRuntimeSettings();
+        }
+    }
+
+    internal void InitializeDrives() => Device.InitializeDrives();
+
+    internal void AttachRuntimeSettings()
+    {
+        if (runtimeSettingsSubscribed)
+            return;
+
+        AttachBaseRuntimeSettings();
+        Drives.ForEach(drive => drive.AttachRuntimeSettings());
         Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        runtimeSettingsSubscribed = true;
+        IsOpen = Data.RuntimeSettings.DeviceToOpen?.ID == ID;
+    }
+
+    internal void DetachRuntimeSettings()
+    {
+        if (!runtimeSettingsSubscribed)
+            return;
+
+        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+        runtimeSettingsSubscribed = false;
+        DetachBaseRuntimeSettings();
+        Drives.ForEach(drive => drive.DetachRuntimeSettings());
+        IsOpen = false;
     }
 
     private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -224,17 +259,4 @@ public class LogicalDeviceViewModel : DeviceViewModel
         => UpdateDrives(other.Device.Drives.Select(d => d.Drive), dispatcher, asyncClassify);
 
     #endregion
-}
-
-public class LogicalDeviceViewModelEqualityComparer : IEqualityComparer<LogicalDeviceViewModel>
-{
-    public bool Equals(LogicalDeviceViewModel x, LogicalDeviceViewModel y)
-    {
-        return x.ID == y.ID && x.Status == y.Status && x.DeviceData == y.DeviceData;
-    }
-
-    public int GetHashCode([DisallowNull] LogicalDeviceViewModel obj)
-    {
-        return (obj.ID.GetHashCode() + obj.Status.GetHashCode()).GetHashCode();
-    }
 }
