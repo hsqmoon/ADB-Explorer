@@ -588,26 +588,34 @@ public class CopyPasteService : ViewModelBase
                         return;
 
                     var shellItems = shItems.ToArray();
-                    var newDescriptors = shellItems.Select(sh => new FileDescriptor(sh)).ToArray();
-                    var newFiles = shellItems.Select(sh => sh.ParsingName).ToArray();
-                    var isVirtual = shellItems.Length > 0 && !shellItems[0].IsFileSystem;
+                    try
+                    {
+                        var newDescriptors = shellItems.Select(sh => new FileDescriptor(sh)).ToArray();
+                        var newFiles = shellItems.Select(sh => sh.ParsingName).ToArray();
+                        var isVirtual = shellItems.Length > 0 && !shellItems[0].IsFileSystem;
 
-                    _ = App.Current.Dispatcher.BeginInvoke(
-                        new Action(() =>
-                        {
-                            if (!ReferenceEquals(previewDataObject, dataObject))
-                                return;
+                        _ = App.Current.Dispatcher.BeginInvoke(
+                            new Action(() =>
+                            {
+                                if (!ReferenceEquals(previewDataObject, dataObject))
+                                    return;
 
-                            Descriptors = newDescriptors;
-                            DragFiles = newFiles;
-                            CurrentSource &= ~DataSource.Android;
-                            if (isVirtual)
-                                CurrentSource |= DataSource.Virtual;
-                            else
-                                CurrentSource &= ~DataSource.Virtual;
+                                Descriptors = newDescriptors;
+                                DragFiles = newFiles;
+                                CurrentSource &= ~DataSource.Android;
+                                if (isVirtual)
+                                    CurrentSource |= DataSource.Virtual;
+                                else
+                                    CurrentSource &= ~DataSource.Virtual;
 
-                            UpdateUI();
-                        }), DispatcherPriority.Background);
+                                UpdateUI();
+                            }), DispatcherPriority.Background);
+                    }
+                    finally
+                    {
+                        foreach (var shellItem in shellItems)
+                            shellItem.Dispose();
+                    }
                 });
             }
             else
@@ -622,12 +630,20 @@ public class CopyPasteService : ViewModelBase
                 else
                 {
                     var shellItems = shItems.ToArray();
-                    Descriptors = [.. shellItems.Select(sh => new FileDescriptor(sh))];
-                    DragFiles = [.. shellItems.Select(sh => sh.ParsingName)];
+                    try
+                    {
+                        Descriptors = [.. shellItems.Select(sh => new FileDescriptor(sh))];
+                        DragFiles = [.. shellItems.Select(sh => sh.ParsingName)];
 
-                    CurrentSource &= ~DataSource.Android;
-                    if (shellItems.Length > 0 && !shellItems[0].IsFileSystem)
-                        CurrentSource |= DataSource.Virtual;
+                        CurrentSource &= ~DataSource.Android;
+                        if (shellItems.Length > 0 && !shellItems[0].IsFileSystem)
+                            CurrentSource |= DataSource.Virtual;
+                    }
+                    finally
+                    {
+                        foreach (var shellItem in shellItems)
+                            shellItem.Dispose();
+                    }
                 }
             }
         }
@@ -895,50 +911,61 @@ public class CopyPasteService : ViewModelBase
                         using ShellFolder tempDrag = new(tempDragPath);
                         using var shItems = ShellItemArray.FromDataObject(
                             (System.Runtime.InteropServices.ComTypes.IDataObject)dataObject);
+                        if (shItems is null)
+                            return;
 
                         using ShellFileOperations shFileOp = new(NativeMethods.InterceptClipboard.MainWindowHandle);
-                        shItems.ForEach(shia => shFileOp.QueueCopyOperation(shia, tempDrag));
-
-                        ShellItem lastTopItem = null;
-                        ShellItem lastTopSource = null;
-                        shFileOp.PostCopyItem += (s, e) =>
+                        var shellItems = shItems.ToArray();
+                        try
                         {
-                            // Skip non top level items
-                            if (e.DestItem.Parent.ParsingName != tempDragPath)
-                                return;
+                            shellItems.ForEach(shia => shFileOp.QueueCopyOperation(shia, tempDrag));
 
-                            // A new top level item means the previous one is done
-                            if (lastTopItem is not null && lastTopItem.ParsingName != e.DestItem.ParsingName)
+                            ShellItem lastTopItem = null;
+                            ShellItem lastTopSource = null;
+                            shFileOp.PostCopyItem += (s, e) =>
                             {
-                                if (isAppDrive)
+                                // Skip non top level items
+                                if (e.DestItem.Parent.ParsingName != tempDragPath)
+                                    return;
+
+                                // A new top level item means the previous one is done
+                                if (lastTopItem is not null && lastTopItem.ParsingName != e.DestItem.ParsingName)
                                 {
-                                    if (allFilesAreApks)
-                                        ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
+                                    if (isAppDrive)
+                                    {
+                                        if (allFilesAreApks)
+                                            ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
+                                    }
+                                    else
+                                        _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
                                 }
-                                else
-                                    _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
-                            }
 
-                            lastTopItem = e.DestItem;
-                            lastTopSource = e.SourceItem;
-                        };
+                                lastTopItem = e.DestItem;
+                                lastTopSource = e.SourceItem;
+                            };
 
-                        shFileOp.FinishOperations += (s, e) =>
+                            shFileOp.FinishOperations += (s, e) =>
+                            {
+                                // The last item is not caught by the PostCopyItem event
+                                if (lastTopItem is not null)
+                                {
+                                    if (isAppDrive)
+                                    {
+                                        if (allFilesAreApks)
+                                            ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
+                                    }
+                                    else
+                                        _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
+                                }
+                            };
+
+                            shFileOp.PerformOperations();
+                        }
+                        finally
                         {
-                            // The last item is not caught by the PostCopyItem event
-                            if (lastTopItem is not null)
-                            {
-                                if (isAppDrive)
-                                {
-                                    if (allFilesAreApks)
-                                        ShellFileOperation.PushPackages(targetDevice, [lastTopItem.ParsingName], App.Current.Dispatcher);
-                                }
-                                else
-                                    _ = VerifyAndPush(targetFolder, lastTopItem.ParsingName, targetDevice, dropEffect, lastTopSource);
-                            }
-                        };
-
-                        shFileOp.PerformOperations();
+                            foreach (var shellItem in shellItems)
+                                shellItem.Dispose();
+                        }
                     });
                 }
                 // Was supposed to be the main method for zip archives, but Vanara covers that in ShellItemArray.

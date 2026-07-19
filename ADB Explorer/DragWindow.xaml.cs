@@ -36,7 +36,16 @@ public partial class DragWindow : INotifyPropertyChanged
         if (Data.RuntimeSettings.DragBitmap is null)
             return;
 
-        UpdateMouse(InterceptMouse.MousePosition);
+        if (CursorInfo.IsRightButtonPressed)
+        {
+            CancelDrag();
+            return;
+        }
+
+        if (!CursorInfo.TryGetPosition(out var mousePosition))
+            return;
+
+        UpdateMouse(mousePosition);
         if (DateTime.Now - lastTooltipUpdate >= DRAG_TOOLTIP_UPDATE_INTERVAL)
         {
             lastTooltipUpdate = DateTime.Now;
@@ -67,7 +76,8 @@ public partial class DragWindow : INotifyPropertyChanged
         }
 
         lastTooltipUpdate = DateTime.MinValue;
-        UpdateMouse(InterceptMouse.MousePosition);
+        if (CursorInfo.TryGetPosition(out var mousePosition))
+            UpdateMouse(mousePosition);
         if (Data.RuntimeSettings.DragBitmap is not null)
             DragTimer.Start();
     }
@@ -243,8 +253,6 @@ public partial class DragWindow : INotifyPropertyChanged
 
 #if DEBUG
         MouseWithinApp = true;
-#else
-        InterceptMouse.Init(CancelDrag);
 #endif
 
         UpdateDragTimerState();
@@ -265,7 +273,7 @@ public partial class DragWindow : INotifyPropertyChanged
             Left = actualPoint.X - DragImage.ActualWidth / 2;
         }
 
-        hwndUnderMouse = InterceptMouse.GetWindowUnderMouse();
+        hwndUnderMouse = CursorInfo.GetWindowUnderMouse(point);
 
         // Shouldn't happen. But if it does, we don't want to do anything.
         if (hwndUnderMouse == dragWindowHandle)
@@ -290,10 +298,6 @@ public partial class DragWindow : INotifyPropertyChanged
     {
         DragTimer.Stop();
         Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
-
-#if !DEBUG
-        InterceptMouse.Close();
-#endif
     }
 
     private void Border_MouseUp(object sender, MouseButtonEventArgs e)

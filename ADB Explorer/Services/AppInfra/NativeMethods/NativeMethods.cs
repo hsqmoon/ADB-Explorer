@@ -358,25 +358,6 @@ public static partial class NativeMethods
         // Duplicate flags have been omitted
     }
 
-    private enum WinHooks
-    {
-        WH_MSGFILTER = -1,
-        WH_JOURNALRECORD = 0,
-        WH_JOURNALPLAYBACK = 1,
-        WH_KEYBOARD = 2,
-        WH_GETMESSAGE = 3,
-        WH_CALLWNDPROC = 4,
-        WH_CBT = 5,
-        WH_SYSMSGFILTER = 6,
-        WH_MOUSE = 7,
-        WH_DEBUG = 9,
-        WH_SHELL = 10,
-        WH_FOREGROUNDIDLE = 11,
-        WH_CALLWNDPROCRET = 12,
-        WH_KEYBOARD_LL = 13,
-        WH_MOUSE_LL = 14,
-    }
-
     public enum ClipboardNotificationMessage
     {
         WM_ASKCBFORMATNAME = 0x030C,
@@ -390,16 +371,6 @@ public static partial class NativeMethods
         WM_RENDERFORMAT = 0x0305,
         WM_SIZECLIPBOARD = 0x030B,
         WM_VSCROLLCLIPBOARD = 0x030A,
-    }
-
-    public enum MouseMessages
-    {
-        WM_LBUTTONDOWN = 0x0201,
-        WM_LBUTTONUP = 0x0202,
-        WM_MOUSEMOVE = 0x0200,
-        WM_MOUSEWHEEL = 0x020A,
-        WM_RBUTTONDOWN = 0x0204,
-        WM_RBUTTONUP = 0x0205
     }
 
     public enum WindowMessages

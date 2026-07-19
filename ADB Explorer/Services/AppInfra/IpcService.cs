@@ -101,7 +101,7 @@ public class IpcService
     public static void NotifyDropCancel(NativeMethods.HResult hr)
     {
         if (Data.RuntimeSettings.DragWithinSlave)
-            SendIpcMessage(NativeMethods.InterceptMouse.WindowUnderMouse, MessageType.DragCanceled, $"{hr}");
+            SendIpcMessage(NativeMethods.CursorInfo.GetWindowUnderMouse(), MessageType.DragCanceled, $"{hr}");
     }
 
     public static void NotifyFileMoved(int remotePid, ADBService.AdbDevice device, FilePath file)
