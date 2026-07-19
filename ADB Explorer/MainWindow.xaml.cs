@@ -148,6 +148,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateFileOp();
 
         NativeMethods.InterceptClipboard.Init(this, CopyPaste.GetClipboardPasteItems, IpcService.AcceptIpcMessage);
+        App.Current.MainWindow = this;
+        dw.Show();
 
 #if DEBUG
         DeviceHelper.TestDevices();
@@ -160,13 +162,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             launchTask.Wait();
             RuntimeSettings.IsWindowLoaded = true;
-
-            Dispatcher.Invoke(() =>
-            {
-                dw.Show();
-
-                App.Current.MainWindow = this;
-            });
         });
     }
 
@@ -180,6 +175,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         DiskUsageTimer.Start();
 
         SettingsHelper.InitNotifications();
+        NativeMethods.InterceptClipboard.ScheduleClipboardRefresh();
+        ScheduleMainToolBarRefresh();
     }
 
     private void DiskUsageTimer_Tick(object sender, EventArgs e)
@@ -535,7 +532,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void ScheduleMainToolBarRefresh()
     {
-        if (Dispatcher.HasShutdownStarted)
+        if (Dispatcher.HasShutdownStarted || RuntimeSettings.IsSplashScreenVisible)
             return;
 
         if (!Dispatcher.CheckAccess())
@@ -558,7 +555,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 isMainToolBarRefreshScheduled = false;
             }
-        }), DispatcherPriority.Background);
+        }), DispatcherPriority.ApplicationIdle);
     }
 
     private void SettingsSearchBox_FocusChanged(object sender, RoutedEventArgs e)

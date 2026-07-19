@@ -91,6 +91,9 @@ public partial class App : Application
             WriteSettings();
         }
 
+        // Complete the one-time emoji and font parsing before the main window becomes visible.
+        _ = Emoji.Wpf.EmojiData.AllGroups.Count;
+
         //Select the text in a TextBox when it receives focus.
         EventManager.RegisterClassHandler(typeof(TextBox), TextBox.PreviewMouseLeftButtonDownEvent,
             new MouseButtonEventHandler(SelectivelyIgnoreMouseButton));

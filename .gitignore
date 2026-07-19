@@ -362,3 +362,11 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /ADB Explorer/Properties/launchSettings.json
+
+# Local diagnostic capture outputs
+/diagnostics/**/*.dmp
+/diagnostics/**/*.nettrace
+/diagnostics/**/*.etlx
+/diagnostics/**/*.speedscope.json
+/diagnostics/**/*.csv
+/diagnostics/**/pid.txt

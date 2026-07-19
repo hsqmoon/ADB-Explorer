@@ -29,7 +29,6 @@ public static partial class NativeMethods
                 _hwndSource.AddHook(WndProc);
 
                 AddClipboardFormatListener(MainWindowHandle);
-                ScheduleClipboardRefresh();
 
                 window.Loaded -= windowLoadedHandler;
             };
@@ -49,7 +48,7 @@ public static partial class NativeMethods
             Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
         }
 
-        private static void ScheduleClipboardRefresh()
+        public static void ScheduleClipboardRefresh()
         {
             if (_dispatcher is not { HasShutdownStarted: false } dispatcher
                 || Interlocked.Exchange(ref _clipboardRefreshScheduled, 1) == 1)
@@ -63,7 +62,7 @@ public static partial class NativeMethods
                 {
                     Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
                     _externalClipAction?.Invoke();
-                }), DispatcherPriority.ContextIdle);
+                }), DispatcherPriority.ApplicationIdle);
             }
             catch (InvalidOperationException)
             {
@@ -75,7 +74,8 @@ public static partial class NativeMethods
         {
             if ((ClipboardNotificationMessage)msg is ClipboardNotificationMessage.WM_CLIPBOARDUPDATE)
             {
-                ScheduleClipboardRefresh();
+                if (!Data.RuntimeSettings.IsSplashScreenVisible)
+                    ScheduleClipboardRefresh();
                 handled = true;
             }
             else if ((WindowMessages)msg is WindowMessages.WM_COPYDATA)
