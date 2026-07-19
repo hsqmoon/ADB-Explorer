@@ -14,7 +14,6 @@ public partial class ADBService
     private const string ENABLE_MDNS = "ADB_MDNS_OPENSCREEN";
     private const string ADB_SERVER_PORT_ENV = "ANDROID_ADB_SERVER_PORT";
     private const int DEFAULT_ADB_SERVER_PORT = 5037;
-    private const string INTERACTIVE_TERMINAL_COMMAND = "env TERM=xterm-256color COLORTERM=truecolor CLICOLOR=1 CLICOLOR_FORCE=1 TERM_PROGRAM=ADBExplorer sh -i";
     private static readonly TimeSpan ADB_SERVER_RESTART_COOLDOWN = TimeSpan.FromSeconds(3);
     private static readonly object AdbServerDiscoveryLock = new();
     private static readonly object AdbServerRestartLock = new();
@@ -194,44 +193,6 @@ public partial class ADBService
         }
 
         return cmdProcess;
-    }
-
-    public static Process StartInteractiveAdbShellProcess(string deviceId)
-    {
-        EnsureAdbServerPort();
-
-        Process process = new()
-        {
-            StartInfo = new()
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardInputEncoding = Encoding.UTF8,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
-                FileName = RuntimeSettings.AdbPath,
-            },
-            EnableRaisingEvents = true,
-        };
-
-        process.StartInfo.ArgumentList.Add("-s");
-        process.StartInfo.ArgumentList.Add(deviceId);
-        process.StartInfo.ArgumentList.Add("shell");
-        process.StartInfo.ArgumentList.Add("-tt");
-        process.StartInfo.ArgumentList.Add(INTERACTIVE_TERMINAL_COMMAND);
-
-        if (IsMdnsEnabled)
-            process.StartInfo.EnvironmentVariables[ENABLE_MDNS] = "1";
-
-        process.StartInfo.EnvironmentVariables[ADB_SERVER_PORT_ENV] = RuntimeSettings.AdbServerPort.ToString(CultureInfo.InvariantCulture);
-
-        process.Start();
-        Data.AddCommandLog($"[adb-server:{RuntimeSettings.AdbServerPort}] {RuntimeSettings.AdbPath} -s {deviceId} shell -tt {EscapeAdbString(INTERACTIVE_TERMINAL_COMMAND)}");
-
-        return process;
     }
 
     public static int ExecuteCommand(

@@ -6,7 +6,6 @@ using ADB_Explorer.Resources;
 using ADB_Explorer.Services;
 using ADB_Explorer.Services.AppInfra;
 using ADB_Explorer.ViewModels;
-using Microsoft.Web.WebView2.Core;
 using System.Windows.Documents;
 using System.Windows.Markup;
 using System.Xml;
@@ -24,13 +23,6 @@ namespace ADB_Explorer;
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private const int MAX_LOG_TEXT_LENGTH = 200_000;
-    private const int MAX_PENDING_TERMINAL_CHUNKS = 512;
-    private const int WH_KEYBOARD_LL = 13;
-    private const int WM_KEYDOWN = 0x0100;
-    private const int WM_KEYUP = 0x0101;
-    private const int WM_SYSKEYDOWN = 0x0104;
-    private const int WM_SYSKEYUP = 0x0105;
-    private const int VK_CONTROL = 0x11;
 
     private readonly DispatcherTimer ServerWatchdogTimer = new() { Interval = RESPONSE_TIMER_INTERVAL };
     private readonly DispatcherTimer ConnectTimer = new() { Interval = CONNECT_TIMER_INIT };
@@ -62,50 +54,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public string SelectedFilesTotalSize => (SelectedFiles is not null && FileHelper.TotalSize(SelectedFiles) is long size and > 0) ? size.BytesToSize() : "";
     public string SelectedFilesCount => $"{ExplorerGrid.SelectedItems.Count}";
 
-    private bool isTerminalSearchVisible;
-    public bool IsTerminalSearchVisible
-    {
-        get => isTerminalSearchVisible;
-        private set
-        {
-            if (isTerminalSearchVisible == value)
-                return;
-
-            isTerminalSearchVisible = value;
-            OnPropertyChanged(nameof(IsTerminalSearchVisible));
-        }
-    }
-
-    private string terminalSearchQuery = "";
-    public string TerminalSearchQuery
-    {
-        get => terminalSearchQuery;
-        set
-        {
-            value ??= "";
-            if (terminalSearchQuery == value)
-                return;
-
-            terminalSearchQuery = value;
-            OnPropertyChanged(nameof(TerminalSearchQuery));
-            PostTerminalSearchQuery();
-        }
-    }
-
-    private string terminalSearchCountText = "0/0";
-    public string TerminalSearchCountText
-    {
-        get => terminalSearchCountText;
-        private set
-        {
-            if (terminalSearchCountText == value)
-                return;
-
-            terminalSearchCountText = value;
-            OnPropertyChanged(nameof(TerminalSearchCountText));
-        }
-    }
-
     private string prevPath = "";
 
     /// <summary>
@@ -122,13 +70,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private DateTime appDataClick;
     private readonly DragWindow dw = new();
     private readonly Queue<Log> pendingLogEntries = new();
-    private readonly Queue<string> pendingTerminalChunks = new();
-    private readonly HashSet<Key> activeTerminalShortcutKeys = [];
     private readonly object pendingLogEntriesLock = new();
-    private const string TERMINAL_HOST_NAME = "terminal.adb-explorer.invalid";
-    private bool isTerminalWebViewInitialized;
-    private bool isTerminalPageReady;
-    private bool isTerminalFocused;
     private bool isDeviceFilterRefreshScheduled;
     private bool isExplorerContextMenuRefreshScheduled;
     private bool isFileOpControlsRefreshScheduled;
@@ -137,46 +79,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private int fileOpViewRefreshScheduled;
     private bool rebuildLogRequested;
     private bool isSettingsControlsRefreshScheduled;
-    private bool terminalShortcutArmed;
-    private string terminalSelectionCache = "";
-    private string TerminalHostFolder => Path.Combine(AppContext.BaseDirectory, "Assets", "Terminal");
-    private string TerminalHostPath => Path.Combine(TerminalHostFolder, "index.html");
-    private Uri TerminalHostUri => new($"https://{TERMINAL_HOST_NAME}/index.html");
-    private readonly LowLevelKeyboardProc keyboardHookProc;
-    private IntPtr keyboardHookHandle;
-
-    [DllImport("user32.dll")]
-    private static extern short GetKeyState(int nVirtKey);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    private static extern IntPtr GetModuleHandle(string lpModuleName);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct KbdLlHookStruct
-    {
-        public uint vkCode;
-        public uint scanCode;
-        public uint flags;
-        public uint time;
-        public IntPtr dwExtraInfo;
-    }
-
-    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     private bool IsInEditMode
     {
@@ -209,18 +111,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public MainWindow()
     {
         InitializeComponent();
-        keyboardHookProc = KeyboardHookCallback;
 
         KeyDown += new KeyEventHandler(OnButtonKeyDown);
         PreviewTextInput += new TextCompositionEventHandler(MainWindow_PreviewTextInput);
-        Terminal.OutputChunkReceived += Terminal_OutputChunkReceived;
-        Terminal.Cleared += Terminal_Cleared;
-        TerminalWebView.GotFocus += TerminalWebView_GotFocus;
-        TerminalWebView.LostFocus += TerminalWebView_LostFocus;
-        TerminalWebView.PreviewMouseDown += TerminalWebView_PreviewMouseDown;
-        TerminalWebView.PreviewMouseUp += TerminalWebView_PreviewMouseUp;
-        TerminalWebView.NavigationCompleted += TerminalWebView_NavigationCompleted;
-        TerminalWebView.PreviewKeyDown += TerminalWebView_PreviewKeyDown;
 
         DevicesObject = new();
         DevicesList.ItemsSource = DevicesObject.UIList;
@@ -485,21 +378,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
                 case nameof(AppRuntimeSettings.IsTerminalOpen):
                     if (RuntimeSettings.IsTerminalOpen)
-                    {
-                        Terminal.EnableMainDeviceFollow();
-                        _ = EnsureTerminalWebViewReadyAsync();
-                        _ = Terminal.EnsureConnectedToCurrentDeviceAsync();
-                        _ = Dispatcher.BeginInvoke(FocusTerminalInput);
-                    }
+                        _ = TerminalControl.OpenAsync(CurrentTerminalDeviceId);
                     else
-                    {
-                        CloseTerminalSearch(clearQuery: false, focusTerminal: false);
-                    }
+                        _ = TerminalControl.CloseAsync();
                     break;
 
                 case nameof(AppRuntimeSettings.CurrentDevice):
-                    if (Terminal.IsFollowingMainDevice)
-                        _ = Terminal.EnsureConnectedToCurrentDeviceAsync();
+                    if (RuntimeSettings.IsTerminalOpen)
+                        _ = TerminalControl.SetDeviceAsync(CurrentTerminalDeviceId);
                     break;
 
                 case nameof(AppRuntimeSettings.AutoHideSearchBox):
@@ -1058,10 +944,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void Window_Closing(object sender, CancelEventArgs e)
     {
-        ComponentDispatcher.ThreadPreprocessMessage -= ComponentDispatcher_ThreadPreprocessMessage;
-        RemoveKeyboardHook();
         DirList?.Stop();
-        Terminal.Shutdown();
+        TerminalControl.Shutdown();
 
         dw.Close();
         NativeMethods.InterceptClipboard.Close();
@@ -1070,20 +954,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ServerWatchdogTimer.Stop();
         DiskUsageTimer.Stop();
         StoreClosingValues();
-    }
-
-    protected override void OnActivated(EventArgs e)
-    {
-        base.OnActivated(e);
-        LogTerminalUiDiagnostic("window.activated", $"armed={terminalShortcutArmed}; focused={IsTerminalFocused()}");
-    }
-
-    protected override void OnDeactivated(EventArgs e)
-    {
-        base.OnDeactivated(e);
-        terminalShortcutArmed = false;
-        activeTerminalShortcutKeys.Clear();
-        LogTerminalUiDiagnostic("window.deactivated", $"armed={terminalShortcutArmed}");
     }
 
     private void StoreClosingValues()
@@ -2311,8 +2181,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void Window_SourceInitialized(object sender, EventArgs e)
     {
-        ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
-        InstallKeyboardHook();
         _ = TryRestoreWindowBounds();
 
         if (Storage.RetrieveBool(AppSettings.SystemVals.windowMaximized) == true)
@@ -3014,660 +2882,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FlyoutBase.ShowAttachedFlyout(menuitem);
     }
 
-    private bool IsTerminalFocused()
-    {
-        return RuntimeSettings.IsTerminalOpen
-               && !(TerminalSearchTextBox?.IsKeyboardFocusWithin ?? false)
-               && (isTerminalFocused || TerminalWebView.IsFocused || TerminalWebView.IsKeyboardFocusWithin);
-    }
-
-    private bool IsTerminalShortcutContextActive()
-    {
-        if (!RuntimeSettings.IsTerminalOpen || !terminalShortcutArmed)
-            return false;
-
-        if (!IsActive)
-            return false;
-
-        IntPtr foregroundWindow = GetForegroundWindow();
-        if (new WindowInteropHelper(this).Handle != foregroundWindow)
-            return false;
-
-        return !SearchBox.IsFocused
-               && NavigationBox.Mode is not NavigationBox.ViewMode.Path
-               && !FileActions.IsExplorerEditing;
-    }
-
-    private static void LogTerminalUiDiagnostic(string eventName, string details)
-    {
-        _ = eventName;
-        _ = details;
-    }
-
-    private void EnqueuePendingTerminalChunk(string chunk)
-    {
-        if (string.IsNullOrEmpty(chunk))
-            return;
-
-        pendingTerminalChunks.Enqueue(chunk);
-
-        while (pendingTerminalChunks.Count > MAX_PENDING_TERMINAL_CHUNKS)
-            pendingTerminalChunks.Dequeue();
-    }
-
-    private void InstallKeyboardHook()
-    {
-        if (keyboardHookHandle != IntPtr.Zero)
-            return;
-
-        try
-        {
-            using Process currentProcess = Process.GetCurrentProcess();
-            using ProcessModule mainModule = currentProcess.MainModule;
-            IntPtr moduleHandle = mainModule is null ? IntPtr.Zero : GetModuleHandle(mainModule.ModuleName);
-            keyboardHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, keyboardHookProc, moduleHandle, 0);
-            LogTerminalUiDiagnostic("keyboard_hook.install", $"ok={keyboardHookHandle != IntPtr.Zero}; handle={keyboardHookHandle}");
-        }
-        catch (Exception ex)
-        {
-            LogTerminalUiDiagnostic("keyboard_hook.install.failed", ex.Message);
-        }
-    }
-
-    private void RemoveKeyboardHook()
-    {
-        if (keyboardHookHandle == IntPtr.Zero)
-            return;
-
-        try
-        {
-            _ = UnhookWindowsHookEx(keyboardHookHandle);
-            LogTerminalUiDiagnostic("keyboard_hook.remove", $"handle={keyboardHookHandle}");
-        }
-        catch (Exception ex)
-        {
-            LogTerminalUiDiagnostic("keyboard_hook.remove.failed", ex.Message);
-        }
-        finally
-        {
-            keyboardHookHandle = IntPtr.Zero;
-            activeTerminalShortcutKeys.Clear();
-        }
-    }
-
-    private async Task EnsureTerminalWebViewReadyAsync()
-    {
-        if (!IsLoaded || TerminalWebView is null)
-            return;
-
-        if (!File.Exists(TerminalHostPath))
-        {
-            AddCommandLog($"terminal.webview host file missing: {TerminalHostPath}");
-            return;
-        }
-
-        try
-        {
-            if (TerminalWebView.CoreWebView2 is null)
-                await TerminalWebView.EnsureCoreWebView2Async();
-
-            ConfigureTerminalWebView();
-
-            if (TerminalWebView.Source is null
-                || !string.Equals(TerminalWebView.Source.AbsoluteUri, TerminalHostUri.AbsoluteUri, StringComparison.OrdinalIgnoreCase))
-            {
-                isTerminalPageReady = false;
-                TerminalWebView.Source = TerminalHostUri;
-            }
-        }
-        catch (Exception ex)
-        {
-            AddCommandLog($"terminal.webview init failed: {ex.Message}");
-        }
-    }
-
-    private void ConfigureTerminalWebView()
-    {
-        if (isTerminalWebViewInitialized || TerminalWebView.CoreWebView2 is null)
-            return;
-
-        CoreWebView2Settings settings = TerminalWebView.CoreWebView2.Settings;
-        settings.AreBrowserAcceleratorKeysEnabled = false;
-        settings.AreDefaultContextMenusEnabled = true;
-        settings.AreDefaultScriptDialogsEnabled = false;
-        settings.AreDevToolsEnabled = true;
-        settings.IsStatusBarEnabled = false;
-        settings.IsZoomControlEnabled = false;
-
-        TerminalWebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
-            TERMINAL_HOST_NAME,
-            TerminalHostFolder,
-            CoreWebView2HostResourceAccessKind.DenyCors);
-
-        TerminalWebView.CoreWebView2.WebMessageReceived += TerminalWebView_WebMessageReceived;
-        isTerminalWebViewInitialized = true;
-    }
-
-    private void PostTerminalMessage(object message)
-    {
-        if (!isTerminalPageReady || TerminalWebView.CoreWebView2 is null)
-            return;
-
-        TerminalWebView.CoreWebView2.PostWebMessageAsJson(JsonConvert.SerializeObject(message));
-    }
-
-    private void FlushPendingTerminalOutput()
-    {
-        if (!isTerminalPageReady)
-            return;
-
-        if (pendingTerminalChunks.Count == 0)
-        {
-            if (!string.IsNullOrEmpty(Terminal.OutputText))
-                PostTerminalMessage(new { type = "write", data = Terminal.OutputText });
-
-            return;
-        }
-
-        while (pendingTerminalChunks.Count > 0)
-            PostTerminalMessage(new { type = "write", data = pendingTerminalChunks.Dequeue() });
-    }
-
-    private void Terminal_OutputChunkReceived(string chunk, bool isError)
-    {
-        if (string.IsNullOrEmpty(chunk))
-            return;
-
-        if (!isTerminalPageReady)
-        {
-            EnqueuePendingTerminalChunk(chunk);
-            return;
-        }
-
-        PostTerminalMessage(new { type = "write", data = chunk });
-    }
-
-    private void Terminal_Cleared()
-    {
-        pendingTerminalChunks.Clear();
-        terminalSelectionCache = "";
-        IsTerminalSearchVisible = false;
-        TerminalSearchCountText = "0/0";
-
-        if (isTerminalPageReady)
-            PostTerminalMessage(new { type = "clear" });
-    }
-
-    private void TerminalWebView_GotFocus(object sender, RoutedEventArgs e)
-    {
-        isTerminalFocused = true;
-        LogTerminalUiDiagnostic("focus.got", $"focused={IsTerminalFocused()}");
-    }
-
-    private void TerminalWebView_LostFocus(object sender, RoutedEventArgs e)
-    {
-        isTerminalFocused = false;
-        LogTerminalUiDiagnostic("focus.lost", $"focused={IsTerminalFocused()}");
-    }
-
-    private void TerminalWebView_PreviewMouseDown(object sender, MouseButtonEventArgs e)
-    {
-        terminalShortcutArmed = true;
-        isTerminalFocused = true;
-
-        LogTerminalUiDiagnostic("mouse.down", $"focused={IsTerminalFocused()}; armed={terminalShortcutArmed}; searchVisible={IsTerminalSearchVisible}; searchBoxFocused={TerminalSearchTextBox?.IsKeyboardFocusWithin == true}");
-    }
-
-    private void TerminalWebView_PreviewMouseUp(object sender, MouseButtonEventArgs e)
-    {
-        terminalShortcutArmed = true;
-        isTerminalFocused = true;
-
-        LogTerminalUiDiagnostic("mouse.up", $"focused={IsTerminalFocused()}; armed={terminalShortcutArmed}; searchVisible={IsTerminalSearchVisible}; searchBoxFocused={TerminalSearchTextBox?.IsKeyboardFocusWithin == true}");
-
-        if (!(TerminalSearchTextBox?.IsKeyboardFocusWithin ?? false))
-            _ = Dispatcher.BeginInvoke(async () => await FocusTerminalInputAsync(), DispatcherPriority.Input);
-    }
-
-    private void TerminalWebView_NavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
-    {
-        if (e.IsSuccess)
-            return;
-
-        isTerminalPageReady = false;
-        AddCommandLog($"terminal.webview navigation failed: {e.WebErrorStatus}");
-    }
-
-    private async void TerminalWebView_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        if (e.Key is Key.C or Key.V or Key.L or Key.F)
-            LogTerminalUiDiagnostic("keydown", $"key={e.Key}; modifiers={Keyboard.Modifiers}; focused={IsTerminalFocused()}");
-
-        if (Keyboard.Modifiers == ModifierKeys.Control && e.Key is Key.F)
-        {
-            e.Handled = true;
-            OpenTerminalSearch();
-            return;
-        }
-
-        if (Keyboard.Modifiers != ModifierKeys.Control)
-            return;
-
-        switch (e.Key)
-        {
-            case Key.C:
-                e.Handled = true;
-                var selectedText = terminalSelectionCache;
-                if (!string.IsNullOrEmpty(selectedText))
-                    Clipboard.SetText(selectedText);
-                else
-                    await Terminal.InterruptAsync();
-
-                break;
-
-            case Key.V:
-                e.Handled = true;
-                if (Clipboard.ContainsText())
-                {
-                    var pasteText = Clipboard.GetText()
-                        .Replace("\r\n", "\n", StringComparison.Ordinal)
-                        .Replace("\r", "\n", StringComparison.Ordinal);
-
-                    if (!string.IsNullOrEmpty(pasteText))
-                        await Terminal.SendLiteralAsync(pasteText);
-                }
-
-                break;
-
-            case Key.L:
-                e.Handled = true;
-                Terminal.Clear();
-                break;
-        }
-    }
-
-    private void ComponentDispatcher_ThreadPreprocessMessage(ref MSG msg, ref bool handled)
-    {
-        if (handled || !IsTerminalFocused())
-            return;
-
-        if (msg.message is not WM_KEYDOWN and not WM_SYSKEYDOWN)
-            return;
-
-        if ((GetKeyState(VK_CONTROL) & 0x8000) == 0)
-            return;
-
-        Key key = KeyInterop.KeyFromVirtualKey((int)msg.wParam);
-        if (key is not (Key.C or Key.V or Key.L))
-            return;
-
-        handled = true;
-        LogTerminalUiDiagnostic("thread_preprocess.suppress", $"key={key}; msg=0x{msg.message:X}; focused={IsTerminalFocused()}");
-    }
-
-    private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        if (nCode < 0 || lParam == IntPtr.Zero)
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        int message = unchecked((int)wParam);
-        if (message is not WM_KEYDOWN and not WM_SYSKEYDOWN and not WM_KEYUP and not WM_SYSKEYUP)
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        var info = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
-        Key key = KeyInterop.KeyFromVirtualKey((int)info.vkCode);
-        if (key is not (Key.C or Key.V or Key.L or Key.F))
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        if (!IsTerminalShortcutContextActive())
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool shiftPressed = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
-        bool isKeyUp = message is WM_KEYUP or WM_SYSKEYUP;
-
-        if (!ctrlPressed && !isKeyUp)
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        if (key is Key.F && shiftPressed && !isKeyUp)
-            return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
-
-        if (isKeyUp)
-        {
-            activeTerminalShortcutKeys.Remove(key);
-            LogTerminalUiDiagnostic("keyboard_hook.keyup", $"key={key}; armed={terminalShortcutArmed}");
-            return (IntPtr)1;
-        }
-
-        if (!activeTerminalShortcutKeys.Add(key))
-            return (IntPtr)1;
-
-        LogTerminalUiDiagnostic("keyboard_hook.keydown", $"key={key}; armed={terminalShortcutArmed}; focused={IsTerminalFocused()}");
-        _ = Dispatcher.BeginInvoke(new Action(() => _ = HandleTerminalShortcutAsync(key)));
-
-        return (IntPtr)1;
-    }
-
-    private async Task HandleTerminalShortcutAsync(Key key)
-    {
-        try
-        {
-            switch (key)
-            {
-                case Key.C:
-                    if (!string.IsNullOrEmpty(terminalSelectionCache))
-                        await TrySetClipboardTextAsync(terminalSelectionCache);
-                    else
-                        await Terminal.InterruptAsync();
-                    break;
-
-                case Key.V:
-                    var pasteText = TryGetClipboardText()
-                        ?.Replace("\r\n", "\n", StringComparison.Ordinal)
-                        .Replace("\r", "\n", StringComparison.Ordinal);
-
-                    if (!string.IsNullOrEmpty(pasteText))
-                        await Terminal.SendLiteralAsync(pasteText);
-                    break;
-
-                case Key.L:
-                    Terminal.Clear();
-                    break;
-
-                case Key.F:
-                    OpenTerminalSearch();
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            LogTerminalUiDiagnostic("shortcut.failed", $"key={key}; ex={ex.GetType().Name}; msg={ex.Message}");
-        }
-    }
-
-    private static string TryGetClipboardText()
-    {
-        try
-        {
-            return Clipboard.ContainsText() ? Clipboard.GetText() : "";
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private async Task TrySetClipboardTextAsync(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return;
-
-        const int maxAttempts = 2;
-
-        for (int attempt = 1; attempt <= maxAttempts; attempt++)
-        {
-            try
-            {
-                Clipboard.SetDataObject(text, false);
-                return;
-            }
-            catch (COMException ex) when ((uint)ex.HResult == 0x800401D0)
-            {
-                LogTerminalUiDiagnostic("clipboard.retry", $"attempt={attempt}; hr=0x{ex.HResult:X8}");
-                await Task.Delay(20 * attempt);
-            }
-        }
-
-        LogTerminalUiDiagnostic("clipboard.giveup", $"len={text.Length}");
-    }
-
-    private async void TerminalWebView_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
-    {
-        try
-        {
-            var payload = JToken.Parse(e.WebMessageAsJson);
-            if (payload is not JObject message)
-                return;
-
-            switch ((string)message["type"])
-            {
-                case "ready":
-                    isTerminalPageReady = true;
-                    LogTerminalUiDiagnostic("web.ready", $"focused={IsTerminalFocused()}");
-                    FlushPendingTerminalOutput();
-                    if (RuntimeSettings.IsTerminalOpen)
-                        await FocusTerminalInputAsync();
-                    break;
-
-                case "input":
-                case "inputBinary":
-                    var input = ((string)message["data"] ?? "")
-                        .Replace("\r\n", "\n", StringComparison.Ordinal)
-                        .Replace("\r", "\n", StringComparison.Ordinal);
-                    await Terminal.SendLiteralAsync(input);
-                    break;
-
-                case "interrupt":
-                    await Terminal.InterruptAsync();
-                    break;
-
-                case "clear":
-                    Terminal.Clear();
-                    break;
-
-                case "copy":
-                    var copiedText = (string)message["data"] ?? "";
-                    if (!string.IsNullOrEmpty(copiedText))
-                        await TrySetClipboardTextAsync(copiedText);
-                    break;
-
-                case "selection":
-                    terminalSelectionCache = (string)message["data"] ?? "";
-                    break;
-
-                case "search_results":
-                    int total = message["total"]?.Value<int>() ?? 0;
-                    int current = message["current"]?.Value<int>() ?? 0;
-                    TerminalSearchCountText = total <= 0
-                        ? "0/0"
-                        : $"{current}/{total}";
-                    LogTerminalUiDiagnostic("web.search_results", $"current={current}; total={total}");
-                    break;
-
-                case "request_search":
-                    var requestedSearch = (string)message["data"] ?? "";
-                    if (!string.IsNullOrWhiteSpace(requestedSearch) && requestedSearch.IndexOf('\n') < 0)
-                        TerminalSearchQuery = requestedSearch;
-
-                    OpenTerminalSearch();
-                    break;
-
-                case "paste":
-                    var pasteText = TryGetClipboardText()
-                        ?.Replace("\r\n", "\n", StringComparison.Ordinal)
-                        .Replace("\r", "\n", StringComparison.Ordinal);
-
-                    if (!string.IsNullOrEmpty(pasteText))
-                        await Terminal.SendLiteralAsync(pasteText);
-                    break;
-
-                case "paste_data":
-                    var pastedData = ((string)message["data"] ?? "")
-                        .Replace("\r\n", "\n", StringComparison.Ordinal)
-                        .Replace("\r", "\n", StringComparison.Ordinal);
-                    if (!string.IsNullOrEmpty(pastedData))
-                        await Terminal.SendLiteralAsync(pastedData);
-                    break;
-
-                case "open_external":
-                    OpenTerminalExternalLink((string)message["data"] ?? "");
-                    break;
-
-                case "log":
-                    LogTerminalUiDiagnostic("web.message.log", (string)message["data"] ?? "");
-                    break;
-
-                case "focus_state":
-                    isTerminalFocused = message["focused"]?.Value<bool>() == true;
-                    LogTerminalUiDiagnostic("web.focus_state", $"focused={isTerminalFocused}");
-                    break;
-
-                case "resize":
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            AddCommandLog($"terminal.webview message failed: {ex.Message}");
-        }
-    }
-
-    private async void TerminalInterrupt_Click(object sender, RoutedEventArgs e)
-    {
-        await Terminal.InterruptAsync();
-        FocusTerminalInput();
-    }
-
-    private async void TerminalFind_Click(object sender, RoutedEventArgs e)
-    {
-        await OpenTerminalSearchAsync();
-    }
-
-    private void TerminalSearchPrev_Click(object sender, RoutedEventArgs e)
-    {
-        NavigateTerminalSearch(previous: true);
-    }
-
-    private void TerminalSearchNext_Click(object sender, RoutedEventArgs e)
-    {
-        NavigateTerminalSearch(previous: false);
-    }
-
-    private void TerminalSearchClose_Click(object sender, RoutedEventArgs e)
-    {
-        CloseTerminalSearch();
-    }
-
-    private void TerminalSearchTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        switch (e.Key)
-        {
-            case Key.Enter:
-                e.Handled = true;
-                NavigateTerminalSearch(previous: Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
-                break;
-
-            case Key.Escape:
-                e.Handled = true;
-                CloseTerminalSearch();
-                break;
-
-            case Key.F3:
-                e.Handled = true;
-                NavigateTerminalSearch(previous: Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
-                break;
-        }
-    }
-
-    private void TerminalClear_Click(object sender, RoutedEventArgs e)
-    {
-        Terminal.Clear();
-        FocusTerminalInput();
-    }
-
-    private async Task FocusTerminalInputAsync()
-    {
-        if (!IsLoaded)
-            return;
-
-        await EnsureTerminalWebViewReadyAsync();
-        terminalShortcutArmed = true;
-        isTerminalFocused = true;
-        TerminalWebView.Focus();
-        PostTerminalMessage(new { type = "focus" });
-        LogTerminalUiDiagnostic("focus.request", $"focused={IsTerminalFocused()}; armed={terminalShortcutArmed}");
-    }
-
-    private void FocusTerminalInput()
-    {
-        _ = FocusTerminalInputAsync();
-    }
-
-    private void OpenTerminalSearch()
-    {
-        _ = OpenTerminalSearchAsync();
-    }
-
-    private async Task OpenTerminalSearchAsync()
-    {
-        if (!IsLoaded)
-            return;
-
-        await EnsureTerminalWebViewReadyAsync();
-        IsTerminalSearchVisible = true;
-        terminalShortcutArmed = true;
-        isTerminalFocused = false;
-        PostTerminalSearchQuery();
-        LogTerminalUiDiagnostic("search.request", $"focused={IsTerminalFocused()}; armed={terminalShortcutArmed}; queryLen={TerminalSearchQuery.Length}");
-        await Dispatcher.BeginInvoke(() =>
-        {
-            TerminalSearchTextBox.Focus();
-            TerminalSearchTextBox.SelectAll();
-        }, DispatcherPriority.Input);
-    }
-
-    private void PostTerminalSearchQuery()
-    {
-        if (!isTerminalPageReady)
-            return;
-
-        PostTerminalMessage(new { type = "search.set", data = TerminalSearchQuery ?? "" });
-    }
-
-    private void NavigateTerminalSearch(bool previous)
-    {
-        if (!isTerminalPageReady)
-            return;
-
-        PostTerminalMessage(new { type = previous ? "search.prev" : "search.next" });
-    }
-
-    private void CloseTerminalSearch(bool clearQuery = true, bool focusTerminal = true)
-    {
-        IsTerminalSearchVisible = false;
-        TerminalSearchCountText = "0/0";
-
-        if (clearQuery)
-            TerminalSearchQuery = "";
-
-        if (isTerminalPageReady)
-            PostTerminalMessage(new { type = "search.close" });
-
-        if (focusTerminal)
-            FocusTerminalInput();
-    }
-
-    private void OpenTerminalExternalLink(string url)
-    {
-        if (string.IsNullOrWhiteSpace(url)
-            || !Uri.TryCreate(url, UriKind.Absolute, out Uri uri)
-            || (uri.Scheme != Uri.UriSchemeHttp
-                && uri.Scheme != Uri.UriSchemeHttps
-                && uri.Scheme != Uri.UriSchemeFtp))
-        {
-            return;
-        }
-
-        try
-        {
-            if (!string.IsNullOrWhiteSpace(RuntimeSettings.DefaultBrowserPath))
-                Process.Start(RuntimeSettings.DefaultBrowserPath, $"\"{uri.AbsoluteUri}\"");
-            else
-                Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
-        }
-        catch (Exception ex)
-        {
-            LogTerminalUiDiagnostic("open_external.failed", $"{uri.AbsoluteUri}; ex={ex.GetType().Name}; msg={ex.Message}");
-        }
-    }
+    private static string CurrentTerminalDeviceId => DevicesObject.Current?.Status is AbstractDevice.DeviceStatus.Ok
+        ? DevicesObject.Current.ID
+        : "";
+
+    private bool IsTerminalFocused() => TerminalControl.IsTerminalFocused;
 }

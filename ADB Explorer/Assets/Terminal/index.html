@@ -2,71 +2,53 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ADB Explorer Terminal</title>
+    <link rel="stylesheet" href="./vendor/xterm.css" />
     <style>
         :root {
             color-scheme: dark;
+            font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
         }
 
-        html, body {
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body,
+        #workspace,
+        #terminal {
             width: 100%;
             height: 100%;
             margin: 0;
             overflow: hidden;
-            background: #111111;
-            color: #f5f5f5;
-            font-family: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
-        }
-
-        body {
-            display: flex;
-            flex-direction: column;
-        }
-
-        #status {
-            padding: 8px 10px;
-            font-size: 12px;
-            line-height: 1.4;
-            color: #d6d6d6;
-            background: #1b1b1b;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            white-space: pre-wrap;
-        }
-
-        #status.hidden {
-            display: none;
+            background: #0c0c0c;
         }
 
         #workspace {
             position: relative;
-            flex: 1;
-            min-height: 0;
-            overflow: hidden;
+            padding: 4px;
         }
 
-        #terminal {
-            width: 100%;
-            height: 100%;
-            padding: 6px 8px;
-            box-sizing: border-box;
+        #terminal .xterm-viewport {
+            scrollbar-color: #666 #1b1b1b;
+            scrollbar-width: thin;
         }
 
         #search-panel {
             position: absolute;
-            top: 12px;
-            right: 14px;
-            z-index: 50;
+            z-index: 20;
+            top: 10px;
+            right: 18px;
             display: none;
             align-items: center;
-            gap: 6px;
-            max-width: calc(100% - 28px);
-            padding: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 10px;
-            background: rgba(26, 26, 26, 0.96);
-            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
-            backdrop-filter: blur(8px);
+            gap: 5px;
+            padding: 6px;
+            border: 1px solid #454545;
+            border-radius: 6px;
+            background: #252526;
+            box-shadow: 0 5px 18px rgb(0 0 0 / 45%);
         }
 
         #search-panel.visible {
@@ -74,768 +56,520 @@
         }
 
         #search-input {
-            width: 240px;
-            max-width: 45vw;
-            padding: 6px 8px;
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 6px;
-            background: #151515;
-            color: #f5f5f5;
+            width: 230px;
+            padding: 5px 8px;
+            border: 1px solid #555;
+            border-radius: 4px;
             outline: none;
-            font: inherit;
+            color: #f3f3f3;
+            background: #1e1e1e;
+            font: 12px "Segoe UI", sans-serif;
         }
 
         #search-input:focus {
-            border-color: rgba(59, 142, 234, 0.9);
-            box-shadow: 0 0 0 1px rgba(59, 142, 234, 0.35);
+            border-color: #007acc;
         }
 
         #search-count {
-            min-width: 56px;
-            color: rgba(255, 255, 255, 0.72);
-            font-size: 12px;
+            min-width: 44px;
+            color: #cfcfcf;
             text-align: center;
-            user-select: none;
+            font: 11px "Segoe UI", sans-serif;
         }
 
-        .terminal-action {
-            padding: 6px 9px;
-            border: 1px solid rgba(255, 255, 255, 0.14);
-            border-radius: 6px;
-            background: #202020;
-            color: #f5f5f5;
+        .action {
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            color: #ddd;
+            background: transparent;
             cursor: pointer;
-            font: inherit;
-            line-height: 1;
         }
 
-        .terminal-action:hover {
-            background: #2b2b2b;
+        .action:hover {
+            border-color: #555;
+            background: #37373d;
         }
 
-        .terminal-action:active {
-            background: #343434;
+        #status,
+        #toast {
+            position: absolute;
+            z-index: 30;
+            pointer-events: none;
+            color: #ddd;
+            background: rgb(24 24 24 / 90%);
+            font: 12px "Segoe UI", sans-serif;
+        }
+
+        #status {
+            inset: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            white-space: pre-wrap;
+        }
+
+        #status.hidden,
+        #toast.hidden {
+            display: none;
+        }
+
+        #status.error {
+            color: #f48771;
         }
 
         #toast {
-            position: absolute;
-            right: 14px;
+            right: 18px;
             bottom: 14px;
-            z-index: 45;
-            max-width: min(360px, calc(100% - 28px));
-            padding: 8px 12px;
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 8px;
-            background: rgba(26, 26, 26, 0.94);
-            color: rgba(255, 255, 255, 0.92);
-            font-size: 12px;
-            line-height: 1.4;
-            opacity: 0;
-            transform: translateY(10px);
-            pointer-events: none;
-            transition: opacity 0.16s ease, transform 0.16s ease;
-            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.32);
-        }
-
-        #toast.visible {
-            opacity: 1;
-            transform: translateY(0);
-        }
-
-        .xterm-viewport::-webkit-scrollbar {
-            width: 12px;
-            height: 12px;
-        }
-
-        .xterm-viewport::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.22);
-            border-radius: 999px;
-        }
-
-        .xterm-viewport::-webkit-scrollbar-track {
-            background: transparent;
+            padding: 6px 10px;
+            border-radius: 4px;
         }
     </style>
 </head>
 <body>
-    <div id="status">Loading terminal...</div>
-    <div id="workspace">
+    <main id="workspace">
         <div id="terminal"></div>
         <div id="search-panel" aria-label="Terminal search">
-            <input id="search-input" type="text" placeholder="Find in terminal" spellcheck="false" />
+            <input id="search-input" type="text" placeholder="Find" spellcheck="false" />
             <span id="search-count">0/0</span>
-            <button id="search-prev" class="terminal-action" type="button" title="Previous match (Shift+Enter)">↑</button>
-            <button id="search-next" class="terminal-action" type="button" title="Next match (Enter)">↓</button>
-            <button id="search-close" class="terminal-action" type="button" title="Close (Esc)">✕</button>
+            <button id="search-previous" class="action" type="button" title="Previous match (Shift+Enter)">↑</button>
+            <button id="search-next" class="action" type="button" title="Next match (Enter)">↓</button>
+            <button id="search-close" class="action" type="button" title="Close (Esc)">✕</button>
         </div>
-        <div id="toast" aria-live="polite"></div>
-    </div>
+        <div id="status">Starting terminal renderer...</div>
+        <div id="toast" class="hidden"></div>
+    </main>
 
+    <script src="./vendor/xterm.js"></script>
+    <script src="./vendor/addon-fit.js"></script>
+    <script src="./vendor/addon-search.js"></script>
+    <script src="./vendor/addon-unicode11.js"></script>
+    <script src="./vendor/addon-web-links.js"></script>
+    <script src="./vendor/addon-webgl.js"></script>
     <script>
-        const host = window.chrome && window.chrome.webview;
-        const statusElement = document.getElementById('status');
-        const workspaceElement = document.getElementById('workspace');
+        'use strict';
+
+        const host = window.chrome?.webview;
+        const workspace = document.getElementById('workspace');
         const terminalElement = document.getElementById('terminal');
         const searchPanel = document.getElementById('search-panel');
         const searchInput = document.getElementById('search-input');
         const searchCount = document.getElementById('search-count');
-        const searchPrevButton = document.getElementById('search-prev');
-        const searchNextButton = document.getElementById('search-next');
-        const searchCloseButton = document.getElementById('search-close');
+        const statusElement = document.getElementById('status');
         const toastElement = document.getElementById('toast');
-        const DEFAULT_FONT_SIZE = 13;
-        const MIN_FONT_SIZE = 11;
-        const MAX_FONT_SIZE = 28;
-        const URL_REGEX = /\b((?:https?|ftp):\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+)/gi;
+        const DEFAULT_FONT_SIZE = 14;
+        const MIN_FONT_SIZE = 9;
+        const MAX_FONT_SIZE = 30;
+        const INPUT_CHUNK_SIZE = 4096;
+        let currentFontSize = DEFAULT_FONT_SIZE;
+        let lastColumns = 0;
+        let lastRows = 0;
+        let fitFrame = 0;
         let toastTimer = 0;
-        let searchRefreshTimer = 0;
+        let inputSequence = 0;
+        let pendingInput = null;
+        const inputQueue = [];
 
         function post(message) {
-            try {
-                host && host.postMessage(message);
-            } catch {
-            }
+            host?.postMessage(message);
         }
 
-        function setStatus(message, keepVisible = true) {
-            statusElement.textContent = message;
-            statusElement.classList.toggle('hidden', !keepVisible);
-            post({ type: 'log', data: message });
-        }
-
-        function showToast(message, timeout = 1400) {
-            if (!message)
+        function enqueueInput(type, data = '') {
+            if (type !== 'interrupt' && !data)
                 return;
 
-            toastElement.textContent = message;
-            toastElement.classList.add('visible');
-            clearTimeout(toastTimer);
-            toastTimer = window.setTimeout(() => toastElement.classList.remove('visible'), timeout);
+            inputQueue.push({ type, data, offset: 0 });
+            pumpInput();
         }
 
-        function normalizeSelectionForCopy(text) {
-            if (!text)
-                return '';
+        function pumpInput() {
+            if (pendingInput || inputQueue.length === 0)
+                return;
 
-            return text
-                .replace(/\r\n/g, '\n')
-                .replace(/\r/g, '\n')
-                .replace(/[ \t]+$/gm, '')
-                .replace(/(?:\n[ \t]*)+$/g, '')
-                .replace(/^[ \t]*\n+/g, '');
-        }
-
-        function normalizeLineEndings(text) {
-            return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        }
-
-        function clamp(value, min, max) {
-            return Math.max(min, Math.min(max, value));
-        }
-
-        function loadScript(src) {
-            return new Promise((resolve, reject) => {
-                const script = document.createElement('script');
-                script.src = src;
-                script.onload = resolve;
-                script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
-                document.head.appendChild(script);
-            });
-        }
-
-        function loadStyle(href) {
-            return new Promise((resolve, reject) => {
-                const link = document.createElement('link');
-                link.rel = 'stylesheet';
-                link.href = href;
-                link.onload = resolve;
-                link.onerror = () => reject(new Error(`Failed to load style: ${href}`));
-                document.head.appendChild(link);
-            });
-        }
-
-        async function loadFirstAvailable(paths, loader) {
-            let lastError = null;
-
-            for (const path of paths) {
-                try {
-                    await loader(path);
-                    return path;
-                } catch (error) {
-                    lastError = error;
-                }
+            const input = inputQueue[0];
+            const id = ++inputSequence;
+            if (input.type === 'interrupt') {
+                pendingInput = { id, end: 0 };
+                post({ type: 'interrupt', id });
+                return;
             }
 
-            throw lastError ?? new Error(`No resource could be loaded: ${paths.join(', ')}`);
+            let end = Math.min(input.offset + INPUT_CHUNK_SIZE, input.data.length);
+            if (input.type === 'input' && end < input.data.length && end > input.offset) {
+                const last = input.data.charCodeAt(end - 1);
+                const next = input.data.charCodeAt(end);
+                if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff)
+                    end--;
+            }
+
+            const chunk = input.data.slice(input.offset, end);
+            pendingInput = { id, end };
+            post({
+                type: input.type,
+                id,
+                data: input.type === 'inputBinary' ? btoa(chunk) : chunk
+            });
         }
 
-        window.addEventListener('focus', () => post({ type: 'focus_state', focused: true }), true);
-        window.addEventListener('blur', () => post({ type: 'focus_state', focused: false }), true);
-        document.addEventListener('visibilitychange', () => {
-            post({ type: 'focus_state', focused: document.visibilityState === 'visible' && document.hasFocus() });
-        });
+        function acknowledgeInput(id) {
+            if (!pendingInput || pendingInput.id !== id || inputQueue.length === 0)
+                return;
 
-        window.addEventListener('error', event => {
-            setStatus(`Terminal page error: ${event.message}`, true);
-        });
+            const input = inputQueue[0];
+            if (input.type === 'interrupt' || pendingInput.end >= input.data.length)
+                inputQueue.shift();
+            else
+                input.offset = pendingInput.end;
 
-        window.addEventListener('unhandledrejection', event => {
-            const message = event.reason && event.reason.message
-                ? event.reason.message
-                : String(event.reason ?? 'unknown');
-            setStatus(`Terminal page rejection: ${message}`, true);
-        });
+            pendingInput = null;
+            pumpInput();
+        }
+
+        function base64ToBytes(encoded) {
+            const binary = atob(encoded || '');
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index++)
+                bytes[index] = binary.charCodeAt(index);
+            return bytes;
+        }
+
+        function showToast(message) {
+            clearTimeout(toastTimer);
+            toastElement.textContent = message;
+            toastElement.classList.remove('hidden');
+            toastTimer = window.setTimeout(() => toastElement.classList.add('hidden'), 1400);
+        }
+
+        function fail(message) {
+            statusElement.textContent = message;
+            statusElement.classList.add('error');
+            statusElement.classList.remove('hidden');
+        }
 
         async function bootstrap() {
-            if (!host) {
-                setStatus('window.chrome.webview is unavailable.', true);
-                return;
-            }
+            if (!host)
+                throw new Error('WebView2 host bridge is unavailable.');
+            if (!window.Terminal || !window.FitAddon || !window.SearchAddon)
+                throw new Error('Required xterm.js assets are missing.');
 
-            setStatus('Loading local xterm.js resources...', true);
-
-            await loadFirstAvailable([
-                './node_modules/@xterm/xterm/css/xterm.css',
-                './node_modules/xterm/css/xterm.css'
-            ], loadStyle);
-
-            await loadFirstAvailable([
-                './node_modules/@xterm/xterm/lib/xterm.js',
-                './node_modules/xterm/lib/xterm.js'
-            ], loadScript);
-
-            await loadFirstAvailable([
-                './node_modules/@xterm/addon-fit/lib/addon-fit.js',
-                './node_modules/@xterm/addon-fit/lib/addon-fit.umd.js',
-                './node_modules/xterm-addon-fit/lib/xterm-addon-fit.js'
-            ], loadScript);
-
-            if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
-                throw new Error('xterm.js loaded but Terminal/FitAddon is missing.');
-            }
-
-            let currentFontSize = DEFAULT_FONT_SIZE;
-            const defaultTheme = {
-                background: '#111111',
-                foreground: '#f5f5f5',
-                cursor: '#ffffff',
-                selectionBackground: 'rgba(255,255,255,0.25)',
-                selectionInactiveBackground: 'rgba(255,255,255,0.18)',
-                black: '#111111',
-                red: '#f14c4c',
-                green: '#23d18b',
-                yellow: '#f5f543',
-                blue: '#3b8eea',
-                magenta: '#d670d6',
-                cyan: '#29b8db',
-                white: '#e5e5e5',
-                brightBlack: '#666666',
-                brightRed: '#f14c4c',
-                brightGreen: '#23d18b',
-                brightYellow: '#f5f543',
-                brightBlue: '#3b8eea',
-                brightMagenta: '#d670d6',
-                brightCyan: '#29b8db',
-                brightWhite: '#ffffff'
-            };
-            const searchTheme = {
-                ...defaultTheme,
-                selectionBackground: 'rgba(255, 196, 0, 0.48)',
-                selectionInactiveBackground: 'rgba(255, 196, 0, 0.36)'
-            };
-            const searchState = {
-                query: '',
-                matches: [],
-                index: -1
-            };
-
-            const term = new Terminal({
+            const terminal = new Terminal({
+                allowProposedApi: true,
                 allowTransparency: false,
                 convertEol: false,
                 cursorBlink: true,
                 cursorStyle: 'block',
                 drawBoldTextInBrightColors: true,
+                fastScrollModifier: 'alt',
                 fontFamily: '"Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
                 fontSize: currentFontSize,
                 minimumContrastRatio: 1,
-                scrollback: 5000,
-                theme: defaultTheme
+                rightClickSelectsWord: true,
+                scrollback: 10000,
+                smoothScrollDuration: 0,
+                theme: {
+                    background: '#0c0c0c',
+                    foreground: '#f2f2f2',
+                    cursor: '#f2f2f2',
+                    cursorAccent: '#0c0c0c',
+                    selectionBackground: 'rgba(38, 79, 120, 0.75)',
+                    selectionInactiveBackground: 'rgba(38, 79, 120, 0.45)',
+                    black: '#0c0c0c',
+                    red: '#c50f1f',
+                    green: '#13a10e',
+                    yellow: '#c19c00',
+                    blue: '#0037da',
+                    magenta: '#881798',
+                    cyan: '#3a96dd',
+                    white: '#cccccc',
+                    brightBlack: '#767676',
+                    brightRed: '#e74856',
+                    brightGreen: '#16c60c',
+                    brightYellow: '#f9f1a5',
+                    brightBlue: '#3b78ff',
+                    brightMagenta: '#b4009e',
+                    brightCyan: '#61d6d6',
+                    brightWhite: '#f2f2f2'
+                }
             });
+
             const fitAddon = new FitAddon.FitAddon();
+            const searchAddon = new SearchAddon.SearchAddon();
+            terminal.loadAddon(fitAddon);
+            terminal.loadAddon(searchAddon);
 
-            function applyTheme(theme) {
-                term.options.theme = theme;
+            if (window.Unicode11Addon) {
+                const unicodeAddon = new Unicode11Addon.Unicode11Addon();
+                terminal.loadAddon(unicodeAddon);
+                terminal.unicode.activeVersion = '11';
             }
 
-            function fitTerminal() {
-                fitAddon.fit();
-                post({ type: 'resize', cols: term.cols, rows: term.rows });
+            if (window.WebLinksAddon) {
+                terminal.loadAddon(new WebLinksAddon.WebLinksAddon((event, uri) => {
+                    post({ type: 'openExternal', data: uri });
+                }));
             }
 
-            function refocusTerminal() {
-                requestAnimationFrame(() => {
-                    try {
-                        term.focus();
-                        post({ type: 'focus_state', focused: true });
-                    } catch {
-                    }
-                });
-            }
+            terminal.open(terminalElement);
 
-            function setSearchCountText() {
-                let current = 0;
-                let total = 0;
-
-                if (!searchState.query) {
-                    searchCount.textContent = '0/0';
-                    post({ type: 'search_results', current, total });
-                    return;
-                }
-
-                total = searchState.matches.length;
-                if (!searchState.matches.length) {
-                    searchCount.textContent = '0/0';
-                    post({ type: 'search_results', current, total });
-                    return;
-                }
-
-                current = searchState.index + 1;
-                searchCount.textContent = `${current}/${total}`;
-                post({ type: 'search_results', current, total });
-            }
-
-            function clearSearchSelection() {
+            if (window.WebglAddon) {
                 try {
-                    term.clearSelection();
+                    const webglAddon = new WebglAddon.WebglAddon();
+                    webglAddon.onContextLoss(() => webglAddon.dispose());
+                    terminal.loadAddon(webglAddon);
+                } catch {
+                    // The built-in renderer remains active when WebGL is unavailable.
+                }
+            }
+
+            function fit() {
+                fitFrame = 0;
+                try {
+                    fitAddon.fit();
+                    if (terminal.cols !== lastColumns || terminal.rows !== lastRows) {
+                        lastColumns = terminal.cols;
+                        lastRows = terminal.rows;
+                        post({ type: 'resize', cols: lastColumns, rows: lastRows });
+                    }
                 } catch {
                 }
             }
 
-            function getBufferLineText(lineIndex) {
-                const line = term.buffer.active.getLine(lineIndex);
-                return line ? line.translateToString(true) : '';
+            function scheduleFit() {
+                if (!fitFrame)
+                    fitFrame = requestAnimationFrame(fit);
             }
 
-            function buildSearchMatches(query) {
-                if (!query)
-                    return [];
+            function focusTerminal() {
+                requestAnimationFrame(() => terminal.focus());
+            }
 
-                const matches = [];
-                const lowerQuery = query.toLocaleLowerCase();
-                const buffer = term.buffer.active;
+            function updateSearchCount(result) {
+                const count = result?.resultCount || 0;
+                const current = count > 0 ? (result.resultIndex || 0) + 1 : 0;
+                searchCount.textContent = `${current}/${count}`;
+            }
 
-                for (let lineIndex = 0; lineIndex < buffer.length; lineIndex++) {
-                    const text = getBufferLineText(lineIndex);
-                    if (!text)
-                        continue;
-
-                    const lowerText = text.toLocaleLowerCase();
-                    let startIndex = 0;
-                    while (startIndex <= lowerText.length) {
-                        const matchIndex = lowerText.indexOf(lowerQuery, startIndex);
-                        if (matchIndex < 0)
-                            break;
-
-                        matches.push({
-                            bufferRow: lineIndex,
-                            column: matchIndex,
-                            length: query.length
-                        });
-
-                        startIndex = matchIndex + Math.max(query.length, 1);
+            function searchOptions(incremental) {
+                return {
+                    caseSensitive: false,
+                    incremental,
+                    regex: false,
+                    wholeWord: false,
+                    decorations: {
+                        matchBackground: '#515c6a',
+                        matchBorder: '#8496aa',
+                        matchOverviewRuler: '#8496aa',
+                        activeMatchBackground: '#f0a000',
+                        activeMatchBorder: '#ffd266',
+                        activeMatchColorOverviewRuler: '#f0a000'
                     }
-                }
-
-                return matches;
+                };
             }
 
-            function revealSearchMatch(match) {
-                if (!match)
-                    return;
-
-                term.scrollToLine(match.bufferRow);
-                term.select(match.column, match.bufferRow, match.length);
-                setSearchCountText();
-            }
-
-            function refreshSearchSelection(revealCurrent = true) {
-                searchState.query = searchInput.value || '';
-                applyTheme(searchState.query ? searchTheme : defaultTheme);
-
-                if (!searchState.query) {
-                    searchState.matches = [];
-                    searchState.index = -1;
-                    clearSearchSelection();
-                    setSearchCountText();
-                    return;
-                }
-
-                searchState.matches = buildSearchMatches(searchState.query);
-                if (!searchState.matches.length) {
-                    searchState.index = -1;
-                    clearSearchSelection();
-                    setSearchCountText();
-                    return;
-                }
-
-                searchState.index = clamp(searchState.index < 0 ? 0 : searchState.index, 0, searchState.matches.length - 1);
-                if (revealCurrent)
-                    revealSearchMatch(searchState.matches[searchState.index]);
-                else
-                    setSearchCountText();
-            }
-
-            function scheduleSearchRefresh() {
-                if (!searchState.query)
-                    return;
-
-                clearTimeout(searchRefreshTimer);
-                searchRefreshTimer = window.setTimeout(() => refreshSearchSelection(false), 80);
-            }
-
-            function openSearch(prefill = '') {
-                post({ type: 'request_search', data: prefill });
+            function openSearch() {
+                searchPanel.classList.add('visible');
+                const selection = terminal.getSelection();
+                if (selection && !selection.includes('\n'))
+                    searchInput.value = selection;
+                searchInput.focus();
+                searchInput.select();
+                if (searchInput.value)
+                    searchAddon.findNext(searchInput.value, searchOptions(true));
             }
 
             function closeSearch() {
-                applyTheme(defaultTheme);
-                searchInput.value = '';
-                searchState.query = '';
-                searchState.matches = [];
-                searchState.index = -1;
-                clearSearchSelection();
-                setSearchCountText();
+                searchPanel.classList.remove('visible');
+                searchAddon.clearDecorations();
+                updateSearchCount();
+                focusTerminal();
             }
 
-            function navigateSearch(direction) {
-                if (!searchState.query) {
-                    post({ type: 'request_search' });
+            function searchNext(previous) {
+                const query = searchInput.value;
+                if (!query)
                     return;
-                }
+                if (previous)
+                    searchAddon.findPrevious(query, searchOptions(false));
+                else
+                    searchAddon.findNext(query, searchOptions(false));
+            }
 
-                if (!searchState.matches.length) {
-                    refreshSearchSelection(true);
+            function requestCopy() {
+                const selection = terminal.getSelection();
+                if (selection)
+                    post({ type: 'copy', data: selection.replace(/\r?\n/g, '\r\n') });
+            }
+
+            function requestPaste() {
+                post({ type: 'requestPaste' });
+            }
+
+            function setFontSize(value) {
+                const next = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, value));
+                if (next === currentFontSize)
                     return;
-                }
-
-                const total = searchState.matches.length;
-                searchState.index = (searchState.index + direction + total) % total;
-                revealSearchMatch(searchState.matches[searchState.index]);
-            }
-
-            function setSearchQuery(query, revealCurrent = true) {
-                searchInput.value = query || '';
-                if (query && searchState.query !== query)
-                    searchState.index = 0;
-
-                refreshSearchSelection(revealCurrent);
-            }
-
-            function applyFontSize(nextSize, announce = true) {
-                const clamped = clamp(nextSize, MIN_FONT_SIZE, MAX_FONT_SIZE);
-                if (clamped === currentFontSize)
-                    return;
-
-                currentFontSize = clamped;
-                term.options.fontSize = currentFontSize;
-                fitTerminal();
-                if (announce)
-                    showToast(`Font ${currentFontSize}px`);
-            }
-
-            function resetFontSize() {
-                currentFontSize = DEFAULT_FONT_SIZE;
-                term.options.fontSize = currentFontSize;
-                fitTerminal();
+                currentFontSize = next;
+                terminal.options.fontSize = currentFontSize;
+                scheduleFit();
                 showToast(`Font ${currentFontSize}px`);
             }
 
-            function normalizeUrl(text) {
-                const trimmed = (text || '').replace(/[)\],.:;!?]+$/g, '');
-                if (!trimmed)
-                    return '';
-
-                return /^www\./i.test(trimmed)
-                    ? `https://${trimmed}`
-                    : trimmed;
-            }
-
-            function registerUrlLinks() {
-                term.registerLinkProvider({
-                    provideLinks(bufferLineNumber, callback) {
-                        const lineText = getBufferLineText(bufferLineNumber - 1);
-                        if (!lineText) {
-                            callback(undefined);
-                            return;
-                        }
-
-                        const links = [];
-                        URL_REGEX.lastIndex = 0;
-
-                        let match;
-                        while ((match = URL_REGEX.exec(lineText)) !== null) {
-                            const displayText = (match[0] || '').replace(/[)\],.:;!?]+$/g, '');
-                            if (!displayText)
-                                continue;
-
-                            const url = normalizeUrl(displayText);
-                            if (!url)
-                                continue;
-
-                            const startX = match.index + 1;
-                            const endX = startX + displayText.length;
-                            links.push({
-                                range: {
-                                    start: { x: startX, y: bufferLineNumber },
-                                    end: { x: endX, y: bufferLineNumber }
-                                },
-                                text: displayText,
-                                activate: () => post({ type: 'open_external', data: url }),
-                                decorations: {
-                                    pointerCursor: true,
-                                    underline: true
-                                }
-                            });
-                        }
-
-                        callback(links.length ? links : undefined);
-                    }
-                });
-            }
-
-            function handleShortcut(event) {
-                const key = event.key && event.key.toLowerCase ? event.key.toLowerCase() : '';
-                const searchInputFocused = document.activeElement === searchInput;
-
-                if (searchInputFocused
-                    && key !== 'escape'
-                    && key !== 'f3'
-                    && !(event.ctrlKey && !event.shiftKey && !event.altKey && key === 'f')
-                    && !(event.ctrlKey && !event.altKey && (key === '0' || key === '=' || key === '+' || key === '-' || key === '_'))) {
-                    return false;
-                }
-
-                if (event.ctrlKey && !event.altKey && key === '0') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    resetFontSize();
-                    return true;
-                }
-
-                if (event.ctrlKey && !event.altKey && (key === '=' || key === '+')) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    applyFontSize(currentFontSize + 1);
-                    return true;
-                }
-
-                if (event.ctrlKey && !event.altKey && (key === '-' || key === '_')) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    applyFontSize(currentFontSize - 1);
-                    return true;
-                }
-
-                if ((event.ctrlKey && !event.shiftKey && !event.altKey && key === 'f') || key === 'f3') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    if (key === 'f3' && searchState.query)
-                        navigateSearch(event.shiftKey ? -1 : 1);
-                    else
-                        openSearch(normalizeSelectionForCopy(term.getSelection() || ''));
-
-                    return true;
-                }
-
-                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'c') {
-                    event.preventDefault();
-                    event.stopPropagation();
-
-                    if (term.hasSelection()) {
-                        const selection = normalizeSelectionForCopy(term.getSelection() || '');
-                        post({ type: 'copy', data: selection });
-
-                        if (navigator.clipboard && navigator.clipboard.writeText)
-                            navigator.clipboard.writeText(selection).catch(() => { });
-                    } else {
-                        post({ type: 'interrupt' });
-                    }
-
-                    return true;
-                }
-
-                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'v') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    post({ type: 'paste' });
-                    return true;
-                }
-
-                if (event.ctrlKey && !event.shiftKey && !event.altKey && key === 'l') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    post({ type: 'clear' });
-                    return true;
-                }
-
-                return false;
-            }
-
-            window.adbTerminal = {
-                getSelection: () => normalizeSelectionForCopy(term.getSelection() || ''),
-                getSelectionJson: () => JSON.stringify(normalizeSelectionForCopy(term.getSelection() || '')),
-                openSearch: () => openSearch(normalizeSelectionForCopy(term.getSelection() || '')),
-                resetZoom: () => resetFontSize()
-            };
-
-            term.loadAddon(fitAddon);
-            term.open(terminalElement);
-            registerUrlLinks();
-
-            term.onData(data => post({ type: 'input', data }));
-            term.onBinary(data => post({ type: 'inputBinary', data }));
-            term.onSelectionChange(() => {
-                post({ type: 'selection', data: normalizeSelectionForCopy(term.getSelection() || '') });
-            });
-            term.onWriteParsed(() => scheduleSearchRefresh());
-
-            term.attachCustomKeyEventHandler(event => {
+            terminal.attachCustomKeyEventHandler(event => {
                 if (event.type !== 'keydown')
                     return true;
 
-                if (searchPanel.classList.contains('visible') && document.activeElement === searchInput)
-                    return true;
+                const key = event.key.toLowerCase();
+                const commandModifier = event.ctrlKey && !event.altKey;
 
-                return !handleShortcut(event);
-            });
-
-            term.attachCustomWheelEventHandler(event => {
-                if (!event.ctrlKey)
-                    return true;
-
-                event.preventDefault();
-                applyFontSize(currentFontSize + (event.deltaY < 0 ? 1 : -1));
-                return false;
-            });
-
-            window.addEventListener('keydown', event => {
-                handleShortcut(event);
-            }, true);
-
-            window.addEventListener('copy', event => {
-                if (!term.hasSelection())
-                    return;
-
-                const selection = normalizeSelectionForCopy(term.getSelection() || '');
-                if (event.clipboardData) {
-                    event.clipboardData.setData('text/plain', selection);
+                if (commandModifier && key === 'f') {
                     event.preventDefault();
+                    openSearch();
+                    return false;
                 }
 
-                post({ type: 'copy', data: selection });
-            }, true);
+                if (key === 'f3' && searchPanel.classList.contains('visible')) {
+                    event.preventDefault();
+                    searchNext(event.shiftKey);
+                    return false;
+                }
 
-            window.addEventListener('paste', event => {
-                const clipboardText = normalizeLineEndings(event.clipboardData?.getData('text/plain') || '');
-                if (!clipboardText)
-                    return;
+                if (commandModifier && key === 'c') {
+                    event.preventDefault();
+                    if (event.shiftKey || terminal.hasSelection())
+                        requestCopy();
+                    else
+                        enqueueInput('interrupt');
+                    return false;
+                }
 
-                event.preventDefault();
-                event.stopPropagation();
-                post({ type: 'paste_data', data: clipboardText });
-            }, true);
+                if ((commandModifier && key === 'v') || (event.shiftKey && key === 'insert')) {
+                    event.preventDefault();
+                    requestPaste();
+                    return false;
+                }
+
+                if (commandModifier && key === '0') {
+                    event.preventDefault();
+                    setFontSize(DEFAULT_FONT_SIZE);
+                    return false;
+                }
+
+                if (commandModifier && (key === '+' || key === '=')) {
+                    event.preventDefault();
+                    setFontSize(currentFontSize + 1);
+                    return false;
+                }
+
+                if (commandModifier && (key === '-' || key === '_')) {
+                    event.preventDefault();
+                    setFontSize(currentFontSize - 1);
+                    return false;
+                }
+
+                return true;
+            });
+
+            terminal.onData(data => enqueueInput('input', data));
+            terminal.onBinary(data => enqueueInput('inputBinary', data));
+            searchAddon.onDidChangeResults(updateSearchCount);
 
             searchInput.addEventListener('input', () => {
-                searchState.index = 0;
-                refreshSearchSelection(true);
+                updateSearchCount();
+                if (searchInput.value)
+                    searchAddon.findNext(searchInput.value, searchOptions(true));
+                else
+                    searchAddon.clearDecorations();
             });
+
             searchInput.addEventListener('keydown', event => {
                 if (event.key === 'Enter') {
                     event.preventDefault();
-                    navigateSearch(event.shiftKey ? -1 : 1);
-                    return;
-                }
-
-                if (event.key === 'Escape') {
+                    searchNext(event.shiftKey);
+                } else if (event.key === 'Escape') {
                     event.preventDefault();
                     closeSearch();
-                    return;
                 }
-
                 event.stopPropagation();
             });
 
-            searchPrevButton.addEventListener('click', () => navigateSearch(-1));
-            searchNextButton.addEventListener('click', () => navigateSearch(1));
-            searchCloseButton.addEventListener('click', closeSearch);
-            searchPanel.addEventListener('mousedown', event => event.stopPropagation(), true);
+            document.getElementById('search-previous').addEventListener('click', () => searchNext(true));
+            document.getElementById('search-next').addEventListener('click', () => searchNext(false));
+            document.getElementById('search-close').addEventListener('click', closeSearch);
 
-            terminalElement.addEventListener('mouseup', () => refocusTerminal(), true);
-            terminalElement.addEventListener('click', () => refocusTerminal(), true);
+            terminalElement.addEventListener('contextmenu', event => {
+                if (terminal.hasSelection())
+                    requestCopy();
+            });
 
-            const resizeObserver = new ResizeObserver(() => fitTerminal());
-            resizeObserver.observe(workspaceElement);
-            window.addEventListener('resize', fitTerminal);
+            terminal.attachCustomWheelEventHandler(event => {
+                if (!event.ctrlKey)
+                    return true;
+                event.preventDefault();
+                setFontSize(currentFontSize + (event.deltaY < 0 ? 1 : -1));
+                return false;
+            });
+
+            const resizeObserver = new ResizeObserver(scheduleFit);
+            resizeObserver.observe(workspace);
+            window.addEventListener('resize', scheduleFit);
+            window.addEventListener('focus', () => post({ type: 'focus', focused: true }), true);
+            window.addEventListener('blur', () => post({ type: 'focus', focused: false }), true);
 
             host.addEventListener('message', event => {
                 const message = event.data || {};
-
                 switch (message.type) {
-                    case 'write':
-                        term.write(message.data || '');
+                    case 'inputAck':
+                        acknowledgeInput(message.id);
+                        break;
+
+                    case 'output': {
+                        const id = message.id;
+                        try {
+                            terminal.write(base64ToBytes(message.data), () => {
+                                post({ type: 'outputAck', id });
+                            });
+                        } catch {
+                            post({ type: 'outputAck', id });
+                        }
+                        break;
+                    }
+
+                    case 'paste':
+                        terminal.paste(message.data || '');
                         break;
 
                     case 'clear':
-                        term.clear();
-                        if (searchState.query)
-                            refreshSearchSelection(false);
+                        terminal.clear();
                         break;
 
                     case 'reset':
-                        term.reset();
-                        fitTerminal();
+                        terminal.reset();
+                        scheduleFit();
                         break;
 
                     case 'focus':
-                        term.focus();
+                        focusTerminal();
                         break;
 
-                    case 'search.set':
-                        setSearchQuery(message.data || '', true);
-                        break;
-
-                    case 'search.next':
-                        navigateSearch(1);
-                        break;
-
-                    case 'search.prev':
-                        navigateSearch(-1);
-                        break;
-
-                    case 'search.close':
-                        closeSearch();
-                        break;
-
-                    case 'show_search':
-                        openSearch(normalizeSelectionForCopy(term.getSelection() || ''));
-                        break;
-
-                    case 'reset_zoom':
-                        resetFontSize();
+                    case 'find':
+                        openSearch();
                         break;
                 }
             });
 
-            fitTerminal();
-            term.focus();
+            scheduleFit();
+            document.fonts?.ready.then(scheduleFit);
+            focusTerminal();
             statusElement.classList.add('hidden');
-            post({ type: 'focus_state', focused: true });
-            post({ type: 'ready' });
+            post({ type: 'ready', cols: terminal.cols, rows: terminal.rows });
+            post({ type: 'focus', focused: true });
         }
 
         bootstrap().catch(error => {
-            const message = error && error.message ? error.message : String(error);
-            setStatus(`Terminal bootstrap failed:\n${message}`, true);
+            fail(`Terminal renderer failed:\n${error?.message || error}`);
         });
     </script>
 </body>

@@ -81,7 +81,6 @@ public partial class App : Application
 #if !DEPLOY
             DebugLog.Initialize();
 #endif
-            TerminalLog.Initialize();
 
         }
         catch

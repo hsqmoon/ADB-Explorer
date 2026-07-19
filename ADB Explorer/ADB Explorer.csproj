@@ -79,7 +79,7 @@
 
   <ItemGroup>
     <Resource Include="app_icon_black_2023_256px.png" />
-    <Content Include="Assets\Terminal\**\*">
+    <Content Include="Assets\Terminal\index.html;Assets\Terminal\vendor\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="PortableLauncher.bat">

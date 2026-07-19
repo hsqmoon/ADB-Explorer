@@ -15,7 +15,6 @@
     xmlns:sys="clr-namespace:System;assembly=System.Runtime"
     xmlns:ui="http://schemas.modernwpf.com/2019"
     xmlns:views="clr-namespace:ADB_Explorer.Views"
-    xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
     x:Name="MainWin"
     Width="800"
     Height="450"
@@ -414,205 +413,17 @@
                         </StackPanel>
                         <TextBlock Style="{StaticResource EmptyFolderAltPromptStyle}" />
                     </Grid>
-                    <Grid Background="{DynamicResource DevicesListBackground}">
-                        <Grid.Style>
-                            <Style TargetType="Grid">
+                    <controls:AdbTerminalControl x:Name="TerminalControl">
+                        <controls:AdbTerminalControl.Style>
+                            <Style TargetType="controls:AdbTerminalControl">
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=IsTerminalOpen}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
-                        </Grid.Style>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition />
-                        </Grid.RowDefinitions>
-                        <Grid Margin="8,8,8,4">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <StackPanel Orientation="Vertical">
-                                <TextBlock
-                                    FontWeight="SemiBold"
-                                    Text="{Binding Source={x:Static Member=models:Data.Terminal}, Path=SessionTitle}" />
-                                <TextBlock
-                                    Margin="0,2,0,0"
-                                    FontFamily="Consolas"
-                                    FontSize="11"
-                                    Opacity="0.8"
-                                    Text="{Binding Source={x:Static Member=models:Data.Terminal}, Path=StatusText}" />
-                            </StackPanel>
-                            <StackPanel
-                                Grid.Column="1"
-                                HorizontalAlignment="Right"
-                                Orientation="Horizontal">
-                                <Button
-                                    Margin="0,0,6,0"
-                                    Click="TerminalInterrupt_Click"
-                                    Content="Ctrl+C"
-                                    IsEnabled="{Binding Source={x:Static Member=models:Data.Terminal}, Path=CanInterrupt}" />
-                                  <Button
-                                      Margin="0,0,6,0"
-                                      Click="TerminalFind_Click"
-                                      Content="Find" />
-                                  <Button Click="TerminalClear_Click" Content="Clear" />
-                              </StackPanel>
-                          </Grid>
-                          <Grid Grid.Row="1" Margin="8,4,8,4">
-                              <wv2:WebView2CompositionControl
-                                  x:Name="TerminalWebView"
-                                  Focusable="True" />
-                                <Border
-                                    x:Name="TerminalSearchOverlay"
-                                    HorizontalAlignment="Right"
-                                    VerticalAlignment="Top"
-                                    Panel.ZIndex="10"
-                                    Background="#FF252526"
-                                    BorderBrush="#FF3C3C3C"
-                                    BorderThickness="1"
-                                    CornerRadius="6"
-                                    Padding="8,6"
-                                    Margin="0,8,8,0">
-                                    <Border.Effect>
-                                        <DropShadowEffect BlurRadius="18" Direction="270" Opacity="0.35" ShadowDepth="4" Color="#FF000000" />
-                                    </Border.Effect>
-                                    <Border.Style>
-                                        <Style TargetType="Border">
-                                            <Setter Property="Visibility" Value="Collapsed" />
-                                            <Style.Triggers>
-                                                <DataTrigger Binding="{Binding ElementName=MainWin, Path=IsTerminalSearchVisible}" Value="True">
-                                                  <Setter Property="Visibility" Value="Visible" />
-                                              </DataTrigger>
-                                            </Style.Triggers>
-                                        </Style>
-                                    </Border.Style>
-                                    <Border.Resources>
-                                        <Style x:Key="TerminalSearchIconButtonStyle" TargetType="Button">
-                                            <Setter Property="MinWidth" Value="28" />
-                                            <Setter Property="Height" Value="28" />
-                                            <Setter Property="Margin" Value="0,0,0,0" />
-                                            <Setter Property="Padding" Value="0" />
-                                            <Setter Property="Foreground" Value="#FFD4D4D4" />
-                                            <Setter Property="Background" Value="Transparent" />
-                                            <Setter Property="BorderBrush" Value="Transparent" />
-                                            <Setter Property="BorderThickness" Value="1" />
-                                            <Setter Property="FontSize" Value="12" />
-                                            <Setter Property="FontFamily" Value="Segoe UI" />
-                                            <Setter Property="Template">
-                                                <Setter.Value>
-                                                    <ControlTemplate TargetType="Button">
-                                                        <Border
-                                                            x:Name="ButtonBorder"
-                                                            Background="{TemplateBinding Background}"
-                                                            BorderBrush="{TemplateBinding BorderBrush}"
-                                                            BorderThickness="{TemplateBinding BorderThickness}"
-                                                            CornerRadius="4">
-                                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                                        </Border>
-                                                        <ControlTemplate.Triggers>
-                                                            <Trigger Property="IsMouseOver" Value="True">
-                                                                <Setter TargetName="ButtonBorder" Property="Background" Value="#FF2A2D2E" />
-                                                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#FF45494A" />
-                                                            </Trigger>
-                                                            <Trigger Property="IsPressed" Value="True">
-                                                                <Setter TargetName="ButtonBorder" Property="Background" Value="#FF37373D" />
-                                                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#FF5A5A5A" />
-                                                            </Trigger>
-                                                        </ControlTemplate.Triggers>
-                                                    </ControlTemplate>
-                                                </Setter.Value>
-                                            </Setter>
-                                        </Style>
-                                        <Style x:Key="TerminalSearchPlaceholderStyle" TargetType="TextBlock">
-                                            <Setter Property="Visibility" Value="Collapsed" />
-                                            <Style.Triggers>
-                                                <DataTrigger Binding="{Binding ElementName=TerminalSearchTextBox, Path=Text.Length}" Value="0">
-                                                    <Setter Property="Visibility" Value="Visible" />
-                                                </DataTrigger>
-                                            </Style.Triggers>
-                                        </Style>
-                                    </Border.Resources>
-                                    <Grid MinWidth="420">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" />
-                                            <ColumnDefinition Width="230" />
-                                            <ColumnDefinition Width="Auto" />
-                                            <ColumnDefinition Width="Auto" />
-                                            <ColumnDefinition Width="Auto" />
-                                            <ColumnDefinition Width="Auto" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock
-                                            Grid.Column="0"
-                                            Margin="2,0,10,0"
-                                            VerticalAlignment="Center"
-                                            FontFamily="Segoe MDL2 Assets"
-                                            FontSize="12"
-                                            Foreground="#FFCCCCCC"
-                                            Text="&#xE721;" />
-                                        <Grid Grid.Column="1" Margin="0,0,8,0">
-                                            <TextBox
-                                                x:Name="TerminalSearchTextBox"
-                                                Padding="8,5"
-                                                VerticalContentAlignment="Center"
-                                                Background="#FF1E1E1E"
-                                                BorderBrush="#FF3C3C3C"
-                                                BorderThickness="1"
-                                                CaretBrush="#FFFFFFFF"
-                                                Foreground="#FFF3F3F3"
-                                                PreviewKeyDown="TerminalSearchTextBox_PreviewKeyDown"
-                                                SelectionBrush="#FF094771"
-                                                Text="{Binding ElementName=MainWin, Path=TerminalSearchQuery, UpdateSourceTrigger=PropertyChanged}" />
-                                            <TextBlock
-                                                Margin="10,0,0,0"
-                                                VerticalAlignment="Center"
-                                                IsHitTestVisible="False"
-                                                Foreground="#FF8A8A8A"
-                                                Style="{StaticResource TerminalSearchPlaceholderStyle}"
-                                                Text="Find" />
-                                        </Grid>
-                                        <Border
-                                            Grid.Column="2"
-                                            Margin="0,0,8,0"
-                                            Padding="8,3"
-                                            VerticalAlignment="Center"
-                                            Background="#FF333333"
-                                            BorderBrush="#FF454545"
-                                            BorderThickness="1"
-                                            CornerRadius="4">
-                                            <TextBlock
-                                                Foreground="#FFD0D0D0"
-                                                FontSize="11"
-                                                Text="{Binding ElementName=MainWin, Path=TerminalSearchCountText}" />
-                                        </Border>
-                                        <Button
-                                            Grid.Column="3"
-                                            Margin="0,0,4,0"
-                                            Click="TerminalSearchPrev_Click"
-                                            Style="{StaticResource TerminalSearchIconButtonStyle}"
-                                            ToolTip="Previous match (Shift+Enter)">
-                                            <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE74A;" />
-                                        </Button>
-                                        <Button
-                                            Grid.Column="4"
-                                            Margin="0,0,4,0"
-                                            Click="TerminalSearchNext_Click"
-                                            Style="{StaticResource TerminalSearchIconButtonStyle}"
-                                            ToolTip="Next match (Enter)">
-                                            <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE74B;" />
-                                        </Button>
-                                        <Button
-                                            Grid.Column="5"
-                                            Click="TerminalSearchClose_Click"
-                                            Style="{StaticResource TerminalSearchIconButtonStyle}"
-                                            ToolTip="Close (Esc)">
-                                            <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE711;" />
-                                        </Button>
-                                    </Grid>
-                                </Border>
-                          </Grid>
-                      </Grid>
+                        </controls:AdbTerminalControl.Style>
+                    </controls:AdbTerminalControl>
                   </Grid>
             </Border>
             <Expander
