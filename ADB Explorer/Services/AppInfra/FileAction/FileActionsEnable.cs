@@ -5,7 +5,7 @@ using ADB_Explorer.ViewModels;
 
 namespace ADB_Explorer.Services;
 
-internal class FileActionsEnable : ViewModelBase
+public class FileActionsEnable : ViewModelBase
 {
     public FileActionsEnable()
     {
@@ -252,13 +252,6 @@ internal class FileActionsEnable : ViewModelBase
         set => Set(ref parentEnabled, value);
     }
 
-    private bool refreshPackages = false;
-    public bool RefreshPackages
-    {
-        get => refreshPackages;
-        set => Set(ref refreshPackages, value);
-    }
-
     private bool listingInProgress = false;
     public bool ListingInProgress
     {
@@ -355,13 +348,6 @@ internal class FileActionsEnable : ViewModelBase
     {
         get => explorerFilter;
         set => Set(ref explorerFilter, value);
-    }
-
-    private object itemToSelect = null;
-    public object ItemToSelect
-    {
-        get => itemToSelect;
-        set => Set(ref itemToSelect, value);
     }
 
     private bool isExplorerEditing = false;
@@ -511,9 +497,9 @@ internal class FileActionsEnable : ViewModelBase
 
     public ObservableProperty<bool> IsExpandSettingsVisible = new() { Value = true };
 
-    public ObservableProperty<bool> IsLogToggleVisible = new() { Value = Data.Settings.EnableLog };
+    public ObservableProperty<bool> IsLogToggleVisible = new() { Value = App.Settings.EnableLog };
 
-    public ObservableProperty<bool> IsApkActionsVisible = new() { Value = Data.Settings.EnableApk };
+    public ObservableProperty<bool> IsApkActionsVisible = new() { Value = App.Settings.EnableApk };
 
 
     public ObservableProperty<IEnumerable<FileOperation>> SelectedFileOps = new() { Value = [] };
@@ -545,7 +531,7 @@ internal class FileActionsEnable : ViewModelBase
     public bool MoreEnabled => EditFileEnabled || UpdateModifiedEnabled;
     public bool NameReadOnly => !RenameEnabled;
     public bool EmptyTrash => IsRecycleBin && !DeleteEnabled && !RestoreEnabled;
-    public bool IsPasteStateVisible => IsExplorerVisible && Data.CopyPaste.PasteSource is not CopyPasteService.DataSource.None;
+    public bool IsPasteStateVisible => IsExplorerVisible && App.CopyPaste.PasteSource is not CopyPasteService.DataSource.None;
     public bool IsEditorTextChanged => OriginalEditorText != EditorText;
 
     #endregion

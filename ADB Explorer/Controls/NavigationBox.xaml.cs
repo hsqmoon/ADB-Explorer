@@ -1,4 +1,3 @@
-﻿using ADB_Explorer.Converters;
 using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
 using ADB_Explorer.Services;
@@ -11,6 +10,9 @@ namespace ADB_Explorer.Controls;
 /// </summary>
 public partial class NavigationBox
 {
+    private readonly SavedLocation currentLocationPlaceholder = new();
+    private long pathUpdateVersion;
+
     public enum ViewMode
     {
         None,
@@ -23,22 +25,28 @@ public partial class NavigationBox
         InitializeComponent();
 
         Breadcrumbs = [];
+        Focusable = true;
 
         Mode = ViewMode.None;
+        UpdateSavedItems();
 
-        SizeChanged += (sender, args) => ArrangeBreadcrumbs();
+        SizeChanged += (sender, args) => ScheduleBreadcrumbApply();
 
-        Data.RuntimeSettings.PropertyChanged += (sender, args) =>
+        App.RuntimeSettings.PropertyChanged += (sender, args) =>
         {
-            if (args.PropertyName == nameof(AppRuntimeSettings.LocationToNavigate))
-            {
-                FlyoutService.GetFlyout(SavedItemsButton).Hide();
-            }
-            else if (args.PropertyName == nameof(AppRuntimeSettings.SavedLocations))
+            if (args.PropertyName == nameof(AppRuntimeSettings.SavedLocations))
             {
                 UpdateSavedItems();
             }
         };
+    }
+
+    internal void CloseSavedItemsFlyout() => FlyoutService.GetFlyout(SavedItemsButton).Hide();
+
+    internal void ShowPath(string path)
+    {
+        Path = path;
+        Mode = ViewMode.Breadcrumbs;
     }
 
     #region Dependency Properties
@@ -55,7 +63,7 @@ public partial class NavigationBox
             if (update)
             {
                 IsFUSE = DriveHelper.GetCurrentDrive(value)?.IsFUSE is true;
-                AddDevice(value);
+                SchedulePathUpdate(value);
             }
         }
     }
@@ -103,16 +111,6 @@ public partial class NavigationBox
     public static readonly DependencyProperty IsLoadingProgressVisibleProperty =
         DependencyProperty.Register(nameof(IsLoadingProgressVisible), typeof(bool),
           typeof(NavigationBox), new PropertyMetadata(false));
-
-    public UIElement UnfocusTarget
-    {
-        get => (UIElement)GetValue(UnfocusTargetProperty);
-        set => SetValue(UnfocusTargetProperty, value);
-    }
-
-    public static readonly DependencyProperty UnfocusTargetProperty =
-        DependencyProperty.Register(nameof(UnfocusTarget), typeof(UIElement),
-          typeof(NavigationBox), new PropertyMetadata(null));
 
     public Thickness MenuPadding
     {
@@ -165,8 +163,8 @@ public partial class NavigationBox
 
             if (value is ViewMode.Path)
                 PathBox.Focus();
-            else if (UnfocusTarget is not null && PathBox.IsFocused)
-                UnfocusTarget.Focus();
+            else if (PathBox.IsFocused)
+                Focus();
         }
     }
 
@@ -176,35 +174,100 @@ public partial class NavigationBox
 
     public double MenuHeight => Height - MenuPadding.Top - MenuPadding.Bottom;
 
-    private void AddDevice(string path)
+    private void SchedulePathUpdate(string path)
     {
+        long version = Interlocked.Increment(ref pathUpdateVersion);
         if (string.IsNullOrEmpty(path))
-            return;
+        {
+            void clear()
+            {
+                if (version != Volatile.Read(ref pathUpdateVersion))
+                    return;
 
+                locations = [];
+                breadcrumbs = [];
+                itemWidths = [];
+                Items = [];
+                UpdateCurrentSavedState();
+            }
+
+            if (Application.Current is App currentApp)
+                currentApp.EnqueueUiLatest("navigation.breadcrumbs.clear", "navigation.breadcrumbs.clear", clear);
+            else
+                clear();
+            return;
+        }
+
+        if (Application.Current is not App app)
+        {
+            PreparePath(path);
+            ArrangeBreadcrumbs();
+            UpdateCurrentSavedState();
+            return;
+        }
+
+        app.EnqueueUiLatest(
+            "navigation.breadcrumbs.prepare",
+            "navigation.breadcrumbs.prepare",
+            () =>
+            {
+                if (version != Volatile.Read(ref pathUpdateVersion))
+                    return;
+
+                PreparePath(path);
+                app.EnqueueUiLatest(
+                    "navigation.breadcrumbs.apply",
+                    "navigation.breadcrumbs.apply",
+                    () =>
+                    {
+                        if (version == Volatile.Read(ref pathUpdateVersion))
+                            ArrangeBreadcrumbs();
+                    });
+                app.EnqueueUiLatest(
+                    "navigation.saved-location",
+                    "navigation.saved-location",
+                    () =>
+                    {
+                        if (version == Volatile.Read(ref pathUpdateVersion))
+                            UpdateCurrentSavedState();
+                    });
+            });
+    }
+
+    private void PreparePath(string path)
+    {
         var driveView = AdbLocation.StringFromLocation(Navigation.SpecialLocation.DriveView);
         if (path == driveView)
-            PopulateButtons(path);
+            PrepareBreadcrumbs(path);
         else
-            PopulateButtons(driveView + path);
-
-        UpdateSavedItems();
+            PrepareBreadcrumbs(driveView + path);
     }
 
     private void UpdateSavedItems()
     {
-        SavedItems = Data.RuntimeSettings.SavedLocations is null
+        SavedItems = App.RuntimeSettings.SavedLocations is null
             ? []
-            : [.. Data.RuntimeSettings.SavedLocations.Select(p => new SavedLocation(p))];
+            : [.. App.RuntimeSettings.SavedLocations.Select(p => new SavedLocation(p))];
 
-        IsCurrentSaved = SavedItems.Any(i => i.Path == Path);
-
-        if (AdbLocation.LocationFromString(Path) is Navigation.SpecialLocation.None && !IsCurrentSaved)
-            SavedItems.Insert(0, new SavedLocation());
-
+        UpdateCurrentSavedState();
         ((ItemsControl)Resources["SavedItemsControl"]).ItemsSource = SavedItems;
     }
 
-    public void Refresh() => AddDevice(Path);
+    private void UpdateCurrentSavedState()
+    {
+        IsCurrentSaved = SavedItems.Any(i =>
+            !ReferenceEquals(i, currentLocationPlaceholder) && i.Path == Path);
+
+        bool showPlaceholder = AdbLocation.LocationFromString(Path) is Navigation.SpecialLocation.None
+            && !IsCurrentSaved;
+        bool containsPlaceholder = SavedItems.Contains(currentLocationPlaceholder);
+        if (showPlaceholder && !containsPlaceholder)
+            SavedItems.Insert(0, currentLocationPlaceholder);
+        else if (!showPlaceholder && containsPlaceholder)
+            SavedItems.Remove(currentLocationPlaceholder);
+    }
+
+    public void Refresh() => SchedulePathUpdate(Path);
 
     public static IEnumerable<AdbLocation> SeparatePath(string path)
     {
@@ -220,7 +283,7 @@ public partial class NavigationBox
         if (current.Length == 0)
             yield break;
 
-        var pairs = Data.CurrentDisplayNames.Where(kv => current.StartsWith(kv.Key));
+        var pairs = App.ExplorerState.CurrentDisplayNames.Where(kv => current.StartsWith(kv.Key));
         var drive = pairs.Count() > 1
             ? pairs.OrderBy(kv => kv.Key.Length).Last()
             : pairs.FirstOrDefault();
@@ -248,23 +311,55 @@ public partial class NavigationBox
         }
     }
 
-    IEnumerable<AdbLocation> locations = [];
+    List<AdbLocation> locations = [];
     List<TextMenu> breadcrumbs = [];
     List<double> itemWidths = [];
 
-    private void PopulateButtons(string path)
+    private void PrepareBreadcrumbs(string path)
     {
         if (string.IsNullOrEmpty(path))
             return;
 
-        locations = SeparatePath(path);
+        locations = SeparatePath(path).ToList();
         breadcrumbs = locations.Select(item => item.NameSubMenu).ToList();
         breadcrumbs[^1].IsLast = true;
 
-        var template = (DataTemplate)Resources["BreadcrumbTemplate"];
-        itemWidths = [.. breadcrumbs.Select(item => GetTextWidth(item) + ControlSize.GetWidth(template, item))];
+        var typeface = new Typeface(
+            SystemFonts.MessageFontFamily,
+            FontStyles.Normal,
+            FontWeights.Normal,
+            FontStretches.Normal);
+        double pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        itemWidths = [.. breadcrumbs.Select(item =>
+            new FormattedText(
+                item.Action.Description ?? "",
+                CultureInfo.CurrentUICulture,
+                FlowDirection.LeftToRight,
+                typeface,
+                SystemFonts.MessageFontSize,
+                Brushes.Black,
+                pixelsPerDip).WidthIncludingTrailingWhitespace + 44)];
 
-        ArrangeBreadcrumbs();
+    }
+
+    private void ScheduleBreadcrumbApply()
+    {
+        long version = Volatile.Read(ref pathUpdateVersion);
+        if (Application.Current is App app)
+        {
+            app.EnqueueUiLatest(
+                "navigation.breadcrumbs.apply",
+                "navigation.breadcrumbs.apply",
+                () =>
+                {
+                    if (version == Volatile.Read(ref pathUpdateVersion))
+                        ArrangeBreadcrumbs();
+                });
+        }
+        else
+        {
+            ArrangeBreadcrumbs();
+        }
     }
 
     private void ArrangeBreadcrumbs()
@@ -273,12 +368,13 @@ public partial class NavigationBox
             return;
 
         int lastHiddenIndex = -1;
+        double trailingWidth = itemWidths.Skip(1).Sum();
         for (var i = 1; i < breadcrumbs.Count; i++)
         {
-            if (125 + itemWidths[0] + itemWidths[i..].Sum() > PathBox.ActualWidth)
-            {
+            if (125 + itemWidths[0] + trailingWidth > PathBox.ActualWidth)
                 lastHiddenIndex = i;
-            }
+
+            trailingWidth -= itemWidths[i];
         }
 
         if (lastHiddenIndex == -1)
@@ -288,7 +384,7 @@ public partial class NavigationBox
             var excessButton = new TextMenu(
                 new FileAction(FileAction.FileActionType.None, () => true, () => { }, "\uE712"))
             {
-                Children = locations.ToList()[1..(lastHiddenIndex + 1)].Select(item => item.ExcessSubMenu)
+                Children = locations[1..(lastHiddenIndex + 1)].Select(item => item.ExcessSubMenu)
             };
 
             var itemsControl = (ItemsControl)Resources["OverflowItemsControl"];
@@ -296,12 +392,6 @@ public partial class NavigationBox
 
             Items = [breadcrumbs[0], excessButton, .. breadcrumbs[(lastHiddenIndex + 1)..]];
         }
-    }
-
-    private static double GetTextWidth(TextMenu textMenu)
-    {
-        TextBlock textBlock = new() { Text = textMenu.Action.Description };
-        return ControlSize.GetWidth(textBlock);
     }
 
     private void PathBox_GotFocus(object sender, RoutedEventArgs e)
@@ -322,9 +412,9 @@ public partial class NavigationBox
         }
         else if (e.Key == Key.Enter)
         {
-            Data.RuntimeSettings.PathBoxNavigation = AdbExplorerConst.POSSIBLE_RECYCLE_PATHS.Any(DisplayPath.StartsWith)
+            ((App)Application.Current).RequestPathNavigation(AdbExplorerConst.POSSIBLE_RECYCLE_PATHS.Any(DisplayPath.StartsWith)
                 ? AdbExplorerConst.RECYCLE_PATH
-                : DisplayPath;
+                : DisplayPath);
 
             e.Handled = true;
             Mode = ViewMode.Breadcrumbs;

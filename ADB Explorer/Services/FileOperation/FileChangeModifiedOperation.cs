@@ -24,39 +24,39 @@ public class FileChangeModifiedOperation : AbstractShellFileOperation
         Status = OperationStatus.InProgress;
         StatusInfo = new InProgShellProgressViewModel();
 
-        var operationTask = ADBService.ExecuteVoidShellCommand(Device.ID,
-                                                                    CancelTokenSource.Token,
-                                                                    "touch",
-                                                                    "-m",
-                                                                    "-t",
-                                                                    NewDate.ToString("yyyyMMddHHmm.ss"),
-                                                                    ADBService.EscapeAdbShellString(FilePath.FullPath));
+        _ = RunAsync(ADBService.ExecuteVoidShellCommand(Device.ID,
+                                                        CancelTokenSource.Token,
+                                                        "touch",
+                                                        "-m",
+                                                        "-t",
+                                                        NewDate.ToString("yyyyMMddHHmm.ss"),
+                                                        ADBService.EscapeAdbShellString(FilePath.FullPath)));
+    }
 
-        operationTask.ContinueWith((t) =>
+    private async Task RunAsync(Task<string> operationTask)
+    {
+        try
         {
-            if (t.Result == "")
+            string result = await operationTask.ConfigureAwait(false);
+            if (CancelTokenSource?.IsCancellationRequested is true)
             {
-                Status = OperationStatus.Completed;
-                StatusInfo = new CompletedShellProgressViewModel();
-            }
-            else
-            {
-                Status = OperationStatus.Failed;
-                StatusInfo = new FailedOpProgressViewModel(t.Result);
+                await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+                return;
             }
 
-        }, TaskContinuationOptions.OnlyOnRanToCompletion);
-
-        operationTask.ContinueWith((t) =>
+            await CompleteAsync(
+                string.IsNullOrEmpty(result) ? OperationStatus.Completed : OperationStatus.Failed,
+                string.IsNullOrEmpty(result)
+                    ? new CompletedShellProgressViewModel()
+                    : new FailedOpProgressViewModel(result)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
-            Status = OperationStatus.Canceled;
-            StatusInfo = new CanceledOpProgressViewModel();
-        }, TaskContinuationOptions.OnlyOnCanceled);
-
-        operationTask.ContinueWith((t) =>
+            await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
         {
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(t.Exception.InnerException.Message);
-        }, TaskContinuationOptions.OnlyOnFaulted);
+            await CompleteAsync(OperationStatus.Failed, new FailedOpProgressViewModel(ex.GetBaseException().Message)).ConfigureAwait(false);
+        }
     }
 }

@@ -165,16 +165,6 @@ public class AppSettings : ViewModelBase
         set => Set(ref enableMdns, value);
     }
 
-    private bool pollDevices;
-    /// <summary>
-    /// <see langword="false"/> - disables polling for both ADB devices and mDNS services. Enables manual refresh button
-    /// </summary>
-    public bool PollDevices
-    {
-        get => Get(ref pollDevices, true);
-        set => Set(ref pollDevices, value);
-    }
-
     private bool pollBattery;
     /// <summary>
     /// Enables battery information for all devices (polling and displaying)
@@ -204,20 +194,6 @@ public class AppSettings : ViewModelBase
     {
         get => Get(ref enableCompactView, false);
         set => Set(ref enableCompactView, value);
-    }
-
-    private bool stopPollingWhileSync;
-    public bool StopPollingOnSync
-    {
-        get => Get(ref stopPollingWhileSync, false);
-        set
-        {
-            if (Set(ref stopPollingWhileSync, value))
-            {
-                Data.RuntimeSettings.IsPollingStopped = value
-                    && Data.FileOpQ.Operations.Any(op => op is FileSyncOperation && op.Status is FileOperation.OperationStatus.InProgress);
-            }
-        }
     }
 
     private bool allowMultiOp;
@@ -304,19 +280,12 @@ public class AppSettings : ViewModelBase
         {
             var value = Get(ref disableAnimation, false);
 
-            if (!Data.RuntimeSettings.IsWindowLoaded)
+            if (!App.RuntimeSettings.IsWindowLoaded)
                 IsAnimated = !disableAnimation;
 
             return value;
         }
         set => Set(ref disableAnimation, value);
-    }
-
-    private bool enableSplash;
-    public bool EnableSplash
-    {
-        get => Get(ref enableSplash, true);
-        set => Set(ref enableSplash, value);
     }
 
     #endregion

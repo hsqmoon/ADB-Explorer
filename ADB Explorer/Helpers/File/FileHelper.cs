@@ -1,8 +1,6 @@
 ﻿using ADB_Explorer.Converters;
 using ADB_Explorer.Models;
 using ADB_Explorer.Services;
-using Vanara.PInvoke;
-using Vanara.Windows.Shell;
 using static ADB_Explorer.Models.AbstractFile;
 
 namespace ADB_Explorer.Helpers;
@@ -13,15 +11,16 @@ public static class FileHelper
 
     public static FileClass ListerFileManipulator(FileClass item)
     {
-        if (Data.CopyPaste.Files.Length > 0
-            && Data.CopyPaste.IsSelfClipboard
-            && Data.CopyPaste.ParentFolder == Data.DirList.CurrentPath
-            && Data.CopyPaste.FileSet.Contains(item.FullPath))
+        if (App.CopyPaste.Files.Length > 0
+            && App.CopyPaste.IsSelfClipboard
+            && App.CopyPaste.ParentFolder == App.ExplorerState.CurrentPath
+            && App.CopyPaste.FileSet.Contains(item.FullPath))
         {
-            item.CutState = Data.CopyPaste.PasteState;
+            item.CutState = App.CopyPaste.PasteState;
+            App.CopyPaste.MarkCutItem(item);
         }
 
-        if (Data.FileActions.IsRecycleBin)
+        if (App.FileActions.IsRecycleBin)
         {
             var indexer = TrashHelper.FindIndexer(item.FullName);
             if (indexer is not null)
@@ -50,8 +49,8 @@ public static class FileHelper
         if (pkg is not Package)
             return false;
         
-        return string.IsNullOrEmpty(Data.FileActions.ExplorerFilter)
-            || pkg.ToString().Contains(Data.FileActions.ExplorerFilter, StringComparison.OrdinalIgnoreCase);
+        return string.IsNullOrEmpty(App.FileActions.ExplorerFilter)
+            || pkg.ToString().Contains(App.FileActions.ExplorerFilter, StringComparison.OrdinalIgnoreCase);
     };
 
     public static bool IsHiddenRecycleItem(FileClass file)
@@ -59,7 +58,7 @@ public static class FileHelper
         if (AdbExplorerConst.POSSIBLE_RECYCLE_PATHS.Contains(file.FullPath) || file.Extension == AdbExplorerConst.RECYCLE_INDEX_SUFFIX)
             return true;
         
-        if (!string.IsNullOrEmpty(Data.FileActions.ExplorerFilter) && !file.ToString().Contains(Data.FileActions.ExplorerFilter, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(App.FileActions.ExplorerFilter) && !file.ToString().Contains(App.FileActions.ExplorerFilter, StringComparison.OrdinalIgnoreCase))
             return true;
 
         return false;
@@ -68,23 +67,20 @@ public static class FileHelper
     public static void RenameFile(FileClass file, string newName)
     {
         var newPath = ConcatPaths(file.ParentPath, newName);
-        if (!Data.Settings.ShowExtensions)
+        if (!App.Settings.ShowExtensions)
             newPath += file.Extension;
 
-        ShellFileOperation.Rename(file, newPath, Data.CurrentADBDevice);
+        ShellFileOperation.Rename(file, newPath, App.ActiveAdbDevice);
     }
 
     public static string DisplayName(TextBox textBox) => DisplayName(textBox.DataContext as FilePath);
 
-    public static string DisplayName(FilePath file) => Data.Settings.ShowExtensions ? file?.FullName : file?.NoExtName;
+    public static string DisplayName(FilePath file) => App.Settings.ShowExtensions ? file?.FullName : file?.NoExtName;
 
     public static FileClass GetFromCell(DataGridCellInfo cell) => CellConverter.GetDataGridCell(cell).DataContext as FileClass;
 
     public static string ConcatPaths(FilePath path1, string path2) => 
         ConcatPaths(path1.FullPath, path2, path1.PathType is FilePathType.Android ? '/' : '\\');
-
-    public static string ConcatPaths(ShellItem path1, string path2) =>
-        ConcatPaths(path1.FileSystemPath, path2, '\\');
 
     public static string ConcatPaths(string path1, string path2, char separator = '/')
     {
@@ -206,7 +202,7 @@ public static class FileHelper
         return fullName[lastDot..];
     }
 
-    public static string DuplicateFile(ObservableList<FileClass> fileList, string fullName, DragDropEffects cutType = DragDropEffects.None)
+    public static string DuplicateFile(IEnumerable<FileClass> fileList, string fullName, DragDropEffects cutType = DragDropEffects.None)
         => DuplicateFile(fileList.Select(f => f.FullName), fullName, cutType);
 
     public static string DuplicateFile(IEnumerable<string> fileList, string fullName, DragDropEffects cutType = DragDropEffects.None)
@@ -356,7 +352,7 @@ public static class FileHelper
                 depth,
                 """\( -type d -printf '/// %p /// d /// d ///\n' \)""",
                 "-o",
-                $"""\( -type f -printf '/// %p /// %s /// {(Data.Settings.KeepDateModified ? "%T@" : "d")} ///\n' \)""",
+                $"""\( -type f -printf '/// %p /// %s /// {(App.Settings.KeepDateModified ? "%T@" : "d")} ///\n' \)""",
                 "2>&1"
             ];
 
@@ -372,7 +368,7 @@ public static class FileHelper
                 """2>/dev/null | while IFS= read -r f;""",
                 """do if [ -d \"$f\" ]; then""",
                 """echo /// $f /// d /// d ///;""",
-                $"""else echo /// $f /// $(stat -c '%s /// %Y' {(Data.Settings.KeepDateModified ? "\\\"$f\\\")" : ") d")} ///;""",
+                $"""else echo /// $f /// $(stat -c '%s /// %Y' {(App.Settings.KeepDateModified ? "\\\"$f\\\")" : ") d")} ///;""",
                 """fi; done;"""
             ];
 
@@ -435,33 +431,6 @@ public static class FileHelper
 
         readBatch();
         return treesBySource;
-    }
-
-    public static (long? Size, DateTime? ModifiedTime) GetShellSizeDate(ShellItem shellItem, bool isDirectory)
-    {
-        long? size = null;
-        DateTime? modifiedTime = null;
-
-        try
-        {
-            size = isDirectory ? null : shellItem.FileInfo.Length;
-            modifiedTime = shellItem.FileInfo.LastWriteTime;
-        }
-        catch (Exception)
-        {
-            if (!isDirectory
-                && shellItem.Properties.TryGetValue<ulong>(Ole32.PROPERTYKEY.System.Size, out var sz))
-            {
-                size = (long)sz;
-            }
-
-            if (shellItem.Properties.TryGetValue<System.Runtime.InteropServices.ComTypes.FILETIME>(Ole32.PROPERTYKEY.System.DateModified, out var modified))
-            {
-                modifiedTime = new NativeMethods.FILETIME(modified).DateTimeLocal;
-            }
-        }
-
-        return (size, modifiedTime);
     }
 
     /// <summary>

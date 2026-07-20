@@ -7,16 +7,18 @@ internal class DriveHelper
 {
     public static void ClearSelectedDrives()
     {
-        Data.RuntimeSettings.CollapseDrives = true;
-        Data.RuntimeSettings.CollapseDrives = false;
+        if (App.ActiveDevices.Current is not null)
+        {
+            foreach (var drive in App.ActiveDevices.Current.Drives)
+                drive.DriveSelected = false;
+        }
     }
 
     public static void ClearDrives()
     {
-        var drives = Data.DevicesObject.Current?.Drives;
-        drives?.ForEach(drive => drive.DetachRuntimeSettings());
+        var drives = App.ActiveDevices.Current?.Drives;
         drives?.Clear();
-        Data.FileActions.IsDriveViewVisible = false;
+        App.FileActions.IsDriveViewVisible = false;
     }
 
     public static DriveViewModel GetCurrentDrive(string path)
@@ -24,9 +26,9 @@ internal class DriveHelper
         if (string.IsNullOrEmpty(path)) return null;
 
         // First search for a non-root drive that matches the path
-        var nonRoot = Data.DevicesObject.Current?.Drives.FirstOrDefault(d => d.Type is not AbstractDrive.DriveType.Root && path.StartsWith(d.Path));
+        var nonRoot = App.ActiveDevices.Current?.Drives.FirstOrDefault(d => d.Type is not AbstractDrive.DriveType.Root && path.StartsWith(d.Path));
         if (nonRoot is null)
-            return Data.DevicesObject.Current?.Drives.FirstOrDefault(d => d.Type is AbstractDrive.DriveType.Root);
+            return App.ActiveDevices.Current?.Drives.FirstOrDefault(d => d.Type is AbstractDrive.DriveType.Root);
 
         return nonRoot;
     }

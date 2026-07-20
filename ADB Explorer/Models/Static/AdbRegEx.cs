@@ -2,9 +2,6 @@
 {
     public static partial class AdbRegEx
     {
-        [GeneratedRegex(@"^(?<Mode>[0-9a-f]+) (?<Size>[0-9a-f]+) (?<Time>[0-9a-f]+) (?<Name>[^/]+?)\r?$", RegexOptions.IgnoreCase)]
-        public static partial Regex RE_LS_FILE_ENTRY();
-
         [GeneratedRegex(@"^(?<id>[\w.:-]+?) +(?<status>unauthorized|device|offline|authorizing|recovery|sideload)(?: +.*(?:model:(?<model>\w+)))?(?: +.*(?:device:(?<device>\w+)))?[^\r\n]*", RegexOptions.Multiline)]
         public static partial Regex RE_DEVICE_NAME();
 
@@ -47,11 +44,8 @@
         [GeneratedRegex(@"^(?<Hash>\w+)[ -]+(?<Path>.+)$", RegexOptions.Multiline)]
         public static partial Regex RE_ANDROID_FIND_HASH();
 
-        [GeneratedRegex("\\/\\/\\/ (?<Source>[\\s\\S]+?) \\/\\/\\/(?:(?: )|(?: (?<Target>\\/[\\s\\S]+?) ))\\/\\/\\/", RegexOptions.Multiline)]
-        public static partial Regex RE_LINK_TARGETS();
-
-        [GeneratedRegex("\\/\\/\\/ (?<Target>[\\s\\S]+?) \\/\\/\\/ (?<Mode>.*) \\/\\/\\/", RegexOptions.Multiline)]
-        public static partial Regex RE_LINK_MODE();
+        [GeneratedRegex("\\/\\/\\/ (?<Source>[\\s\\S]+?) \\/\\/\\/ (?<Target>[\\s\\S]*?) \\/\\/\\/ (?<Type>[dfbcpsxu]) \\/\\/\\/", RegexOptions.Multiline)]
+        public static partial Regex RE_LINK_DETAILS();
 
         [GeneratedRegex("\\/\\/\\/ (?<Name>[\\s\\S]+?) \\/\\/\\/ (?<Size>.*) \\/\\/\\/ (?<Date>.*) \\/\\/\\/", RegexOptions.Multiline)]
         public static partial Regex RE_FIND_TREE();
@@ -61,9 +55,6 @@
 
         [GeneratedRegex(@"^\w:\\$")]
         public static partial Regex RE_WINDOWS_DRIVE_ROOT();
-
-        [GeneratedRegex(@"(?<Alias>[^=\s]+)='(?<Target>.+)'")]
-        public static partial Regex RE_GET_ALIAS();
 
         [GeneratedRegex(@"[\d.]+")]
         public static partial Regex RE_GITHUB_VERSION();

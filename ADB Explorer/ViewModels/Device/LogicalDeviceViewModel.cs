@@ -29,14 +29,14 @@ public class LogicalDeviceViewModel : DeviceViewModel
         {
             if (Set(ref isOpen, value) && Root is RootStatus.Enabled)
             {
-                if (!value && Status is DeviceStatus.Ok && Data.Settings.UnrootOnDisconnect is true)
+                if (!value && Status is DeviceStatus.Ok && App.Settings.UnrootOnDisconnect is true)
                 {
                     var currentDevice = Device;
                     _ = Task.Run(() => ADBService.Unroot(currentDevice));
                 }
 
                 if (value)
-                    Data.RuntimeSettings.IsRootActive = true;
+                    App.RuntimeSettings.IsRootActive = true;
             }
         }
     }
@@ -141,7 +141,7 @@ public class LogicalDeviceViewModel : DeviceViewModel
         DiscoverTime = DateTime.Now;
 
         Device = device;
-        if (Device.Type is DeviceType.Emulator)
+        if (Device.Type is DeviceType.Emulator || string.IsNullOrWhiteSpace(Device.Name))
             UseIdForName = true;
 
         BrowseCommand = new(() => !IsOpen && device.Status is DeviceStatus.Ok && device.Type is not DeviceType.Sideload,
@@ -155,7 +155,7 @@ public class LogicalDeviceViewModel : DeviceViewModel
         {
             RebootCommands.Add(new RebootCommand(this, item));
 
-            if (item is RebootCommand.RebootType.Title)
+            if (subscribeRuntimeSettings && item is RebootCommand.RebootType.Title)
                 RebootCommands.Add(new Separator() { Margin = new(-11, 0, -11, 0)});
         }
 
@@ -177,10 +177,9 @@ public class LogicalDeviceViewModel : DeviceViewModel
             return;
 
         AttachBaseRuntimeSettings();
-        Drives.ForEach(drive => drive.AttachRuntimeSettings());
-        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
         runtimeSettingsSubscribed = true;
-        IsOpen = Data.RuntimeSettings.DeviceToOpen?.ID == ID;
+        IsOpen = App.RuntimeSettings.DeviceToOpen?.ID == ID;
     }
 
     internal void DetachRuntimeSettings()
@@ -188,10 +187,9 @@ public class LogicalDeviceViewModel : DeviceViewModel
         if (!runtimeSettingsSubscribed)
             return;
 
-        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
         runtimeSettingsSubscribed = false;
         DetachBaseRuntimeSettings();
-        Drives.ForEach(drive => drive.DetachRuntimeSettings());
         IsOpen = false;
     }
 
@@ -199,8 +197,8 @@ public class LogicalDeviceViewModel : DeviceViewModel
     {
         if (e.PropertyName == nameof(AppRuntimeSettings.DeviceToOpen))
         {
-            IsOpen = Data.RuntimeSettings.DeviceToOpen is not null
-                && Data.RuntimeSettings.DeviceToOpen.ID == ID;
+            IsOpen = App.RuntimeSettings.DeviceToOpen is not null
+                && App.RuntimeSettings.DeviceToOpen.ID == ID;
         }
     }
 
@@ -230,9 +228,11 @@ public class LogicalDeviceViewModel : DeviceViewModel
 
     public void EnableRoot(bool enable)
     {
-        Device.EnableRoot(enable);
-        OnPropertyChanged(nameof(Root));
+        SetRootStatus(Device.ChangeRoot(enable));
     }
+
+    internal RootStatus ChangeRoot(bool enable, CancellationToken cancellationToken = default) =>
+        Device.ChangeRoot(enable, cancellationToken);
 
     public bool SetRootStatus(RootStatus status)
     {
@@ -243,7 +243,7 @@ public class LogicalDeviceViewModel : DeviceViewModel
             OnPropertyChanged(nameof(RootString));
 
             if (IsOpen)
-                Data.RuntimeSettings.IsRootActive = status is RootStatus.Enabled;
+                App.RuntimeSettings.IsRootActive = status is RootStatus.Enabled;
 
             return true;
         }
@@ -251,12 +251,9 @@ public class LogicalDeviceViewModel : DeviceViewModel
         return false;
     }
 
-    public void UpdateBattery() => Device.UpdateBattery();
+    internal void ApplyBatteryInfo(Dictionary<string, string> batteryInfo) => Device.ApplyBatteryInfo(batteryInfo);
 
-    public Task<bool> UpdateDrives(IEnumerable<Drive> drives, Dispatcher dispatcher, bool asyncClassify = false) => Device.UpdateDrives(drives, dispatcher, asyncClassify);
-
-    public Task<bool> UpdateDrives(LogicalDeviceViewModel other, Dispatcher dispatcher, bool asyncClassify = false)
-        => UpdateDrives(other.Device.Drives.Select(d => d.Drive), dispatcher, asyncClassify);
+    public bool UpdateDrives(IEnumerable<Drive> drives) => Device.UpdateDrives(drives);
 
     #endregion
 }

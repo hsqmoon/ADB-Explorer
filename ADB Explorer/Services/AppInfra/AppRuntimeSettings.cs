@@ -1,20 +1,32 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
 using ADB_Explorer.ViewModels;
-using System.Collections;
 using System.Net;
-using System.Windows.Threading;
-using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Services;
 
+internal enum RuntimeUiChange
+{
+    MdnsExpander,
+    SearchText,
+    PathBoxFocus,
+    SearchBoxFocus,
+    TerminalVisibility,
+    CurrentDevice,
+    SettingsGroups,
+    Cursor,
+    PaneVisibility,
+}
+
 public class AppRuntimeSettings : ViewModelBase
 {
-    public AppRuntimeSettings()
+    internal event Action<RuntimeUiChange> UiChangeRequested;
+
+    internal AppRuntimeSettings(AppSettings settings)
     {
-        Data.Settings.PropertyChanged += (object sender, PropertyChangedEventArgs e) =>
+        settings.PropertyChanged += (object sender, PropertyChangedEventArgs e) =>
         {
-            if (e.PropertyName == nameof(Data.Settings.ForceFluentStyles))
+            if (e.PropertyName == nameof(AppSettings.ForceFluentStyles))
                 OnPropertyChanged(nameof(UseFluentStyles));
         };
     }
@@ -28,7 +40,7 @@ public class AppRuntimeSettings : ViewModelBase
         set
         {
             if (Set(ref isSettingsPaneOpen, value))
-                DeviceHelper.CollapseDevices();
+                UiChangeRequested?.Invoke(RuntimeUiChange.PaneVisibility);
         }
     }
 
@@ -39,7 +51,7 @@ public class AppRuntimeSettings : ViewModelBase
         set
         {
             if (Set(ref isDevicesPaneOpen, value))
-                DeviceHelper.CollapseDevices();
+                UiChangeRequested?.Invoke(RuntimeUiChange.PaneVisibility);
         }
     }
 
@@ -47,7 +59,11 @@ public class AppRuntimeSettings : ViewModelBase
     public bool IsMdnsExpanderOpen
     {
         get => isMdnsExpanderOpen;
-        set => Set(ref isMdnsExpanderOpen, value);
+        set
+        {
+            if (Set(ref isMdnsExpanderOpen, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.MdnsExpander);
+        }
     }
 
     private bool isOperationsViewOpen = false;
@@ -58,8 +74,8 @@ public class AppRuntimeSettings : ViewModelBase
         {
             if (Set(ref isOperationsViewOpen, value))
             {
-                DeviceHelper.CollapseDevices();
                 IsDetailedPeekMode = false;
+                UiChangeRequested?.Invoke(RuntimeUiChange.PaneVisibility);
             }
         }
     }
@@ -75,14 +91,22 @@ public class AppRuntimeSettings : ViewModelBase
     public bool GroupsExpanded
     {
         get => groupsExpanded;
-        set => Set(ref groupsExpanded, value);
+        set
+        {
+            if (Set(ref groupsExpanded, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.SettingsGroups);
+        }
     }
 
     private string searchText = "";
     public string SearchText
     {
         get => searchText;
-        set => Set(ref searchText, value);
+        set
+        {
+            if (Set(ref searchText, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.SearchText);
+        }
     }
 
     private double maxSearchBoxWidth = AdbExplorerConst.DEFAULT_SEARCH_WIDTH;
@@ -90,20 +114,6 @@ public class AppRuntimeSettings : ViewModelBase
     {
         get => maxSearchBoxWidth;
         set => Set(ref maxSearchBoxWidth, value);
-    }
-
-    private bool collapseDevices = false;
-    public bool CollapseDevices
-    {
-        get => collapseDevices;
-        set => Set(ref collapseDevices, value);
-    }
-
-    private bool collapseDrives = false;
-    public bool CollapseDrives
-    {
-        get => collapseDrives;
-        set => Set(ref collapseDrives, value);
     }
 
     private LogicalDeviceViewModel deviceToBrowse = null;
@@ -120,86 +130,38 @@ public class AppRuntimeSettings : ViewModelBase
         set => Set(ref isManualPairingInProgress, value);
     }
 
-    private DriveViewModel browseDrive = null;
-    public DriveViewModel BrowseDrive
-    {
-        get => browseDrive;
-        set => Set(ref browseDrive, value);
-    }
-
     private DeviceViewModel connectNewDevice = null;
     public DeviceViewModel ConnectNewDevice
     {
         get => connectNewDevice;
-        set
-        {
-            if (Set(ref connectNewDevice, value))
-            {
-                if (value is not null)
-                    DeviceHelper.ConnectDevice(value);
-            }
-        }
+        set => Set(ref connectNewDevice, value);
     }
 
     private DateTime lastServerResponse = DateTime.Now;
-    private int lastServerResponseNotifyScheduled;
     public DateTime LastServerResponse
     {
         get => lastServerResponse;
         set
         {
             lastServerResponse = value;
-            ScheduleLastServerResponseNotification();
+            RefreshServerResponseStatus();
         }
-    }
-
-    private void ScheduleLastServerResponseNotification()
-    {
-        var dispatcher = App.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.HasShutdownStarted)
-            return;
-
-        if (Interlocked.Exchange(ref lastServerResponseNotifyScheduled, 1) == 1)
-            return;
-
-        _ = dispatcher.BeginInvoke(new Action(() =>
-        {
-            try
-            {
-                OnPropertyChanged(nameof(LastServerResponse));
-                OnPropertyChanged(nameof(TimeFromLastResponse));
-                OnPropertyChanged(nameof(ServerUnresponsive));
-            }
-            finally
-            {
-                Interlocked.Exchange(ref lastServerResponseNotifyScheduled, 0);
-            }
-        }), DispatcherPriority.Background);
     }
 
     public string TimeFromLastResponse => $"{DateTime.Now.Subtract(LastServerResponse).TotalSeconds:0}";
 
-    public bool ServerUnresponsive => Data.Settings.PollDevices && DateTime.Now.Subtract(LastServerResponse) > AdbExplorerConst.SERVER_RESPONSE_TIMEOUT;
+    public bool ServerUnresponsive => DateTime.Now.Subtract(LastServerResponse) > AdbExplorerConst.SERVER_RESPONSE_TIMEOUT;
 
-    private AdbLocation locationToNavigate = new(Navigation.SpecialLocation.None);
-    public AdbLocation LocationToNavigate
+    internal void RefreshServerResponseStatus()
     {
-        get => locationToNavigate;
-        set
+        if (Application.Current is App app)
         {
-            if (!Set(ref locationToNavigate, value))
-                OnPropertyChanged();
-        }
-    }
-
-    private string pathBoxNavigation = "";
-    public string PathBoxNavigation
-    {
-        get => pathBoxNavigation;
-        set
-        {
-            if (!Set(ref pathBoxNavigation, value))
-                OnPropertyChanged();        
+            app.EnqueueUiLatest("adb.last-response", "adb.last-response", () =>
+            {
+                OnPropertyChanged(nameof(LastServerResponse));
+                OnPropertyChanged(nameof(TimeFromLastResponse));
+                OnPropertyChanged(nameof(ServerUnresponsive));
+            });
         }
     }
 
@@ -216,25 +178,15 @@ public class AppRuntimeSettings : ViewModelBase
 
     public string AdbVersionString => $"\u200E - v{AdbVersion}";
 
-    private bool isSplashScreenVisible = true;
-    public bool IsSplashScreenVisible
-    {
-        get => isSplashScreenVisible;
-        set => Set(ref isSplashScreenVisible, value);
-    }
-
-    private IEnumerable explorerSource;
-    public IEnumerable ExplorerSource
-    {
-        get => explorerSource;
-        set => Set(ref explorerSource, value);
-    }
-
     private LogicalDeviceViewModel currentDevice = null;
     public LogicalDeviceViewModel CurrentDevice
     {
         get => currentDevice;
-        set => Set(ref currentDevice, value);
+        set
+        {
+            if (Set(ref currentDevice, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.CurrentDevice);
+        }
     }
 
     private bool? isPathBoxFocused = null;
@@ -245,6 +197,7 @@ public class AppRuntimeSettings : ViewModelBase
         {
             if (!Set(ref isPathBoxFocused, value))
                 OnPropertyChanged();
+            UiChangeRequested?.Invoke(RuntimeUiChange.PathBoxFocus);
         }
     }
 
@@ -256,6 +209,7 @@ public class AppRuntimeSettings : ViewModelBase
         {
             if (!Set(ref isSearchBoxFocused, value))
                 OnPropertyChanged();
+            UiChangeRequested?.Invoke(RuntimeUiChange.SearchBoxFocus);
         }
     }
 
@@ -263,7 +217,11 @@ public class AppRuntimeSettings : ViewModelBase
     public bool IsTerminalOpen
     {
         get => isTerminalOpen;
-        set => Set(ref isTerminalOpen, value);
+        set
+        {
+            if (Set(ref isTerminalOpen, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.TerminalVisibility);
+        }
     }
 
     private bool isLogOpen = false;
@@ -348,13 +306,6 @@ public class AppRuntimeSettings : ViewModelBase
         set => Set(ref isAdbWriteActive, value);
     }
 
-    private bool isPollingStopped = false;
-    public bool IsPollingStopped
-    {
-        get => isPollingStopped;
-        set => Set(ref isPollingStopped, value);
-    }
-
     private bool isDetailedPeekMode = false;
     public bool IsDetailedPeekMode
     {
@@ -380,7 +331,11 @@ public class AppRuntimeSettings : ViewModelBase
     public Cursor MainCursor
     {
         get => cursor;
-        set => Set(ref cursor, value);
+        set
+        {
+            if (Set(ref cursor, value))
+                UiChangeRequested?.Invoke(RuntimeUiChange.Cursor);
+        }
     }
 
     private float dpiScalingFactor = 1.0f;
@@ -426,33 +381,19 @@ public class AppRuntimeSettings : ViewModelBase
 
     private string tempDragPath = null;
     private readonly object tempDragPathLock = new();
-    public string TempDragPath
-    {
-        get
-        {
-            lock (tempDragPathLock)
-            {
-                return tempDragPath ??= CreateTempDragPath();
-            }
-        }
-    }
-
     public string ResetTempDragPath()
     {
         lock (tempDragPathLock)
         {
-            tempDragPath = CreateTempDragPath();
+            tempDragPath = Path.Combine(App.AppDataPath, $"drag-{Guid.NewGuid():N}");
             return tempDragPath;
         }
     }
 
-    private static string CreateTempDragPath()
-    {
-        Directory.CreateDirectory(Data.AppDataPath);
-        return Directory.CreateDirectory(Path.Combine(Data.AppDataPath, $"drag-{Guid.NewGuid():N}")).FullName;
-    }
-
-    public bool IsAppDeployed => Environment.CurrentDirectory.ToUpper() == @"C:\WINDOWS\SYSTEM32";
+    public bool IsAppDeployed => string.Equals(
+        Environment.CurrentDirectory,
+        @"C:\Windows\System32",
+        StringComparison.OrdinalIgnoreCase);
 
     public bool IsWin11 =>
 #if DEBUG
@@ -466,31 +407,8 @@ public class AppRuntimeSettings : ViewModelBase
 
     public bool HideForceFluent => !IsWin11;
 
-    public bool UseFluentStyles => IsWin11 || Data.Settings.ForceFluentStyles;
+    public bool UseFluentStyles => IsWin11 || App.Settings.ForceFluentStyles;
 
     public bool IsRTL => Thread.CurrentThread.CurrentUICulture.TextInfo.IsRightToLeft;
 
-    #region Event-only properties
-
-    public bool NewFolder { get => false; set => OnPropertyChanged(); }
-    public bool NewFile { get => false; set => OnPropertyChanged(); }
-    public bool Rename { get => false; set => OnPropertyChanged(); }
-    public bool SelectAll { get => false; set => OnPropertyChanged(); }
-    public bool Refresh { get => false; set => OnPropertyChanged(); }
-    public bool FilterDrives { get => false; set => OnPropertyChanged(); }
-    public bool FilterDevices { get => false; set => OnPropertyChanged(); }
-    public bool FilterActions { get => false; set => OnPropertyChanged(); }
-    public bool ClearNavBox { get => false; set => OnPropertyChanged(); }
-    public bool InitLister { get => false; set => OnPropertyChanged(); }
-    public bool DriveViewNav { get => false; set => OnPropertyChanged(); }
-    public bool AutoHideSearchBox { get => false; set => OnPropertyChanged(); }
-    public bool RefreshFileOpControls { get => false; set => OnPropertyChanged(); }
-    public bool ClearLogs { get => false; set => OnPropertyChanged(); }
-    public bool RefreshSettingsControls { get => false; set => OnPropertyChanged(); }
-    public bool SortFileOps { get => false; set => OnPropertyChanged(); }
-    public bool RefreshExplorerSorting { get => false; set => OnPropertyChanged(); }
-    public bool FinalizeSplash { get => false; set => OnPropertyChanged(); }
-    public bool RefreshBreadcrumbs { get => false; set => OnPropertyChanged(); }
-
-    #endregion
 }

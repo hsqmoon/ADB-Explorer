@@ -33,7 +33,7 @@ public partial class DragWindow : INotifyPropertyChanged
 
     private void DragTimer_Tick(object sender, EventArgs e)
     {
-        if (Data.RuntimeSettings.DragBitmap is null)
+        if (App.RuntimeSettings.DragBitmap is null)
             return;
 
         if (CursorInfo.IsRightButtonPressed)
@@ -58,18 +58,18 @@ public partial class DragWindow : INotifyPropertyChanged
 
     private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName != nameof(Data.RuntimeSettings.DragBitmap))
+        if (e.PropertyName != nameof(App.RuntimeSettings.DragBitmap))
             return;
 
         if (Dispatcher.CheckAccess())
             UpdateDragTimerState();
-        else
-            _ = Dispatcher.BeginInvoke(new Action(UpdateDragTimerState));
+        else if (Application.Current is App app)
+            app.EnqueueUiLatest("drag-window.state", "drag-window.state", UpdateDragTimerState);
     }
 
     private void UpdateDragTimerState()
     {
-        if (Data.RuntimeSettings.DragBitmap is null)
+        if (App.RuntimeSettings.DragBitmap is null)
         {
             DragTimer.Stop();
             return;
@@ -78,7 +78,7 @@ public partial class DragWindow : INotifyPropertyChanged
         lastTooltipUpdate = DateTime.MinValue;
         if (CursorInfo.TryGetPosition(out var mousePosition))
             UpdateMouse(mousePosition);
-        if (Data.RuntimeSettings.DragBitmap is not null)
+        if (App.RuntimeSettings.DragBitmap is not null)
             DragTimer.Start();
     }
 
@@ -87,7 +87,7 @@ public partial class DragWindow : INotifyPropertyChanged
         void updateTooltip()
         {
             DragTooltip.Inlines.Clear();
-            if (Data.CopyPaste.DragFiles.Length == 0 || Data.CopyPaste.CurrentDropEffect is DragDropEffects.None)
+            if (App.CopyPaste.DragFiles.Length == 0 || App.CopyPaste.CurrentDropEffect is DragDropEffects.None)
             {
                 return;
             }
@@ -99,27 +99,27 @@ public partial class DragWindow : INotifyPropertyChanged
             string target = "";
             if (MouseWithinApp)
             {
-                if (Data.CopyPaste.IsSelf
-                    && Data.CopyPaste.DropTarget == Data.CopyPaste.DragParent
+                if (App.CopyPaste.IsSelf
+                    && App.CopyPaste.DropTarget == App.CopyPaste.DragParent
                     && !Keyboard.Modifiers.HasFlag(ModifierKeys.Control)
                     && !Keyboard.Modifiers.HasFlag(ModifierKeys.Alt))
                 {
                     return;
                 }
 
-                target = FileHelper.GetFullName(Data.CopyPaste.DropTarget);
+                target = FileHelper.GetFullName(App.CopyPaste.DropTarget);
             }
 
             var format = "";
             string result = "";
-            var count = Data.CopyPaste.DragFiles.Length;
+            var count = App.CopyPaste.DragFiles.Length;
 
             if (count == 1)
             {
                 int sourceLength = target is null ? 30 : 45 - target.Length;
-                var source = FileHelper.GetShortFileName(Data.CopyPaste.DragFiles[0], sourceLength);
+                var source = FileHelper.GetShortFileName(App.CopyPaste.DragFiles[0], sourceLength);
 
-                if (Data.FileActions.IsAppDrive && MouseWithinApp)
+                if (App.FileActions.IsAppDrive && MouseWithinApp)
                 {
                     result = string.Format(Strings.Resources.S_DRAG_INSTALL_SINGLE, source);
                     var apkSplit = result.Split(source);
@@ -131,17 +131,17 @@ public partial class DragWindow : INotifyPropertyChanged
                     return;
                 }
 
-                if (Data.CopyPaste.CurrentDropEffect is DragDropEffects.Link)
+                if (App.CopyPaste.CurrentDropEffect is DragDropEffects.Link)
                 {
                     result = string.Format(Strings.Resources.S_DRAGDROP_LINK, target);
                 }
-                else if (Data.CopyPaste.CurrentDropEffect is DragDropEffects.Move)
+                else if (App.CopyPaste.CurrentDropEffect is DragDropEffects.Move)
                 {
                     format = string.IsNullOrEmpty(target)
                         ? Strings.Resources.S_DRAGDROP_MOVE_SINGLE
                         : Strings.Resources.S_DRAGDROP_MOVE_TARGET_SINGLE;
                 }
-                else if (Data.CopyPaste.CurrentDropEffect is DragDropEffects.Copy)
+                else if (App.CopyPaste.CurrentDropEffect is DragDropEffects.Copy)
                 {
                     format = string.IsNullOrEmpty(target)
                         ? Strings.Resources.S_DRAGDROP_COPY_SINGLE
@@ -171,7 +171,7 @@ public partial class DragWindow : INotifyPropertyChanged
             }
             else
             {
-                if (Data.FileActions.IsAppDrive && MouseWithinApp)
+                if (App.FileActions.IsAppDrive && MouseWithinApp)
                 {
                     result = string.Format(Strings.Resources.S_DRAG_INSTALL_MULTIPLE, count);
                     DragTooltip.Inlines.Add(new Run(result) { Foreground = blueBrush });
@@ -179,13 +179,13 @@ public partial class DragWindow : INotifyPropertyChanged
                     return;
                 }
 
-                if (Data.CopyPaste.CurrentDropEffect is DragDropEffects.Move)
+                if (App.CopyPaste.CurrentDropEffect is DragDropEffects.Move)
                 {
                     format = string.IsNullOrEmpty(target)
                         ? Strings.Resources.S_DRAGDROP_MOVE
                         : Strings.Resources.S_DRAGDROP_MOVE_TARGET;
                 }
-                else if (Data.CopyPaste.CurrentDropEffect is DragDropEffects.Copy)
+                else if (App.CopyPaste.CurrentDropEffect is DragDropEffects.Copy)
                 {
                     format = string.IsNullOrEmpty(target)
                         ? Strings.Resources.S_DRAGDROP_COPY
@@ -209,8 +209,8 @@ public partial class DragWindow : INotifyPropertyChanged
 
         if (App.Current.Dispatcher.CheckAccess())
             updateTooltip();
-        else
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(updateTooltip));
+        else if (Application.Current is App app)
+            app.EnqueueUiLatest("drag-window.tooltip", "drag-window.tooltip", updateTooltip);
     }
 
     private bool mouseWithinApp = true;
@@ -236,16 +236,16 @@ public partial class DragWindow : INotifyPropertyChanged
         DragImage.Width = SystemParameters.IconWidth;
         DragImage.Height = SystemParameters.IconHeight;
 
-        Data.CopyPaste.PropertyChanged += (s, e) =>
+        App.CopyPaste.PropertyChanged += (s, e) =>
         {
-            if ((e.PropertyName == nameof(Data.CopyPaste.DragFiles)
-                || e.PropertyName == nameof(Data.CopyPaste.DropTarget))
-                && Data.RuntimeSettings.DragBitmap is not null)
+            if ((e.PropertyName == nameof(App.CopyPaste.DragFiles)
+                || e.PropertyName == nameof(App.CopyPaste.DropTarget))
+                && App.RuntimeSettings.DragBitmap is not null)
             {
                 GetPathUnderMouse();
             }
         };
-        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
 
         dragWindowHandle = new WindowInteropHelper(this).Handle;
 
@@ -258,11 +258,11 @@ public partial class DragWindow : INotifyPropertyChanged
         UpdateDragTimerState();
     }
 
-    private void CancelDrag() => Data.RuntimeSettings.DragBitmap = null;
+    private void CancelDrag() => App.RuntimeSettings.DragBitmap = null;
 
     private void UpdateMouse(POINT point)
     {
-        if (Data.RuntimeSettings.DragBitmap is null)
+        if (App.RuntimeSettings.DragBitmap is null)
             return;
 
         var actualPoint = MonitorInfo.MousePositionToDpi(point, dragWindowHandle);
@@ -282,27 +282,27 @@ public partial class DragWindow : INotifyPropertyChanged
         var wasWithinApp = MouseWithinApp;
         MouseWithinApp = hwndUnderMouse == InterceptClipboard.MainWindowHandle;
 
-        if (!MouseWithinApp && Data.CopyPaste.DragStatus is CopyPasteService.DragState.None)
-            Data.RuntimeSettings.DragBitmap = null;
+        if (!MouseWithinApp && App.CopyPaste.DragStatus is CopyPasteService.DragState.None)
+            App.RuntimeSettings.DragBitmap = null;
 
         if (!MouseWithinApp)
         {
             if (wasWithinApp)
-                Data.CopyPaste.PasteState = DragDropEffects.None;
+                App.CopyPaste.PasteState = DragDropEffects.None;
         }
         else
-            Data.RuntimeSettings.DragWithinSlave = false;
+            App.RuntimeSettings.DragWithinSlave = false;
     }
 
     private void Window_Closing(object sender, CancelEventArgs e)
     {
         DragTimer.Stop();
-        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
     }
 
     private void Border_MouseUp(object sender, MouseButtonEventArgs e)
     {
-        Data.RuntimeSettings.DragBitmap = null;
+        App.RuntimeSettings.DragBitmap = null;
     }
 }
 

@@ -6,56 +6,92 @@ namespace ADB_Explorer.Helpers;
 
 internal static class AdbHelper
 {
-    public static Task<bool> CheckAdbVersion() => Task.Run(() =>
+    public static async Task<bool> CheckAdbVersion(CancellationToken cancellationToken)
     {
-        string adbPath = string.IsNullOrEmpty(Data.Settings.ManualAdbPath)
+        string adbPath = string.IsNullOrEmpty(App.Settings.ManualAdbPath)
             ? AdbExplorerConst.ADB_PROCESS
-            : Data.Settings.ManualAdbPath;
+            : App.Settings.ManualAdbPath;
 
-        ADBService.VerifyAdbVersion(adbPath);
+        await ADBService.VerifyAdbVersionAsync(adbPath, cancellationToken).ConfigureAwait(false);
 
-        return Data.RuntimeSettings.AdbVersion >= AdbExplorerConst.MIN_ADB_VERSION;
-    });
+        return App.RuntimeSettings.AdbVersion >= AdbExplorerConst.MIN_ADB_VERSION;
+    }
 
     public static void MdnsCheck()
     {
-        Task.Run(() => Data.MdnsService.State = ADBService.CheckMDNS() ? MDNS.MdnsState.Running : MDNS.MdnsState.NotRunning);
-        Task.Run(async () =>
-        {
-            while (Data.MdnsService.State is MDNS.MdnsState.InProgress)
-            {
-                _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.MdnsService.UpdateProgress()));
-
-                await Task.Delay(AdbExplorerConst.MDNS_STATUS_UPDATE_INTERVAL);
-            }
-        });
+        _ = MdnsCheckAsync();
     }
 
-    public static void EnableMdns() => App.Current.Dispatcher.Invoke(async () =>
+    private static async Task MdnsCheckAsync()
     {
-        ADBService.IsMdnsEnabled = Data.Settings.EnableMdns;
-        if (Data.Settings.EnableMdns)
+        try
         {
-            Data.QrClass = new();
-        }
-        else
-        {
-            if (Data.MdnsService.State is MDNS.MdnsState.Running)
+            var checkTask = Task.Run(ADBService.CheckMDNS);
+            while (!checkTask.IsCompleted)
             {
-                var result = await DialogService.ShowConfirmation(Strings.Resources.S_DISABLE_MDNS,
-                                                                  Strings.Resources.S_DISABLE_MDNS_TITLE,
-                                                                  Strings.Resources.S_RESTART_ADB_NOW,
-                                                                  cancelText: Strings.Resources.S_RESTART_LATER,
-                                                                  icon: DialogService.DialogIcon.Informational);
+                if (Application.Current is App app)
+                    app.EnqueueUiLatest("mdns.progress", "mdns.progress", App.MdnsService.UpdateProgress);
+
+                await Task.Delay(AdbExplorerConst.MDNS_STATUS_UPDATE_INTERVAL).ConfigureAwait(false);
+            }
+
+            bool running = await checkTask.ConfigureAwait(false);
+            if (Application.Current is App currentApp)
+            {
+                await currentApp.EnqueueUiAsync(
+                    "mdns.state",
+                    () => App.MdnsService.State = running ? MDNS.MdnsState.Running : MDNS.MdnsState.NotRunning);
+            }
+        }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "mdns.check");
+        }
+    }
+
+    public static void InitializeMdns()
+    {
+        ADBService.IsMdnsEnabled = App.Settings.EnableMdns;
+        App.QrClass = App.Settings.EnableMdns ? new() : null;
+
+        if (!App.Settings.EnableMdns)
+            App.MdnsService.State = MDNS.MdnsState.Disabled;
+    }
+
+    public static void EnableMdns() => _ = EnableMdnsAsync();
+
+    private static async Task EnableMdnsAsync()
+    {
+        try
+        {
+            ADBService.IsMdnsEnabled = App.Settings.EnableMdns;
+            if (App.Settings.EnableMdns)
+            {
+                App.QrClass = new();
+                return;
+            }
+
+            if (App.MdnsService.State is MDNS.MdnsState.Running)
+            {
+                var result = await DialogService.ShowConfirmation(
+                    Strings.Resources.S_DISABLE_MDNS,
+                    Strings.Resources.S_DISABLE_MDNS_TITLE,
+                    Strings.Resources.S_RESTART_ADB_NOW,
+                    cancelText: Strings.Resources.S_RESTART_LATER,
+                    icon: DialogService.DialogIcon.Informational);
 
                 if (result.Item1 is ContentDialogResult.Primary)
                     await Task.Run(() => ADBService.KillAdbServer());
             }
 
-            Data.QrClass = null;
-            Data.MdnsService.State = MDNS.MdnsState.Disabled;
+            App.QrClass = null;
+            App.MdnsService.State = MDNS.MdnsState.Disabled;
         }
-    });
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "mdns.enable");
+        }
+    }
 
     public static string ReadFile(ADBService.AdbDevice device, string path)
     {

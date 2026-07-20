@@ -1,13 +1,12 @@
-﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
+using ADB_Explorer.ViewModels;
 
 namespace ADB_Explorer.Services;
 
 public static class ShellCommands
 {
-    public const string SYS_BIN = "/system/bin";
     private static readonly TimeSpan COMMAND_SCAN_TIMEOUT = TimeSpan.FromSeconds(10);
-    private static readonly ConcurrentDictionary<string, byte> ActiveCommandScans = [];
+    private static readonly ConcurrentDictionary<(string DeviceId, long Sequence), byte> ActiveCommandScans = [];
     private static readonly SemaphoreSlim CommandScanGate = new(2, 2);
 
     public enum ShellCmd
@@ -47,146 +46,96 @@ public static class ShellCommands
         DeviceFindPrintf.TryRemove(deviceID, out _);
     }
 
-    public static string TranslateCommand(string cmd)
+    public static string TranslateCommand(string cmd) =>
+        TranslateCommand(cmd, App.ActiveAdbDevice?.ID);
+
+    public static string TranslateCommand(string cmd, string deviceId)
     {
         if (Enum.TryParse<ShellCmd>(cmd, out var enumCmd)
-            && Data.CurrentADBDevice is not null
-            && DeviceCommands.TryGetValue(Data.CurrentADBDevice.ID, out var dict)
+            && deviceId is not null
+            && DeviceCommands.TryGetValue(deviceId, out var dict)
             && dict.TryGetValue(enumCmd, out var deviceCmd))
+        {
             return deviceCmd;
+        }
 
         return cmd;
     }
 
-    public static void FindCommands(string deviceID)
+    internal static async Task FindCommandsAsync(
+        LogicalDeviceViewModel device,
+        long sequence,
+        Func<bool> isCurrent,
+        AdbCommandClient commandClient,
+        CancellationToken cancellationToken)
     {
-        if (!ActiveCommandScans.TryAdd(deviceID, 0))
+        string deviceID = device.ID;
+        var scanKey = (deviceID, sequence);
+        if (!ActiveCommandScans.TryAdd(scanKey, 0))
             return;
 
-        CommandScanGate.Wait();
+        bool gateAcquired = false;
         try
         {
-            using var cancellation = new CancellationTokenSource(COMMAND_SCAN_TIMEOUT);
-            int returnCode = 0;
+            await CommandScanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            gateAcquired = true;
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cancellation.CancelAfter(COMMAND_SCAN_TIMEOUT);
 
-            returnCode = ADBService.ExecuteDeviceAdbShellCommand(deviceID, "busybox", out string helpResult, out _, cancellation.Token, "--help");
-            bool busyBoxExists = returnCode == 0;
-
-            returnCode = ADBService.ExecuteDeviceAdbShellCommand(deviceID, "echo", out string echoResult, out _, cancellation.Token, "$PATH");
-            if (returnCode == 127)
-            {
-                if (!busyBoxExists)
-                    throw new Exception("echo command not found");
-
-                if (ADBService.ExecuteDeviceAdbShellCommand(deviceID, "busybox echo", out echoResult, out _, cancellation.Token, "$PATH") != 0)
-                    echoResult = null;
-            }
-
-            string mainPath;
-            List<string> cmdPaths = [];
-            if (string.IsNullOrEmpty(echoResult))
-            {
-                cmdPaths = [SYS_BIN];
-                mainPath = SYS_BIN;
-            }
-            else
-            {
-                cmdPaths = [.. echoResult.TrimEnd(ADBService.LINE_SEPARATORS).Split(':')];
-                mainPath = (cmdPaths.Contains(SYS_BIN) ? SYS_BIN : cmdPaths[0]);
-            }
-
-            bool findExists = true;
-            returnCode = ADBService.ExecuteDeviceAdbShellCommand(deviceID,
-                                                                 "find",
-                                                                 out string findResult,
-                                                                 out _,
-                                                                 cancellation.Token,
-                                                                 [.. Commands.Select(c => FileHelper.ConcatPaths(mainPath, c)), "2>/dev/null"]);
-            if (returnCode == 127)
-            {
-                if (!busyBoxExists)
-                    throw new Exception("find command not found");
-
-                findExists = false;
-                ADBService.ExecuteDeviceAdbShellCommand(deviceID,
-                                                        "busybox find",
-                                                        out findResult,
-                                                        out _,
-                                                        cancellation.Token,
-                                                        [.. Commands.Select(c => FileHelper.ConcatPaths(mainPath, c)), "2>/dev/null"]);
-            }
-
-            ADBService.ExecuteDeviceAdbShellCommand(deviceID,
-                                                    "find",
-                                                    out string findHelp,
-                                                    out _,
-                                                    cancellation.Token,
-                                                    "--help");
-
-            DeviceFindPrintf[deviceID] = findHelp.Contains("-printf FORMAT");
-
-            var sysBinCmds = findResult.Split(ADBService.LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Select(FileHelper.GetFullName).ToList();
-            var missingCmds = Commands.Except(sysBinCmds).ToList();
-
-            if (!cmdPaths.Remove(SYS_BIN))
-                cmdPaths.RemoveAt(0);
-
-            foreach (var cmdPath in cmdPaths)
-            {
-                if (missingCmds.Count < 1)
-                    break;
-
-                ADBService.ExecuteDeviceAdbShellCommand(deviceID,
-                                                        $"{(findExists ? "" : "busybox ")}find",
-                                                        out findResult,
-                                                        out _,
-                                                        cancellation.Token,
-                                                        [.. missingCmds.Select(c => FileHelper.ConcatPaths(cmdPath, c)), "2>/dev/null"]);
-
-                var newCmds = findResult.Split(ADBService.LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries)
-                                        .Select(FileHelper.GetFullName);
-
-                foreach (var item in newCmds)
-                {
-                    if (missingCmds.Remove(item))
-                        sysBinCmds.Add(item);
-                }
-            }
-
-            if (missingCmds.Count > 0)
-            {
-                ADBService.ExecuteDeviceAdbShellCommand(deviceID, "alias", out string aliasResult, out _, cancellation.Token);
-
-                var matches = AdbRegEx.RE_GET_ALIAS().Matches(aliasResult);
-
-                var aliases = matches.Select(m => m.Groups["Alias"].Value).Where(missingCmds.Contains);
-
-                foreach (var item in aliases)
-                {
-                    if (missingCmds.Remove(item))
-                        sysBinCmds.Add(item);
-                }
-            }
+            string commandNames = string.Join(' ', Commands);
+            string script = $"""
+                for cmd in {commandNames}; do
+                    resolved=$(command -v "$cmd" 2>/dev/null)
+                    if [ -n "$resolved" ]; then
+                        echo "$cmd=$resolved"
+                    elif command -v busybox >/dev/null 2>&1 && busybox "$cmd" --help >/dev/null 2>&1; then
+                        echo "$cmd=busybox $cmd"
+                    fi
+                done
+                find_help=$(find --help 2>&1)
+                case "$find_help" in
+                    *'-printf FORMAT'*) echo '__FIND_PRINTF__=1' ;;
+                esac
+                """;
+            string output = await commandClient.ExecuteShellAsync(
+                device,
+                script,
+                cancellation.Token).ConfigureAwait(false);
 
             Dictionary<ShellCmd, string> deviceDict = [];
-
-            sysBinCmds.Select<string, (ShellCmd?, string)>(c => (Enum.TryParse<ShellCmd>(c, true, out var result) ? result : null, c))
-                      .Where(c => c.Item1 is not null)
-                      .ForEach(c => deviceDict.TryAdd(c.Item1.Value, c.Item2));
-
-            if (missingCmds.Count > 0 && busyBoxExists)
+            bool findPrintf = false;
+            foreach (string line in output.Split(ADBService.LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries))
             {
-                missingCmds.Select<string, (ShellCmd?, string)>(c => (Enum.TryParse<ShellCmd>(c, true, out var result) ? result : null, c))
-                      .Where(c => c.Item1 is not null)
-                      .ForEach(c => deviceDict.TryAdd(c.Item1.Value, $"busybox {c.Item2}"));
+                var parts = line.Trim().Split('=', 2);
+                if (parts.Length != 2)
+                    continue;
+                if (parts[0] == "__FIND_PRINTF__")
+                {
+                    findPrintf = parts[1] == "1";
+                    continue;
+                }
+                if (Enum.TryParse(parts[0], true, out ShellCmd command))
+                    deviceDict[command] = parts[1];
             }
 
-            DeviceCommands[deviceID] = deviceDict;
+            if (isCurrent())
+            {
+                DeviceFindPrintf[deviceID] = findPrintf;
+                DeviceCommands[deviceID] = deviceDict;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        { }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "shell-commands.scan");
+            throw;
         }
         finally
         {
-            CommandScanGate.Release();
-            ActiveCommandScans.TryRemove(deviceID, out _);
+            if (gateAcquired)
+                CommandScanGate.Release();
+            ActiveCommandScans.TryRemove(scanKey, out _);
         }
     }
 }

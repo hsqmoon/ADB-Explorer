@@ -2,6 +2,7 @@
 <ResourceDictionary
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:app="clr-namespace:ADB_Explorer"
     xmlns:converters="clr-namespace:ADB_Explorer.Converters"
     xmlns:helpers="clr-namespace:ADB_Explorer.Helpers"
     xmlns:models="clr-namespace:ADB_Explorer.Models"
@@ -194,7 +195,7 @@
             </EventTrigger>
             <MultiDataTrigger>
                 <MultiDataTrigger.Conditions>
-                    <Condition Binding="{Binding Source={x:Static Member=models:Data.Settings}, Path=IsAnimated}" Value="True" />
+                    <Condition Binding="{Binding Source={x:Static Member=app:App.Settings}, Path=IsAnimated}" Value="True" />
                     <Condition Binding="{Binding RelativeSource={RelativeSource Mode=Self}, Path=(helpers:StyleHelper.BeginAnimation)}" Value="True" />
                     <Condition Binding="{Binding RelativeSource={RelativeSource Mode=Self}, Path=(helpers:StyleHelper.AnimateOnClick)}" Value="True" />
                 </MultiDataTrigger.Conditions>
@@ -992,7 +993,7 @@
         BasedOn="{StaticResource DefaultMenuItemStyle}"
         TargetType="MenuItem">
         <Setter Property="Background" Value="{DynamicResource MenuFlyoutItemRevealBackground}" />
-        <Setter Property="helpers:StyleHelper.UseFluentStyles" Value="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=UseFluentStyles}" />
+        <Setter Property="helpers:StyleHelper.UseFluentStyles" Value="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=UseFluentStyles}" />
         <Setter Property="helpers:MenuHelper.IsButtonMenu" Value="{Binding RelativeSource={RelativeSource Mode=Self}, Converter={StaticResource MenuItemConverter}, ConverterParameter=Style}" />
         <Setter Property="helpers:StyleHelper.ContentAnimation" Value="None" />
         <Setter Property="helpers:StyleHelper.BeginAnimation" Value="False" />

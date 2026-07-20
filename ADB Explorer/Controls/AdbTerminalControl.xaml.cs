@@ -119,7 +119,7 @@ public partial class AdbTerminalControl : UserControl
         PostMessage(new { type = "focus" });
     }
 
-    public void Shutdown()
+    public async Task ShutdownAsync()
     {
         if (isDisposed)
             return;
@@ -134,7 +134,7 @@ public partial class AdbTerminalControl : UserControl
 
         try
         {
-            Session.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await Session.DisposeAsync();
         }
         catch
         { }
@@ -210,7 +210,10 @@ public partial class AdbTerminalControl : UserControl
         TaskCompletionSource<int> completion = CreateCompletion<int>();
         bool posted = false;
 
-        await Dispatcher.InvokeAsync(() =>
+        if (Application.Current is not App app)
+            return;
+
+        await app.EnqueueUiAsync("terminal.output", () =>
         {
             if (isDisposed || !pageReady)
                 return;
@@ -223,7 +226,7 @@ public partial class AdbTerminalControl : UserControl
                 data = Convert.ToBase64String(output),
             });
             posted = true;
-        }, DispatcherPriority.Render);
+        });
 
         if (!posted)
             return;
@@ -250,8 +253,8 @@ public partial class AdbTerminalControl : UserControl
     {
         if (Dispatcher.CheckAccess())
             PostMessage(new { type = "clear" });
-        else
-            _ = Dispatcher.BeginInvoke(new Action(() => PostMessage(new { type = "clear" })));
+        else if (Application.Current is App app)
+            app.EnqueueUiLatest("terminal.clear", "terminal.clear", () => PostMessage(new { type = "clear" }));
     }
 
     private async void TerminalWebView_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -303,11 +306,14 @@ public partial class AdbTerminalControl : UserControl
                     break;
 
                 case "copy":
-                    _ = SetClipboardTextAsync((string)message["data"] ?? "");
+                    if (Application.Current is App copyApp)
+                        await copyApp.SetClipboardTextAsync((string)message["data"] ?? "");
                     break;
 
                 case "requestPaste":
-                    string clipboardText = GetClipboardText();
+                    string clipboardText = Application.Current is App pasteApp
+                        ? await pasteApp.ReadClipboardTextAsync()
+                        : "";
                     if (!string.IsNullOrEmpty(clipboardText))
                         PostMessage(new { type = "paste", data = clipboardText });
                     break;
@@ -354,7 +360,8 @@ public partial class AdbTerminalControl : UserControl
             return;
 
         Session.SetHostUnavailable(status);
-        _ = Dispatcher.BeginInvoke(new Action(() => _ = RecoverRendererAsync()), DispatcherPriority.Background);
+        if (Application.Current is App app)
+            app.EnqueueUiLatest("terminal.recover", "terminal.recover", () => _ = RecoverRendererAsync());
     }
 
     private async Task RecoverRendererAsync()
@@ -406,37 +413,6 @@ public partial class AdbTerminalControl : UserControl
             return;
 
         TerminalWebView.CoreWebView2.PostWebMessageAsJson(JsonConvert.SerializeObject(message));
-    }
-
-    private static async Task SetClipboardTextAsync(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return;
-
-        for (int attempt = 1; attempt <= 3; attempt++)
-        {
-            try
-            {
-                Clipboard.SetDataObject(text, true);
-                return;
-            }
-            catch (COMException ex) when ((uint)ex.HResult == 0x800401D0)
-            {
-                await Task.Delay(20 * attempt);
-            }
-        }
-    }
-
-    private static string GetClipboardText()
-    {
-        try
-        {
-            return Clipboard.ContainsText() ? Clipboard.GetText() : "";
-        }
-        catch
-        {
-            return "";
-        }
     }
 
     private static void OpenExternalLink(string url)

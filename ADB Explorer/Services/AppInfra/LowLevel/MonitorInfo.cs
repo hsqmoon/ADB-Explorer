@@ -48,12 +48,12 @@ public static partial class NativeMethods
                 dpi = 96;
 
             // Calculate the scaling factor (96 is the default DPI)
-            Data.RuntimeSettings.DpiScalingFactor = 96f / dpi;
+            App.RuntimeSettings.DpiScalingFactor = 96f / dpi;
 
             // Convert the coordinates
             return new(
-                (int)(mousePosition.X * Data.RuntimeSettings.DpiScalingFactor),
-                (int)(mousePosition.Y * Data.RuntimeSettings.DpiScalingFactor));
+                (int)(mousePosition.X * App.RuntimeSettings.DpiScalingFactor),
+                (int)(mousePosition.Y * App.RuntimeSettings.DpiScalingFactor));
         }
 
         [DllImport("User32.dll")]

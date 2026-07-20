@@ -4,20 +4,18 @@ using AdvancedSharpAdbClient;
 using System.Net;
 using static ADB_Explorer.Models.AdbExplorerConst;
 using static ADB_Explorer.Models.AdbRegEx;
-using static ADB_Explorer.Models.Data;
+using static ADB_Explorer.App;
 
 namespace ADB_Explorer.Services;
 
 public partial class ADBService
 {
-    private const string GET_DEVICES = "devices";
     private const string ENABLE_MDNS = "ADB_MDNS_OPENSCREEN";
     private const string ADB_SERVER_PORT_ENV = "ANDROID_ADB_SERVER_PORT";
     private const int DEFAULT_ADB_SERVER_PORT = 5037;
+    private const int COMMAND_OUTPUT_QUEUE_CAPACITY = 256;
     private static readonly TimeSpan ADB_SERVER_RESTART_COOLDOWN = TimeSpan.FromSeconds(3);
-    private static readonly object AdbServerDiscoveryLock = new();
     private static readonly object AdbServerRestartLock = new();
-    private static bool adbServerDiscoveryCompleted;
     private static DateTime lastAdbServerRestart = DateTime.MinValue;
     private static bool lastAdbServerRestartSucceeded;
 
@@ -61,9 +59,6 @@ public partial class ADBService
         }
     }
 
-    private static IEnumerable<LogicalDevice> ParseDevices(string stdout) =>
-        RE_DEVICE_NAME().Matches(stdout).Select(LogicalDevice.New).Where(d => d);
-
     private static string GetRunningAdbServerPath(int port)
     {
         try
@@ -92,44 +87,6 @@ public partial class ADBService
         { }
 
         return null;
-    }
-
-    private static bool TrySwitchToVisibleAdbServer(out IEnumerable<LogicalDevice> devices)
-    {
-        devices = [];
-
-        lock (AdbServerDiscoveryLock)
-        {
-            if (adbServerDiscoveryCompleted)
-                return false;
-
-            adbServerDiscoveryCompleted = true;
-
-            try
-            {
-                var adbServerPath = GetRunningAdbServerPath(DEFAULT_ADB_SERVER_PORT);
-                if (string.IsNullOrWhiteSpace(adbServerPath))
-                    return false;
-
-                using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-                var result = ExecuteCommand(adbServerPath, GET_DEVICES, out string stdout, out _, Encoding.UTF8, cancellation.Token, "-l");
-                if (result != 0)
-                    return false;
-
-                if (!string.Equals(RuntimeSettings.AdbPath, adbServerPath, StringComparison.OrdinalIgnoreCase))
-                {
-                    RuntimeSettings.AdbPath = adbServerPath;
-                    Data.AddCommandLog($"Using visible adb server: {adbServerPath} on {DEFAULT_ADB_SERVER_PORT}");
-                }
-
-                devices = ParseDevices(stdout).ToList();
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
     }
 
     public class ProcessFailedException : Exception
@@ -185,12 +142,9 @@ public partial class ADBService
         cmdProcess.Start();
         SetBackgroundPriority(cmdProcess);
 
-        if (!isAdbExecutable || cmd != GET_DEVICES)
-        {
-            Data.AddCommandLog(isAdbExecutable
-                ? $"[adb-server:{RuntimeSettings.AdbServerPort}] {file} {arguments}"
-                : $"{file} {arguments}");
-        }
+        App.AddCommandLog(isAdbExecutable
+            ? $"[adb-server:{RuntimeSettings.AdbServerPort}] {file} {arguments}"
+            : $"{file} {arguments}");
 
         return cmdProcess;
     }
@@ -199,33 +153,46 @@ public partial class ADBService
         string file, string cmd, out string stdout, out string stderr, Encoding encoding, CancellationToken cancellationToken, params string[] args)
     {
         using var cmdProcess = StartCommandProcess(file, cmd, encoding, args: args);
-
-        var stdoutTask = cmdProcess.StandardOutput.ReadToEndAsync();
-        var stderrTask = cmdProcess.StandardError.ReadToEndAsync();
-        
-        var processTask = cmdProcess.WaitForExitAsync(cancellationToken);
-
-        try
+        StringBuilder stdoutBuilder = new();
+        StringBuilder stderrBuilder = new();
+        object outputLock = new();
+        cmdProcess.OutputDataReceived += (_, e) =>
         {
-            Task.WaitAll([stdoutTask, stderrTask, processTask], cancellationToken);
-
-            stdout = stdoutTask.Result;
-            stderr = stderrTask.Result;
-            return cmdProcess.ExitCode;
-        }
-        catch (OperationCanceledException)
+            if (e.Data is not null)
+            {
+                lock (outputLock)
+                    stdoutBuilder.AppendLine(e.Data);
+            }
+        };
+        cmdProcess.ErrorDataReceived += (_, e) =>
         {
-            ProcessHandling.KillProcess(cmdProcess);
+            if (e.Data is not null)
+            {
+                lock (outputLock)
+                    stderrBuilder.AppendLine(e.Data);
+            }
+        };
+        cmdProcess.BeginOutputReadLine();
+        cmdProcess.BeginErrorReadLine();
 
-            processTask = null;
-            stdoutTask = null;
-            stderrTask = null;
+        using var cancellationRegistration = cancellationToken.Register(() =>
+        {
+            try
+            {
+                ProcessHandling.KillProcess(cmdProcess);
+            }
+            catch
+            { }
+        });
+        cmdProcess.WaitForExit();
 
-            stdout = "";
-            stderr = "";
-
-            return -1;
+        lock (outputLock)
+        {
+            stdout = stdoutBuilder.ToString();
+            stderr = stderrBuilder.ToString();
         }
+
+        return cancellationToken.IsCancellationRequested ? -1 : cmdProcess.ExitCode;
     }
 
     public static int ExecuteAdbCommand(string cmd, out string stdout, out string stderr, CancellationToken cancellationToken, params string[] args)
@@ -270,7 +237,7 @@ public partial class ADBService
         using var cmdProcess = StartCommandProcess(file, cmd, encoding, redirect, process, workingDir, args: args);
         using var cancellationRegistration = cancellationToken.Register(() => ProcessHandling.KillProcess(cmdProcess));
 
-        using BlockingCollection<string> outputQueue = [];
+        using BlockingCollection<string> outputQueue = new(COMMAND_OUTPUT_QUEUE_CAPACITY);
         string stderr = "";
         cmdProcess.OutputDataReceived += (sender, e) =>
         {
@@ -320,7 +287,7 @@ public partial class ADBService
         {
             // device is disconnected
             // return without throwing
-            // command results are no longer relevant and will be cleared by DeviceListSetup()
+            // command results are no longer relevant and will be cleared by the device snapshot pipeline
         }
         else
         {
@@ -382,34 +349,26 @@ public partial class ADBService
 
     public static string EscapeAdbString(string str) => $"\"{str}\"";
 
-    public static IEnumerable<LogicalDevice> GetDevices()
+    public static Task<bool> EnsureAdbServerAsync(CancellationToken cancellationToken) => Task.Run(() =>
     {
         EnsureAdbServerPort();
 
-        if (TrySwitchToVisibleAdbServer(out var visibleDevices))
-            return visibleDevices;
-
-        try
+        if (string.IsNullOrWhiteSpace(RuntimeSettings.AdbPath)
+            || !File.Exists(RuntimeSettings.AdbPath))
         {
-            using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-            var devices = new AdbClient(AdbServerEndPoint)
-                .GetDevicesAsync(cancellation.Token)
-                .GetAwaiter()
-                .GetResult()
-                .Select(LogicalDevice.New)
-                .Where(device => device)
-                .ToList();
-            RuntimeSettings.LastServerResponse = DateTime.Now;
-            return devices;
+            var visibleAdbPath = GetRunningAdbServerPath(DEFAULT_ADB_SERVER_PORT);
+            if (!string.IsNullOrWhiteSpace(visibleAdbPath))
+                RuntimeSettings.AdbPath = visibleAdbPath;
         }
-        catch
-        { }
 
-        using var processCancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-        ExecuteAdbCommand(GET_DEVICES, out string stdout, out string stderr, processCancellation.Token, "-l");
-
-        return ParseDevices(stdout).ToList();
-    }
+        return ExecuteCommand(
+            RuntimeSettings.AdbPath,
+            "start-server",
+            out _,
+            out _,
+            Encoding.UTF8,
+            cancellationToken) == 0;
+    }, cancellationToken);
 
     public static void ConnectNetworkDevice(string host, UInt16 port) => NetworkDeviceOperation("connect", $"{host}:{port}");
     public static void ConnectNetworkDevice(string fullAddress) => NetworkDeviceOperation("connect", fullAddress);
@@ -477,37 +436,6 @@ public partial class ADBService
         }
     }
 
-    public static bool MmcExists(string deviceID) => GetMmcNode(deviceID).Count > 1;
-
-    public static GroupCollection GetMmcNode(string deviceID)
-    {
-        // Check whether the MMC block device (first partition) exists (MMC0 / MMC1)
-        ExecuteDeviceAdbShellCommand(deviceID, "stat", out string stdout, out _, CancellationToken.None, @"-c""%t,%T""", MMC_BLOCK_DEVICES[0], MMC_BLOCK_DEVICES[1]);
-        // Exit code will always be 1 since we are searching for both possibilities, and only one of them can exist
-
-        // Get major and minor nodes in hex and return
-        return RE_MMC_BLOCK_DEVICE_NODE().Match(stdout).Groups;
-    }
-
-    public static string GetMmcId(string deviceID)
-    {
-        var matchGroups = GetMmcNode(deviceID);
-        if (matchGroups.Count < 2)
-            return "";
-
-        // Get a list of all volumes (and their nodes)
-        // The public flag reduces execution time significantly
-        int exitCode = ExecuteDeviceAdbShellCommand(deviceID, "sm", out string stdout, out _, CancellationToken.None, "list-volumes", "public");
-        if (exitCode != 0)
-            return "";
-
-        var node = $"{Convert.ToInt32(matchGroups["major"].Value, 16)},{Convert.ToInt32(matchGroups["minor"].Value, 16)}";
-        // Find the ID of the device with the MMC node
-        var mmcVolumeId = Regex.Match(stdout, @$"{node}\smounted\s(?<id>[\w-]+)");
-
-        return mmcVolumeId.Success ? mmcVolumeId.Groups["id"].Value : "";
-    }
-
     public static bool CheckMDNS()
     {
         var res = ExecuteAdbCommandAsync("mdns", CancellationToken.None, "check");
@@ -544,45 +472,25 @@ public partial class ADBService
 
     static string[] UnrootArgs => ["shell", "su", "-c", EscapeAdbShellString("resetprop ro.debuggable 0 && resetprop service.adb.root 0 && setprop ctl.restart adbd")];
 
-    public static bool Root(Device device)
+    public static bool Root(Device device, CancellationToken cancellationToken = default)
     {
-        ExecuteDeviceAdbCommand(device.ID, "", out string stdout, out string stderr, CancellationToken.None, RootArgs);
+        ExecuteDeviceAdbCommand(device.ID, "", out string stdout, out string stderr, cancellationToken, RootArgs);
         if (stdout != "" || stderr != "")
-            ExecuteDeviceAdbCommand(device.ID, "", out stdout, out _, CancellationToken.None, "root");
+            ExecuteDeviceAdbCommand(device.ID, "", out stdout, out _, cancellationToken, "root");
 
         return !stdout.Contains("cannot run as root");
     }
 
-    public static bool Unroot(Device device)
+    public static bool Unroot(Device device, CancellationToken cancellationToken = default)
     {
-        ExecuteDeviceAdbCommand(device.ID, "", out string stdout, out string stderr, CancellationToken.None, UnrootArgs);
+        ExecuteDeviceAdbCommand(device.ID, "", out string stdout, out string stderr, cancellationToken, UnrootArgs);
         if (stdout != "" || stderr != "")
-            ExecuteDeviceAdbCommand(device.ID, "", out stdout, out _, CancellationToken.None, "unroot");
+            ExecuteDeviceAdbCommand(device.ID, "", out stdout, out _, cancellationToken, "unroot");
 
         var result = stdout.Contains("restarting adbd as non root");
-        DevicesObject.UpdateDeviceRoot(device.ID, result);
+        App.ActiveDevices.UpdateDeviceRoot(device.ID, result);
 
         return result;
-    }
-
-    public static bool? TryGetRootState(string deviceId)
-    {
-        using var cancellation = new CancellationTokenSource(ADB_POLL_COMMAND_TIMEOUT);
-        if (ExecuteDeviceAdbShellCommand(deviceId, "whoami", out string stdout, out _, cancellation.Token) != 0)
-            return null;
-
-        return stdout.Trim() == "root";
-    }
-
-    public static bool WhoAmI(string deviceId) => TryGetRootState(deviceId) is true;
-
-    public static ulong CountFiles(string deviceID, string path, IEnumerable<string> includeNames = null, IEnumerable<string> excludeNames = null)
-    {
-        string[] args = PrepFindArgs(path, includeNames, excludeNames, true);
-
-        ExecuteDeviceAdbShellCommand(deviceID, "find", out string stdout, out _, CancellationToken.None, args);
-
-        return ulong.TryParse(stdout, out var count) ? count : 0;
     }
 
     public static string[] FindFilesInPath(string deviceID, string path, IEnumerable<string> includeNames = null, IEnumerable<string> excludeNames = null, bool caseSensitive = false)
@@ -633,26 +541,28 @@ public partial class ADBService
         return args;
     }
 
-    public static long CountRecycle(string deviceID)
-    {
-        return (long)CountFiles(deviceID, RECYCLE_PATH, excludeNames: ["*" + RECYCLE_INDEX_SUFFIX]);
-    }
+    private static readonly SemaphoreSlim RepoHashGate = new(1, 1);
+    private static IReadOnlyCollection<string> repoHashList;
 
-    public static ulong CountPackages(string deviceID)
+    private static async Task<IReadOnlyCollection<string>> GetRepoHashListAsync(CancellationToken cancellationToken)
     {
-        return CountFiles(deviceID, TEMP_PATH, includeNames: INSTALL_APK.Select(name => "*" + name));
-    }
+        if (repoHashList is not null)
+            return repoHashList;
 
-    static IEnumerable<string> _repoHashList = null;
-    static IEnumerable<string> RepoHashList
-    {
-        get
+        await RepoHashGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            _repoHashList ??= Network.GetAdbVersionListAsync().Result;
-
-            return _repoHashList;
+            repoHashList ??= (await Network.GetAdbVersionListAsync().ConfigureAwait(false))?.ToArray() ?? [];
+            return repoHashList;
+        }
+        finally
+        {
+            RepoHashGate.Release();
         }
     }
+
+    public static Task VerifyAdbVersionAsync(string adbPath, CancellationToken cancellationToken = default) =>
+        Task.Run(() => VerifyAdbVersionCoreAsync(adbPath, cancellationToken), cancellationToken);
 
     /// <summary>
     /// Verifies ADB.exe hash against known valid versions and its version.<br/>
@@ -664,7 +574,7 @@ public partial class ADBService
     /// • 0.0.0 if ADB is valid but the version cannot be determined <br/>
     /// • the actual version if it can be determined
     /// </remarks>
-    public static void VerifyAdbVersion(string adbPath)
+    private static async Task VerifyAdbVersionCoreAsync(string adbPath, CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(adbPath) || adbPath.StartsWith(@"\\"))   // Forbid UNC paths for security reasons
         {
@@ -696,7 +606,7 @@ public partial class ADBService
 
             // As a last resort, check against the list retrieved from the repository (which is updated more frequently)
             if (!isHashValid)
-                isHashValid = RepoHashList.Contains(adbSHA);
+                isHashValid = (await GetRepoHashListAsync(cancellationToken).ConfigureAwait(false)).Contains(adbSHA);
         }
 
         if (!isHashValid)
@@ -709,7 +619,7 @@ public partial class ADBService
         string stdout = "";
         try
         {
-            exitCode = ExecuteCommand($"\"{adbPath}\"", "version", out stdout, out _, Encoding.UTF8, CancellationToken.None);
+            exitCode = ExecuteCommand($"\"{adbPath}\"", "version", out stdout, out _, Encoding.UTF8, cancellationToken);
         }
         catch { }
 

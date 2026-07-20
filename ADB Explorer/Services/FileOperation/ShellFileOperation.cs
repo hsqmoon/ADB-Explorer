@@ -42,7 +42,7 @@ public static class ShellFileOperation
         ADBService.ExecuteDeviceAdbShellCommand(device.ID, "rm", out _, out _, CancellationToken.None, args);
     }
 
-    public static void DeleteItems(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
+    public static Task DeleteItemsAsync(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
@@ -53,7 +53,7 @@ public static class ShellFileOperation
             operations.Add(fileOp);
         }
 
-        Data.FileOpQ.AddOperations(operations);
+        return App.ActiveFileOperations.AddOperationsAsync(operations);
     }
 
     private static void DeleteFileOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -68,16 +68,17 @@ public static class ShellFileOperation
         if (op.FilePath.TrashIndex is TrashIndexer indexer)
             SilentDelete(op.Device, indexer.IndexerPath);
 
-        if (op.Device.ID == Data.CurrentADBDevice.ID)
+        var session = App.ActiveDirectorySession;
+        if (op.Device.ID == App.ActiveAdbDevice?.ID && session is not null)
         {
             // remove file from cut items and clear its trash indexer if current device
             op.FilePath.CutState = DragDropEffects.None;
             op.FilePath.TrashIndex = null;
 
             // update UI if current path
-            if (op.TargetPath.ParentPath == Data.CurrentPath)
+            if (op.TargetPath.ParentPath == App.ExplorerState.CurrentPath)
             {
-                Data.DirList.FileList.Remove(op.FilePath);
+                session.RemoveItem(op.FilePath);
                 FileActionLogic.ScheduleUpdateFileActions();
             }
         }
@@ -90,7 +91,7 @@ public static class ShellFileOperation
         var fileOp = new FileRenameOperation(item, targetPath, device, App.Current.Dispatcher);
         fileOp.PropertyChanged += RenameFileOp_PropertyChanged;
 
-        Data.FileOpQ.AddOperation(fileOp);
+        App.ActiveFileOperations.AddOperation(fileOp);
     }
 
     private static void RenameFileOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -101,23 +102,35 @@ public static class ShellFileOperation
         if (e.PropertyName is not nameof(FileOperation.Status) || op.Status is not FileOperation.OperationStatus.Completed)
             return;
 
-        if (op.Device.ID == Data.CurrentADBDevice.ID
-            && op.FilePath.ParentPath == Data.CurrentPath)
+        var session = App.ActiveDirectorySession;
+        if (op.Device.ID == App.ActiveAdbDevice?.ID
+            && op.FilePath.ParentPath == App.ExplorerState.CurrentPath
+            && session is not null)
         {
-            var file = Data.DirList.FileList.Find(f => f.FullPath == op.FilePath.FullPath);
+            var file = session.FileList.FirstOrDefault(f => f.FullPath == op.FilePath.FullPath);
+            if (file is null)
+            {
+                op.PropertyChanged -= RenameFileOp_PropertyChanged;
+                return;
+            }
 
             // update UI when on current device and current path
-            if (op.Dispatcher.CheckAccess())
-                file.UpdatePath(op.TargetPath.FullPath);
-            else
-                _ = op.Dispatcher.BeginInvoke(new Action(() => file.UpdatePath(op.TargetPath.FullPath)));
+            if (Application.Current is App app)
+                app.EnqueueUiLatest(
+                    $"file.rename.{op.Device.ID}.{op.FilePath.FullPath}",
+                    "file.rename",
+                    () =>
+                    {
+                        if (ReferenceEquals(session, App.ActiveDirectorySession))
+                            file.UpdatePath(op.TargetPath.FullPath);
+                    });
 
-            if (Data.SelectedFiles.Count() == 1 && Data.SelectedFiles.First() == file)
-                Data.FileActions.ItemToSelect = null;
+            if (App.ExplorerState.SelectedFiles.Count() == 1 && App.ExplorerState.SelectedFiles.First() == file)
+                (Application.Current as App)?.SelectExplorerItem(null);
 
             // only select the item if there aren't any other operations
-            if (Data.FileOpQ.TotalCount == 1)
-                Data.FileActions.ItemToSelect = file;
+            if (App.ActiveFileOperations.TotalCount == 1)
+                (Application.Current as App)?.SelectExplorerItem(file);
         }
 
         op.PropertyChanged -= RenameFileOp_PropertyChanged;
@@ -147,7 +160,7 @@ public static class ShellFileOperation
                                  IEnumerable<FileClass> items,
                                  string targetPath,
                                  string currentPath,
-                                 ObservableList<FileClass> fileList,
+                                 IEnumerable<FileClass> fileList,
                                  Dispatcher dispatcher,
                                  DragDropEffects cutType = DragDropEffects.None)
         => MoveItems(device,
@@ -176,8 +189,8 @@ public static class ShellFileOperation
         Dictionary<string, TrashIndexer> recycleIndex = null;
         if (isRestore && itemList.Any(item => item.TrashIndex is null))
         {
-            IEnumerable<TrashIndexer> indexers = Data.RecycleIndex;
-            if (Data.RecycleIndex.Count == 0)
+            IEnumerable<TrashIndexer> indexers = App.ExplorerState.RecycleIndex;
+            if (App.ExplorerState.RecycleIndex.Count == 0)
             {
                 try
                 {
@@ -185,7 +198,7 @@ public static class ShellFileOperation
                 }
                 catch (Exception e)
                 {
-                    Data.AddCommandLog($"@ADB Explorer: failed to read recycle index: {e.Message}");
+                    App.AddCommandLog($"@ADB Explorer: failed to read recycle index: {e.Message}");
                     return;
                 }
             }
@@ -253,92 +266,114 @@ public static class ShellFileOperation
         else
             fileops = [.. Move()];
 
+        if (fileops.Count == 0)
+            return;
+
         fileops.ForEach(op => op.MasterPid = masterPid);
 
-        dispatcher.Invoke(() =>
+        List<(DirectorySession Session, FileClass Item)> completedTargets = [];
+        int remainingOperations = fileops.Count;
+        void moveFileOpCompleted(object sender, PropertyChangedEventArgs e)
         {
-            fileops.ForEach(op => op.PropertyChanged += MoveFileOp_PropertyChanged);
-            Data.FileOpQ.AddOperations(fileops);
-        });
+            var op = sender as FileMoveOperation;
+            if (e.PropertyName is not nameof(FileOperation.Status)
+                || op.Status is FileOperation.OperationStatus.Waiting or FileOperation.OperationStatus.InProgress)
+            {
+                return;
+            }
+
+            op.PropertyChanged -= moveFileOpCompleted;
+            var completedTarget = ApplyMoveFileOpCompletion(op);
+            if (completedTarget is not null)
+                completedTargets.Add(completedTarget.Value);
+
+            remainingOperations--;
+            if (remainingOperations > 0 || Application.Current is not App app)
+                return;
+
+            var currentSession = App.ActiveDirectorySession;
+            if (currentSession is null)
+                return;
+
+            var items = completedTargets
+                .Where(result => ReferenceEquals(result.Session, currentSession))
+                .Select(result => result.Item)
+                .ToArray();
+            app.SelectExplorerItems(items, currentSession);
+        }
+
+        fileops.ForEach(op => op.PropertyChanged += moveFileOpCompleted);
+        await App.ActiveFileOperations.AddOperationsAsync(fileops).ConfigureAwait(false);
     }
 
-    private static void MoveFileOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
+    private static (DirectorySession Session, FileClass Item)? ApplyMoveFileOpCompletion(FileMoveOperation op)
     {
-        var op = sender as FileMoveOperation;
+        if (op.Status is not FileOperation.OperationStatus.Completed)
+            return null;
 
-        // when operation completes, remove this event handler anyway
-        if (e.PropertyName is nameof(FileOperation.Status)
-            && op.Status is FileOperation.OperationStatus.Completed)
+        // write or delete indexer, even if not current device
+        if (op.OperationName is FileOperation.OperationType.Recycle)
         {
-            // write or delete indexer, even if not current device
-            if (op.OperationName is FileOperation.OperationType.Recycle)
-            {
-                TrashIndexer indexer = new(op);
-                WriteLine(op.Device, op.IndexerPath, ADBService.EscapeAdbShellString(indexer.ToString()));
-            }
-            else if (op.OperationName is FileOperation.OperationType.Restore)
-            {
-                SilentDelete(op.Device, op.IndexerPath);
-            }
-
-            // remove file from cut items
-            op.FilePath.CutState = DragDropEffects.None;
-
-            if (op.Device.ID == Data.CurrentADBDevice.ID)
-            {
-                // notify master process of completion
-                if (op.MasterPid > 0 && op.OperationName is not FileOperation.OperationType.Copy)
-                {
-                    IpcService.NotifyFileMoved(op.MasterPid, op.Device, op.FilePath);
-                }
-
-                // clear file trash indexer if restore / recycle on current device
-                if (op.OperationName is FileOperation.OperationType.Recycle or FileOperation.OperationType.Restore)
-                {
-                    op.FilePath.TrashIndex = null;
-                }
-
-                // update UI when copy / cut target is current path
-                if (op.TargetPath.ParentPath == Data.CurrentPath)
-                {
-                    if (op.OperationName is FileOperation.OperationType.Copy)
-                    {
-                        FileClass newFile = new(op.FilePath)
-                        {
-                            IsLink = op.isLink
-                        };
-                        newFile.UpdatePath(op.TargetPath.FullPath);
-                        newFile.ModifiedTime = op.DateModified;
-                        
-                        Data.DirList.FileList.Add(newFile);
-
-                        // only select the item if there aren't any other operations
-                        if (Data.FileOpQ.TotalCount == 1)
-                            Data.FileActions.ItemToSelect = newFile;
-                    }
-                    else
-                    {
-                        op.FilePath.UpdatePath(op.TargetPath.FullPath);
-                        Data.DirList.FileList.Add(op.FilePath);
-
-                        // only select the item if there aren't any other operations
-                        if (Data.FileOpQ.TotalCount == 1)
-                            Data.FileActions.ItemToSelect = op.FilePath;
-                    }
-
-                    FileActionLogic.ScheduleUpdateFileActions();
-                }
-
-                // update UI when cut / restore / recycle source is current path
-                else if (op.FilePath.ParentPath == Data.CurrentPath && op.OperationName is not FileOperation.OperationType.Copy)
-                {
-                    Data.DirList.FileList.Remove(op.FilePath);
-                    FileActionLogic.ScheduleUpdateFileActions();
-                }
-            }
-
-            op.PropertyChanged -= MoveFileOp_PropertyChanged;
+            TrashIndexer indexer = new(op);
+            WriteLine(op.Device, op.IndexerPath, ADBService.EscapeAdbShellString(indexer.ToString()));
         }
+        else if (op.OperationName is FileOperation.OperationType.Restore)
+        {
+            SilentDelete(op.Device, op.IndexerPath);
+        }
+
+        // remove file from cut items
+        op.FilePath.CutState = DragDropEffects.None;
+
+        var session = App.ActiveDirectorySession;
+        if (op.Device.ID == App.ActiveAdbDevice?.ID && session is not null)
+        {
+            // notify master process of completion
+            if (op.MasterPid > 0 && op.OperationName is not FileOperation.OperationType.Copy)
+            {
+                IpcService.NotifyFileMoved(op.MasterPid, op.Device, op.FilePath);
+            }
+
+            // clear file trash indexer if restore / recycle on current device
+            if (op.OperationName is FileOperation.OperationType.Recycle or FileOperation.OperationType.Restore)
+            {
+                op.FilePath.TrashIndex = null;
+            }
+
+            // update UI when copy / cut target is current path
+            if (op.TargetPath.ParentPath == App.ExplorerState.CurrentPath)
+            {
+                FileClass completedItem;
+                if (op.OperationName is FileOperation.OperationType.Copy)
+                {
+                    completedItem = new(op.FilePath)
+                    {
+                        IsLink = op.isLink
+                    };
+                    completedItem.UpdatePath(op.TargetPath.FullPath);
+                    completedItem.ModifiedTime = op.DateModified;
+                }
+                else
+                {
+                    op.FilePath.UpdatePath(op.TargetPath.FullPath);
+                    completedItem = op.FilePath;
+                }
+
+                session.AddItem(completedItem);
+                FileActionLogic.ScheduleUpdateFileActions();
+                return (session, completedItem);
+            }
+
+            // update UI when cut / restore / recycle source is current path
+            if (op.FilePath.ParentPath == App.ExplorerState.CurrentPath
+                && op.OperationName is not FileOperation.OperationType.Copy)
+            {
+                session.RemoveItem(op.FilePath);
+                FileActionLogic.ScheduleUpdateFileActions();
+            }
+        }
+
+        return null;
     }
 
     public static async Task MakeDir(ADBService.AdbDevice device, string fullPath)
@@ -447,7 +482,7 @@ public static class ShellFileOperation
         return match.Success ? match.Groups["package"].Value : fullPath[..fullPath.LastIndexOf('.')][(fullPath.LastIndexOf('/') + 1)..];
     }
 
-    public static void InstallPackages(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
+    public static Task InstallPackagesAsync(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
@@ -458,10 +493,10 @@ public static class ShellFileOperation
             operations.Add(op);
         }
 
-        Data.FileOpQ.AddOperations(operations);
+        return App.ActiveFileOperations.AddOperationsAsync(operations);
     }
 
-    public static void PushPackages(ADBService.AdbDevice device, IEnumerable<string> paths, Dispatcher dispatcher)
+    public static Task PushPackagesAsync(ADBService.AdbDevice device, IEnumerable<string> paths, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
@@ -477,15 +512,10 @@ public static class ShellFileOperation
             operations.Add(op);
         }
 
-        void addOperations() => Data.FileOpQ.AddOperations(operations);
-
-        if (dispatcher.CheckAccess())
-            addOperations();
-        else
-            _ = dispatcher.BeginInvoke(new Action(addOperations));
+        return App.ActiveFileOperations.AddOperationsAsync(operations);
     }
 
-    public static void UninstallPackages(ADBService.AdbDevice device, IEnumerable<string> packages, Dispatcher dispatcher)
+    public static Task UninstallPackagesAsync(ADBService.AdbDevice device, IEnumerable<string> packages, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
@@ -496,7 +526,7 @@ public static class ShellFileOperation
             operations.Add(op);
         }
 
-        Data.FileOpQ.AddOperations(operations);
+        return App.ActiveFileOperations.AddOperationsAsync(operations);
     }
 
     private static void InstallOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -510,14 +540,14 @@ public static class ShellFileOperation
         try
         {
             if (op.Status is FileOperation.OperationStatus.Completed
-                && op.Device.ID == Data.CurrentADBDevice?.ID
-                && Data.FileActions.IsAppDrive)
+                && op.Device.ID == App.ActiveAdbDevice?.ID
+                && App.FileActions.IsAppDrive)
             {
                 // update UI when on current device and current path
                 if (op.IsUninstall)
-                    Data.Packages.RemoveAll(pkg => pkg.Name == op.PackageName);
+                    App.ExplorerState.Packages.RemoveAll(pkg => pkg.Name == op.PackageName);
                 else if (op.PushPackage)
-                    Data.FileActions.RefreshPackages = true;
+                    (Application.Current as App)?.RefreshPackages();
             }
         }
         finally
@@ -526,45 +556,7 @@ public static class ShellFileOperation
         }
     }
 
-    public static ulong? GetPackagesCount(ADBService.AdbDevice device)
-    {
-        var result = ADBService.ExecuteDeviceAdbShellCommand(device.ID, "pm", out string stdout, out _, CancellationToken.None, ["list", "packages", "|", "wc", "-l"]);
-        if (result != 0 || !ulong.TryParse(stdout, out ulong value))
-            return null;
-
-        return value;
-    }
-
-    public static ObservableList<Package> GetPackages(ADBService.AdbDevice device, bool includeSystem = true, bool optionalParams = true)
-    {
-        // More package-specific info can be acquired using dumpsys package [package_name]
-
-        ObservableList<Package> packages = [];
-        string stdout = "";
-        string[] args = ["list", "packages", "-s", "-f"];
-        if (optionalParams)
-            args = [.. args, "-U", "--show-versioncode"];
-
-        if (includeSystem)
-        {
-            // get system packages
-            var systemExitCode = ADBService.ExecuteDeviceAdbShellCommand(device.ID, "pm", out stdout, out _, CancellationToken.None, args);
-
-            if (systemExitCode == 0)
-                packages.AddRange(stdout.Split(ADBService.LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Select(pkg => Package.New(pkg, Package.PackageType.System)));
-        }
-
-        args[2] = "-3";
-        // get user packages
-        var userExitCode = ADBService.ExecuteDeviceAdbShellCommand(device.ID, "pm", out stdout, out _, CancellationToken.None, args);
-
-        if (userExitCode == 0)
-            packages.AddRange(stdout.Split(ADBService.LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Select(pkg => Package.New(pkg, Package.PackageType.User)));
-
-        return packages;
-    }
-
-    public static void ChangeDateFromName(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
+    public static Task ChangeDateFromNameAsync(ADBService.AdbDevice device, IEnumerable<FileClass> items, Dispatcher dispatcher)
     {
         List<FileOperation> operations = [];
 
@@ -599,7 +591,7 @@ public static class ShellFileOperation
         }
 
         operations.ForEach(op => op.PropertyChanged += ChangeModifiedOp_PropertyChanged);
-        Data.FileOpQ.AddOperations(operations);
+        return App.ActiveFileOperations.AddOperationsAsync(operations);
     }
 
     private static void ChangeModifiedOp_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -610,8 +602,8 @@ public static class ShellFileOperation
         if (e.PropertyName is not nameof(FileOperation.Status) || op.Status is not FileOperation.OperationStatus.Completed)
             return;
 
-        if (op.Device.ID == Data.CurrentADBDevice.ID
-            && op.FilePath.ParentPath == Data.CurrentPath)
+        if (op.Device.ID == App.ActiveAdbDevice?.ID
+            && op.FilePath.ParentPath == App.ExplorerState.CurrentPath)
         {
             // update UI when on current device and current path
             op.FilePath.ModifiedTime = op.NewDate;

@@ -71,7 +71,7 @@ public abstract class DeviceViewModel : AbstractDevice
                                     && IpAddress.Count(c => c == '.') == 3
                                     && IpAddress.Split('.').Count(i => byte.TryParse(i, out _)) == 4;
 
-    public bool IsDeviceConnectionInProgress => Data.RuntimeSettings.ConnectNewDevice?.Equals(this) is true;
+    public bool IsDeviceConnectionInProgress => App.RuntimeSettings.ConnectNewDevice?.Equals(this) is true;
 
     #endregion
 
@@ -93,7 +93,7 @@ public abstract class DeviceViewModel : AbstractDevice
         if (runtimeSettingsSubscribed)
             return;
 
-        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
         runtimeSettingsSubscribed = true;
     }
 
@@ -102,17 +102,13 @@ public abstract class DeviceViewModel : AbstractDevice
         if (!runtimeSettingsSubscribed)
             return;
 
-        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
+        App.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
         runtimeSettingsSubscribed = false;
     }
 
     private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(AppRuntimeSettings.CollapseDevices) && Data.RuntimeSettings.CollapseDevices)
-        {
-            DeviceSelected = false;
-        }
-        else if (e.PropertyName == nameof(AppRuntimeSettings.ConnectNewDevice))
+        if (e.PropertyName == nameof(AppRuntimeSettings.ConnectNewDevice))
         {
             OnPropertyChanged(nameof(IsDeviceConnectionInProgress));
         }
@@ -143,15 +139,11 @@ public abstract class DeviceViewModel : AbstractDevice
             OnPropertyChanged(nameof(Status));
             OnPropertyChanged(nameof(StatusIcon));
 
-            if (this is LogicalDeviceViewModel)
-            {
-                ShellCommands.RemoveDevice(ID);
-                if (status is DeviceStatus.Ok)
-                    Task.Run(() => ShellCommands.FindCommands(ID));
-            }
+            if (App.ActiveFileOperations?.Operations.Any(op => op.Device.ID == ID) is true)
+                (Application.Current as App)?.RequestUi(UiCommand.SortFileOperations);
 
             if (status is DeviceStatus.Offline)
-                Data.FileOpQ.MoveOperationsToPast(true, this);
+                App.ActiveFileOperations?.MoveOperationsToPast(true, this);
 
             return true;
         }

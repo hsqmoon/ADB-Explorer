@@ -109,11 +109,11 @@ public partial class SearchBox : UserControl
         if (e.Key is Key.Escape)
         {
             Text = "";
-            Models.Data.RuntimeSettings.AutoHideSearchBox = true;
+            (Application.Current as App)?.RequestUi(ADB_Explorer.Services.UiCommand.AutoHideSearch);
         }
         else if (e.Key is Key.Enter)
         {
-            Models.Data.RuntimeSettings.AutoHideSearchBox = true;
+            (Application.Current as App)?.RequestUi(ADB_Explorer.Services.UiCommand.AutoHideSearch);
         }
     }
 

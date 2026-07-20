@@ -23,46 +23,59 @@ public class FileDeleteOperation : AbstractShellFileOperation
         Status = OperationStatus.InProgress;
         StatusInfo = new InProgShellProgressViewModel();
 
-        var task = ADBService.ExecuteVoidShellCommand(Device.ID, CancelTokenSource.Token, "rm", "-rf", ADBService.EscapeAdbShellString(FilePath.FullPath)); 
+        _ = RunAsync(ADBService.ExecuteVoidShellCommand(
+            Device.ID,
+            CancelTokenSource.Token,
+            "rm",
+            "-rf",
+            ADBService.EscapeAdbShellString(FilePath.FullPath)),
+            Children.Count > 0);
+    }
 
-        task.ContinueWith((t) =>
+    private async Task RunAsync(Task<string> operationTask, bool hasChildren)
+    {
+        try
         {
-            if (t.Result == "")
+            string result = await operationTask.ConfigureAwait(false);
+            if (CancelTokenSource?.IsCancellationRequested is true)
             {
-                Status = OperationStatus.Completed;
-                StatusInfo = new CompletedShellProgressViewModel();
-            }
-            else
-            {
-                Status = OperationStatus.Failed;
-                var res = AdbRegEx.RE_SHELL_ERROR().Matches(t.Result);
-                var updates = res.Where(m => m.Success).Select(m => new ShellErrorInfo(m, base.FilePath.FullPath));
-                base.AddUpdates(updates);
-
-                var message = updates.Any() ? updates.Last().Message : "";
-                if (message.Contains(':'))
-                    message = message.Split(':').Last().TrimStart();
-
-                var errorString = FileOpStatusConverter.StatusString(typeof(ShellErrorInfo),
-                                                   failed: Children.Count > 0 ? updates.Count() : -1,
-                                                   message: message,
-                                                   total: true);
-
-                StatusInfo = new FailedOpProgressViewModel(errorString);
+                await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+                return;
             }
 
-        }, TaskContinuationOptions.OnlyOnRanToCompletion);
+            if (string.IsNullOrEmpty(result))
+            {
+                await CompleteAsync(OperationStatus.Completed, new CompletedShellProgressViewModel()).ConfigureAwait(false);
+                return;
+            }
 
-        task.ContinueWith((t) =>
-        {
-            Status = OperationStatus.Canceled;
-            StatusInfo = new CanceledOpProgressViewModel();
-        }, TaskContinuationOptions.OnlyOnCanceled);
+            var updates = AdbRegEx.RE_SHELL_ERROR()
+                .Matches(result)
+                .Where(match => match.Success)
+                .Select(match => new ShellErrorInfo(match, FilePath.FullPath))
+                .ToArray();
+            string message = updates.LastOrDefault()?.Message ?? "";
+            if (message.Contains(':'))
+                message = message.Split(':').Last().TrimStart();
 
-        task.ContinueWith((t) =>
+            var errorString = FileOpStatusConverter.StatusString(
+                typeof(ShellErrorInfo),
+                failed: hasChildren ? updates.Length : -1,
+                message: message,
+                total: true);
+
+            await CompleteAsync(
+                OperationStatus.Failed,
+                new FailedOpProgressViewModel(errorString),
+                () => AddUpdates(updates)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(t.Exception.InnerException.Message);
-        }, TaskContinuationOptions.OnlyOnFaulted);
+            await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await CompleteAsync(OperationStatus.Failed, new FailedOpProgressViewModel(ex.GetBaseException().Message)).ConfigureAwait(false);
+        }
     }
 }

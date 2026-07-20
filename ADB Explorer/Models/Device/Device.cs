@@ -48,13 +48,7 @@ public abstract class Device : AbstractDevice
     public virtual DeviceStatus Status
     {
         get => status;
-        set
-        {
-            if (Set(ref status, value) && Data.FileOpQ?.Operations.Any(op => op.Device.ID == ID) is true)
-            {
-                Data.RuntimeSettings.SortFileOps = true;
-            }
-        }
+        set => Set(ref status, value);
     }
 
     private string ipAddress;

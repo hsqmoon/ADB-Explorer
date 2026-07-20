@@ -27,24 +27,24 @@ public class SavedLocation : ViewModelBase
             () => !string.IsNullOrEmpty(Path),
             () =>
             {
-                Data.RuntimeSettings.SavedLocations = [.. Data.RuntimeSettings.SavedLocations.Except([Path])];
-                Storage.StoreValue(nameof(Data.RuntimeSettings.SavedLocations), Data.RuntimeSettings.SavedLocations.ToArray());
+                App.RuntimeSettings.SavedLocations = [.. App.RuntimeSettings.SavedLocations.Except([Path])];
+                Storage.StoreValue(nameof(App.RuntimeSettings.SavedLocations), App.RuntimeSettings.SavedLocations.ToArray());
             });
 
         AddAction = new(
             () => string.IsNullOrEmpty(Path),
             () =>
             {
-                if (Data.RuntimeSettings.SavedLocations is null)
-                    Data.RuntimeSettings.SavedLocations = [Data.CurrentPath];
+                if (App.RuntimeSettings.SavedLocations is null)
+                    App.RuntimeSettings.SavedLocations = [App.ExplorerState.CurrentPath];
                 else
-                    Data.RuntimeSettings.SavedLocations = [.. Data.RuntimeSettings.SavedLocations, Data.CurrentPath];
+                    App.RuntimeSettings.SavedLocations = [.. App.RuntimeSettings.SavedLocations, App.ExplorerState.CurrentPath];
 
-                Storage.StoreValue(nameof(Data.RuntimeSettings.SavedLocations), Data.RuntimeSettings.SavedLocations.ToArray());
+                Storage.StoreValue(nameof(App.RuntimeSettings.SavedLocations), App.RuntimeSettings.SavedLocations.ToArray());
             });
 
         NavigateAction = new(
             () => !string.IsNullOrEmpty(Path),
-            () => Data.RuntimeSettings.LocationToNavigate = new(Path));
+            () => (Application.Current as App)?.RequestNavigation(new(Path)));
     }
 }

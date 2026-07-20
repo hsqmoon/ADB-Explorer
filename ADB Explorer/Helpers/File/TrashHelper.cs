@@ -15,44 +15,56 @@ internal static class TrashHelper
     public static void EnableRecycleButtons(IEnumerable<FileClass> fileList = null)
     {
         if (fileList is null)
-            fileList = Data.DirList.FileList;
+            fileList = (IEnumerable<FileClass>)(Application.Current as App)?.CurrentDirectorySession?.FileList
+                ?? Array.Empty<FileClass>();
 
-        Data.FileActions.RestoreEnabled = fileList.Any(file => file.TrashIndex is not null && !string.IsNullOrEmpty(file.TrashIndex.OriginalPath));
-        Data.FileActions.DeleteEnabled = fileList.Any(item => item.Extension != AdbExplorerConst.RECYCLE_INDEX_SUFFIX);
+        App.FileActions.RestoreEnabled = fileList.Any(file => file.TrashIndex is not null && !string.IsNullOrEmpty(file.TrashIndex.OriginalPath));
+        App.FileActions.DeleteEnabled = fileList.Any(item => item.Extension != AdbExplorerConst.RECYCLE_INDEX_SUFFIX);
     }
 
     public static async Task UpdateRecycledItemsCount()
     {
-        var device = Data.DevicesObject.Current;
-        if (device is null)
+        var device = App.ActiveDevices.Current;
+        var adbDevice = App.ActiveAdbDevice;
+        if (device is null || adbDevice is null)
             return;
 
         long count;
         try
         {
-            count = await Task.Run(() =>
-            {
-                long result = ADBService.CountRecycle(device.ID);
-                return result < 1
-                    ? FolderHelper.FolderExists(AdbExplorerConst.RECYCLE_PATH) is null ? -1 : 0
-                    : result;
-            });
+            ulong rawResult = await adbDevice.CountFilesAsync(
+                AdbExplorerConst.RECYCLE_PATH,
+                includeNames: null,
+                excludeNames: ["*" + AdbExplorerConst.RECYCLE_INDEX_SUFFIX],
+                cancellationToken: DeviceHelper.GetCurrentDeviceWorkToken());
+            long result = rawResult <= long.MaxValue ? (long)rawResult : long.MaxValue;
+            count = result < 1
+                ? (await FolderHelper.FolderExistsAsync(
+                    AdbExplorerConst.RECYCLE_PATH,
+                    showError: false).ConfigureAwait(false)) is null ? -1 : 0
+                : result;
         }
         catch
         {
             return;
         }
 
-        if (Data.DevicesObject.Current?.ID != device.ID
-            || App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+        if (!ReferenceEquals(App.ActiveDevices.Current, device)
+            || !ReferenceEquals(App.ActiveAdbDevice, adbDevice)
+            || Application.Current is not App app)
         {
             return;
         }
 
-        var trash = device.Drives.Find(d => d.Type is AbstractDrive.DriveType.Trash);
-        await dispatcher.InvokeAsync(
-            () => ((VirtualDriveViewModel)trash)?.SetItemsCount(count),
-            DispatcherPriority.Background);
+        await app.EnqueueUiAsync("trash.count", () =>
+        {
+            if (!ReferenceEquals(App.ActiveDevices.Current, device)
+                || !ReferenceEquals(App.ActiveAdbDevice, adbDevice))
+                return;
+
+            var trash = device.Drives.Find(d => d.Type is AbstractDrive.DriveType.Trash);
+            ((VirtualDriveViewModel)trash)?.SetItemsCount(count);
+        });
     }
 
     public static async Task ParseIndexersAsync(ADBService.AdbDevice device)
@@ -61,26 +73,23 @@ internal static class TrashHelper
             return;
 
         var indexers = await GetIndexersAsync(device);
-        if (Data.CurrentADBDevice?.ID != device.ID)
+        if (!ReferenceEquals(App.ActiveAdbDevice, device))
             return;
 
         void applyIndexers()
         {
-            if (Data.CurrentADBDevice?.ID != device.ID)
+            if (!ReferenceEquals(App.ActiveAdbDevice, device))
                 return;
 
             indexersByRecycleName = indexers
                 .Where(indexer => !string.IsNullOrEmpty(indexer.RecycleName))
                 .GroupBy(indexer => indexer.RecycleName, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
-            Data.RecycleIndex.RemoveAll();
-            Data.RecycleIndex.AddRange(indexers);
+            App.ExplorerState.RecycleIndex = new(indexers);
         }
 
-        if (App.Current.Dispatcher.CheckAccess())
-            applyIndexers();
-        else
-            await App.Current.Dispatcher.InvokeAsync(applyIndexers);
+        if (Application.Current is App app)
+            await app.EnqueueUiAsync("trash.indexers", applyIndexers);
     }
 
     public static Task<List<TrashIndexer>> GetIndexersAsync(ADBService.AdbDevice device) => Task.Run(() =>

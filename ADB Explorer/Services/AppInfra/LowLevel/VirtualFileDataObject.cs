@@ -29,10 +29,14 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     private readonly List<DataObject> dataObjects = [];
     private readonly object dataObjectsLock = new();
     private readonly object selfDataLock = new();
+    private readonly object operationsQueueLock = new();
     private readonly CancellationTokenSource preparationCancellation = new();
+    private readonly TaskCompletionSource<bool> preparationCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private IReadOnlyList<FileClass> selfFiles;
     private FileGroup selfFileGroup;
     private bool selfDataReleased;
+    private Task operationsQueueTask;
+    private int operationsQueueSucceeded;
 
     /// <summary>
     /// Tracks whether an asynchronous operation is ongoing.
@@ -494,10 +498,97 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     internal static void ReleaseClipboardData()
         => Volatile.Read(ref clipboardOwner)?.ReleaseDragData();
 
+    internal void AcquireClipboardOwnership()
+    {
+        var previousOwner = Interlocked.Exchange(ref clipboardOwner, this);
+        if (previousOwner is not null && !ReferenceEquals(previousOwner, this))
+            previousOwner.ReleaseDragData();
+    }
+
     public void SetFileDrop(params IEnumerable<string> files)
         => SetData(AdbDataFormats.FileDrop, new NativeMethods.CFHDROP(files).Bytes);
 
-    public List<FileSyncOperation> Operations { get; private set; } = [];
+    private List<FileSyncOperation> Operations { get; set; } = [];
+
+    internal bool AreOperationsCompleted =>
+        Operations.All(operation => operation.Status is FileOperation.OperationStatus.Completed);
+
+    internal Task EnsureOperationsQueued()
+    {
+        lock (operationsQueueLock)
+            return operationsQueueTask ??= QueuePreparedOperationsAsync();
+    }
+
+    private async Task QueuePreparedOperationsAsync()
+    {
+        try
+        {
+            await preparationCompletion.Task.WaitAsync(preparationCancellation.Token).ConfigureAwait(false);
+            if (Operations.Count == 0)
+            {
+                Volatile.Write(ref operationsQueueSucceeded, 1);
+                return;
+            }
+
+            if (Application.Current is not App)
+            {
+                Volatile.Write(ref operationsQueueSucceeded, -1);
+                return;
+            }
+
+            await App.ActiveFileOperations.AddOperationsAsync(
+                Operations,
+                preparationCancellation.Token).ConfigureAwait(false);
+            Volatile.Write(ref operationsQueueSucceeded, 1);
+        }
+        catch (OperationCanceledException) when (preparationCancellation.IsCancellationRequested)
+        {
+            Volatile.Write(ref operationsQueueSucceeded, -1);
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref operationsQueueSucceeded, -1);
+            App.ReportBackgroundFailure(ex, "virtual-files.queue");
+        }
+    }
+
+    internal bool DidOperationsQueueSuccessfully =>
+        Volatile.Read(ref operationsQueueSucceeded) == 1;
+
+    private async Task CompletePreparationAsync(
+        Task<(List<FileSyncOperation> Operations, FileDescriptor[] Descriptors, bool IncludeContent)> preparation,
+        IReadOnlyList<FileClass> files,
+        bool updateCursor)
+    {
+        try
+        {
+            var result = await preparation.ConfigureAwait(false);
+            preparationCancellation.Token.ThrowIfCancellationRequested();
+            Operations = result.Operations;
+            SetFileDescriptors(result.Descriptors, result.IncludeContent);
+            preparationCompletion.TrySetResult(true);
+        }
+        catch (OperationCanceledException) when (preparationCancellation.IsCancellationRequested)
+        {
+            preparationCompletion.TrySetCanceled(preparationCancellation.Token);
+        }
+        catch (Exception ex)
+        {
+            preparationCompletion.TrySetException(ex);
+            App.ReportBackgroundFailure(ex, "virtual-files.prepare");
+        }
+        finally
+        {
+            files.ForEach(file => file.ClearDescriptors());
+            if (updateCursor && Application.Current is App app)
+            {
+                app.EnqueueUiLatest(
+                    "virtual-files.cursor",
+                    "virtual-files.cursor",
+                    () => App.RuntimeSettings.MainCursor = Cursors.Arrow);
+            }
+        }
+    }
 
     private DragDropEffects currentEffect = DragDropEffects.None;
     public DragDropEffects CurrentEffect
@@ -506,7 +597,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         set
         {
             if (Set(ref currentEffect, value))
-                Data.CopyPaste.CurrentDropEffect = value & ~DragDropEffects.Scroll;
+                App.CopyPaste.CurrentDropEffect = value & ~DragDropEffects.Scroll;
         }
     }
 
@@ -625,6 +716,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
     void IAsyncOperation.StartOperation(IBindCtx pbcReserved)
     {
         inOperation = true;
+        _ = EnsureOperationsQueued();
     }
 
     /// <summary>
@@ -670,11 +762,11 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                                                         DataObjectMethod method = DataObjectMethod.DragDrop)
     {
         var packageList = packages.ToList();
-        var device = Data.CurrentADBDevice;
-        Data.FileActions.IsSelectionIllegalOnWindows =
-        Data.FileActions.IsSelectionConflictingOnFuse = false;
+        var device = App.ActiveAdbDevice;
+        App.FileActions.IsSelectionIllegalOnWindows =
+        App.FileActions.IsSelectionConflictingOnFuse = false;
 
-        var tempDragPath = Data.RuntimeSettings.ResetTempDragPath();
+        var tempDragPath = App.RuntimeSettings.ResetTempDragPath();
         VirtualFileDataObject vfdo = new(DragDropEffects.Copy, method);
 
         var files = packageList
@@ -689,11 +781,12 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         vfdo.SetData(AdbDataFormats.FileContents, []);
         vfdo.SetSelfFileGroup(new([]));
 
-        Data.RuntimeSettings.MainCursor = Cursors.AppStarting;
-        Task.Run(() =>
+        App.RuntimeSettings.MainCursor = Cursors.AppStarting;
+        var preparation = Task.Run(() =>
         {
             var cancellationToken = vfdo.preparationCancellation.Token;
-            return files.Zip(packageList).Select(item =>
+            Directory.CreateDirectory(tempDragPath);
+            var operations = files.Zip(packageList).Select(item =>
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 return item.First.PrepareDescriptors(
@@ -702,30 +795,12 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                     device,
                     item.Second.Name + ".apk");
             }).ToList();
-        }, vfdo.preparationCancellation.Token).ContinueWith(t =>
-        {
-            if (!t.IsCompletedSuccessfully || vfdo.preparationCancellation.IsCancellationRequested)
-            {
-                _ = t.Exception;
-                files.ForEach(file => file.ClearDescriptors());
-                _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow));
-                return;
-            }
-
-            vfdo.Operations = t.Result;
-            try
-            {
-                vfdo.SetFileDescriptors(files.SelectMany(file => file.Descriptors));
-            }
-            finally
-            {
-                files.ForEach(file => file.ClearDescriptors());
-            }
-
-            _ = App.Current.Dispatcher.BeginInvoke(
-                new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow),
-                DispatcherPriority.Background);
-        });
+            return (
+                Operations: operations,
+                Descriptors: files.SelectMany(file => file.Descriptors).ToArray(),
+                IncludeContent: true);
+        }, vfdo.preparationCancellation.Token);
+        _ = vfdo.CompletePreparationAsync(preparation, files, updateCursor: true);
 
         return vfdo;
     }
@@ -735,21 +810,21 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                                                         DataObjectMethod method = DataObjectMethod.DragDrop)
     {
         var fileList = files.ToList();
-        var device = Data.CurrentADBDevice;
-        var tempDragPath = Data.RuntimeSettings.ResetTempDragPath();
+        var device = App.ActiveAdbDevice;
+        var tempDragPath = App.RuntimeSettings.ResetTempDragPath();
 
-        Data.FileActions.IsSelectionIllegalOnWindows = !FileHelper.FileNameLegal(Data.SelectedFiles, FileHelper.RenameTarget.Windows);
-        Data.FileActions.IsSelectionConflictingOnFuse = Data.SelectedFiles.Select(f => f.FullName)
+        App.FileActions.IsSelectionIllegalOnWindows = !FileHelper.FileNameLegal(App.ExplorerState.SelectedFiles, FileHelper.RenameTarget.Windows);
+        App.FileActions.IsSelectionConflictingOnFuse = App.ExplorerState.SelectedFiles.Select(f => f.FullName)
             .Distinct(StringComparer.InvariantCultureIgnoreCase)
-            .Count() != Data.SelectedFiles.Count();
+            .Count() != App.ExplorerState.SelectedFiles.Count();
 
         VirtualFileDataObject vfdo = new(preferredEffect, method);
         vfdo.SetAdbDrag(fileList, device);
 
         var includeContent =
-            !Data.FileActions.IsSelectionIllegalOnWindows
-            && !Data.FileActions.IsSelectionConflictingOnFuse
-            && !Data.FileActions.IsRecycleBin;
+            !App.FileActions.IsSelectionIllegalOnWindows
+            && !App.FileActions.IsSelectionConflictingOnFuse
+            && !App.FileActions.IsRecycleBin;
 
         if (includeContent)
         {
@@ -758,16 +833,17 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
             vfdo.SetData(AdbDataFormats.FileContents, []);
             vfdo.SetSelfFileGroup(new([]));
 
-            Data.RuntimeSettings.MainCursor = Cursors.AppStarting;
-            Task.Run(() =>
+            App.RuntimeSettings.MainCursor = Cursors.AppStarting;
+            var preparation = Task.Run(() =>
             {
                 // Prepare file ops recursively for folders
                 var cancellationToken = vfdo.preparationCancellation.Token;
+                Directory.CreateDirectory(tempDragPath);
                 var treesBySource = FileHelper.GetFolderTrees(
                     fileList.Where(file => file.IsDirectory).Select(file => file.FullPath),
                     device,
                     cancellationToken);
-                return fileList.Select(file =>
+                var operations = fileList.Select(file =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     return file.PrepareDescriptors(
@@ -779,29 +855,12 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                             ? tree.Skip(1)
                             : null);
                 }).ToList();
-            }, vfdo.preparationCancellation.Token).ContinueWith(t =>
-            {
-                if (!t.IsCompletedSuccessfully || vfdo.preparationCancellation.IsCancellationRequested)
-                {
-                    _ = t.Exception;
-                    fileList.ForEach(file => file.ClearDescriptors());
-                    _ = App.Current.Dispatcher.BeginInvoke(new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow));
-                    return;
-                }
-
-                vfdo.Operations = t.Result;
-                try
-                {
-                    vfdo.SetFileDescriptors(fileList.SelectMany(f => f.Descriptors));
-                }
-                finally
-                {
-                    fileList.ForEach(file => file.ClearDescriptors());
-                }
-                _ = App.Current.Dispatcher.BeginInvoke(
-                    new Action(() => Data.RuntimeSettings.MainCursor = Cursors.Arrow),
-                    DispatcherPriority.Background);
-            });
+                return (
+                    Operations: operations,
+                    Descriptors: fileList.SelectMany(file => file.Descriptors).ToArray(),
+                    IncludeContent: true);
+            }, vfdo.preparationCancellation.Token);
+            _ = vfdo.CompletePreparationAsync(preparation, fileList, updateCursor: true);
 
         }
         else // When the selection is illegal for Windows
@@ -809,7 +868,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
             vfdo.SetData(AdbDataFormats.FileDescriptor, []);
             vfdo.SetSelfFileGroup(new([]));
 
-            Task.Run(() =>
+            var preparation = Task.Run(() =>
             {
                 var cancellationToken = vfdo.preparationCancellation.Token;
                 foreach (var file in fileList)
@@ -818,21 +877,12 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                     file.PrepareDescriptors(vfdo, tempDragPath, device, file.FullName, false);
                 }
 
-                return fileList.SelectMany(file => file.Descriptors).ToArray();
-            }, vfdo.preparationCancellation.Token).ContinueWith(t =>
-            {
-                try
-                {
-                    if (t.IsCompletedSuccessfully && !vfdo.preparationCancellation.IsCancellationRequested)
-                        vfdo.SetFileDescriptors(t.Result, false);
-                    else
-                        _ = t.Exception;
-                }
-                finally
-                {
-                    fileList.ForEach(file => file.ClearDescriptors());
-                }
-            });
+                return (
+                    Operations: new List<FileSyncOperation>(),
+                    Descriptors: fileList.SelectMany(file => file.Descriptors).ToArray(),
+                    IncludeContent: false);
+            }, vfdo.preparationCancellation.Token);
+            _ = vfdo.CompletePreparationAsync(preparation, fileList, updateCursor: false);
 
         }
 
@@ -859,11 +909,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
             {
                 CurrentEffect = allowedEffects;
                 PerformedDropEffect = allowedEffects;
-                Clipboard.SetDataObject(this);
-
-                var previousOwner = Interlocked.Exchange(ref clipboardOwner, this);
-                if (previousOwner is not null && !ReferenceEquals(previousOwner, this))
-                    previousOwner.ReleaseDragData();
+                _ = SendToClipboardAsync();
             }
             else
                 throw new NotSupportedException();
@@ -889,7 +935,7 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         Action<DragDropEffects> dragFeedback = value =>
         {
             if (value.HasFlag(DragDropEffects.Move)
-                && !Data.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.ShiftKey))
+                && !App.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.ShiftKey))
             {
                 // Override default since Windows gives Move as default
                 value = DragDropEffects.Copy;
@@ -929,23 +975,23 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
         public int QueryContinueDrag(int fEscapePressed, uint grfKeyState)
         {
             var escapePressed = (0 != fEscapePressed);
-            Data.RuntimeSettings.DragModifiers = (DragDropKeyStates)grfKeyState;
+            App.RuntimeSettings.DragModifiers = (DragDropKeyStates)grfKeyState;
             
             var res = escapePressed switch
             {
                 true => NativeMethods.HResult.DRAGDROP_S_CANCEL,
-                false when Data.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.RightMouseButton) => NativeMethods.HResult.DRAGDROP_S_CANCEL,
-                false when !Data.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.LeftMouseButton) => NativeMethods.HResult.DRAGDROP_S_DROP,
+                false when App.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.RightMouseButton) => NativeMethods.HResult.DRAGDROP_S_CANCEL,
+                false when !App.RuntimeSettings.DragModifiers.HasFlag(DragDropKeyStates.LeftMouseButton) => NativeMethods.HResult.DRAGDROP_S_DROP,
                 _ => NativeMethods.HResult.Ok,
             };
 
             if (res is not NativeMethods.HResult.Ok)
             {
-                Data.RuntimeSettings.DragBitmap = null;
-                Data.CopyPaste.DragStatus = CopyPasteService.DragState.None;
+                App.RuntimeSettings.DragBitmap = null;
+                App.CopyPaste.DragStatus = CopyPasteService.DragState.None;
                 IpcService.NotifyDropCancel(res);
             }
-            Data.CopyPaste.DragResult = res;
+            App.CopyPaste.DragResult = res;
 
             return (int)res;
         }
@@ -986,6 +1032,20 @@ public sealed class VirtualFileDataObject : ViewModelBase, System.Runtime.Intero
                 Marshal.ReleaseComObject(stream);
 
             Vanara.PInvoke.Ole32.ReleaseStgMedium(in medium);
+        }
+    }
+
+    private async Task SendToClipboardAsync()
+    {
+        try
+        {
+            if (Application.Current is App app)
+                await app.SetClipboardAsync(this).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReleaseDragData();
+            App.ReportBackgroundFailure(ex, "clipboard.set");
         }
     }
 }

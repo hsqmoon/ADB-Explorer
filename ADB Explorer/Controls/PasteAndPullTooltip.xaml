@@ -2,11 +2,11 @@
     x:Class="ADB_Explorer.Controls.PasteAndPullTooltip"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:app="clr-namespace:ADB_Explorer"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:helpers="clr-namespace:ADB_Explorer.Helpers"
     xmlns:local="clr-namespace:ADB_Explorer.Controls"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-    xmlns:models="clr-namespace:ADB_Explorer.Models"
     xmlns:strings="clr-namespace:ADB_Explorer.Strings"
     xmlns:ui="http://schemas.modernwpf.com/2019"
     x:Name="pasteTooltip"
@@ -32,39 +32,39 @@
             <Style.Triggers>
                 <MultiDataTrigger>
                     <MultiDataTrigger.Conditions>
-                        <Condition Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="False" />
-                        <Condition Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWinRoot}" Value="False" />
-                        <Condition Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionConflictingOnFuse}" Value="False" />
-                        <Condition Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingConflictingOnFuse}" Value="False" />
-                        <Condition Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsRegularItem}" Value="True" />
+                        <Condition Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="False" />
+                        <Condition Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWinRoot}" Value="False" />
+                        <Condition Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionConflictingOnFuse}" Value="False" />
+                        <Condition Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingConflictingOnFuse}" Value="False" />
+                        <Condition Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsRegularItem}" Value="True" />
                     </MultiDataTrigger.Conditions>
                     <Setter Property="Visibility" Value="Collapsed" />
                 </MultiDataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingIllegalOnFuse}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingIllegalOnFuse}" Value="True">
                     <Setter Property="Visibility" Value="Visible" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingConflictingOnFuse}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingConflictingOnFuse}" Value="True">
                     <Setter Property="Visibility" Value="Visible" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsExplorerVisible}" Value="False">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsExplorerVisible}" Value="False">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsRecycleBin}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsRecycleBin}" Value="True">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsAppDrive}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsAppDrive}" Value="True">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static models:Data.Settings}, Path=HidePasteNamingInfo}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static app:App.Settings}, Path=HidePasteNamingInfo}" Value="True">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static models:Data.FileActions}, Path=ListingInProgress}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static app:App.FileActions}, Path=ListingInProgress}" Value="True">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static models:Data.RuntimeSettings}, Path=IsLogOpen}" Value="True">
+                <DataTrigger Binding="{Binding Source={x:Static app:App.RuntimeSettings}, Path=IsLogOpen}" Value="True">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
-                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                     <Setter Property="Visibility" Value="Collapsed" />
                 </DataTrigger>
             </Style.Triggers>
@@ -83,7 +83,7 @@
                 <Grid.Style>
                     <Style TargetType="Grid">
                         <Style.Triggers>
-                            <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=IsRTL, Mode=OneTime}" Value="True">
+                            <DataTrigger Binding="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=IsRTL, Mode=OneTime}" Value="True">
                                 <Setter Property="FlowDirection" Value="RightToLeft" />
                             </DataTrigger>
                         </Style.Triggers>
@@ -111,10 +111,10 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -134,13 +134,13 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWinRoot}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWinRoot}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="True">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="True">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -160,13 +160,13 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionConflictingOnFuse}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionConflictingOnFuse}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="True">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnWindows}" Value="True">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -186,10 +186,10 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsSelectionIllegalOnFuse}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsSelectionIllegalOnFuse}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -209,10 +209,10 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingConflictingOnFuse}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingConflictingOnFuse}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingIllegalOnFuse}" Value="True">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingIllegalOnFuse}" Value="True">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -232,7 +232,7 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsPastingIllegalOnFuse}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsPastingIllegalOnFuse}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -252,10 +252,10 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsRegularItem}" Value="True">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsRegularItem}" Value="True">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=SelectedItemsCount}" Value="0">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=SelectedItemsCount}" Value="0">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>

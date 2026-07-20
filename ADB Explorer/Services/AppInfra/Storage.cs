@@ -6,23 +6,24 @@ public static class Storage
 
     public static object RetrieveValue(string key)
     {
-        return Application.Current.Properties[key];
+        return Application.Current?.Properties[key];
     }
 
     public static T Retrieve<T>(string key)
     {
-        return (T)Application.Current.Properties[key];
+        return Application.Current?.Properties[key] is T value ? value : default;
     }
 
     public static void StoreValue(Enum key, object value) => StoreValue(key.ToString(), value);
 
     public static void StoreValue(string key, object value)
     {
-        Application.Current.Properties[key] = value;
+        if (Application.Current is not null)
+            Application.Current.Properties[key] = value;
     }
 
-    public static object RetrieveEnum(Type type) => Application.Current.Properties[type.ToString()];
-    public static object RetrieveEnum(string key) => Application.Current.Properties[key];
+    public static object RetrieveEnum(Type type) => Application.Current?.Properties[type.ToString()];
+    public static object RetrieveEnum(string key) => Application.Current?.Properties[key];
 
     public static T RetrieveEnum<T>(string key = "") => RetrieveEnum(string.IsNullOrEmpty(key) ? typeof(T).ToString() : key) switch
     {
@@ -33,7 +34,8 @@ public static class Storage
 
     public static void StoreEnum(Enum value)
     {
-        Application.Current.Properties[value.GetType().ToString()] = value;
+        if (Application.Current is not null)
+            Application.Current.Properties[value.GetType().ToString()] = value;
     }
 
     public static bool? RetrieveBool(Enum value) => RetrieveBool(value.ToString());

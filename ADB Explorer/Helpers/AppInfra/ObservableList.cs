@@ -6,6 +6,12 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
 {
     private bool suppressOnCollectionChanged = false;
 
+    public ObservableList()
+    { }
+
+    public ObservableList(IEnumerable<T> items) : base(items)
+    { }
+
     protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
     {
         if (!suppressOnCollectionChanged)
@@ -154,16 +160,7 @@ public class ObservableList<T> : ObservableCollection<T> where T : INotifyProper
 
     public void ForEach(Action<T> action)
     {
-        suppressOnCollectionChanged = true;
-        try
-        {
-            foreach (var item in this)
-                action(item);
-        }
-        finally
-        {
-            suppressOnCollectionChanged = false;
-            NotifyReset();
-        }
+        foreach (var item in this)
+            action(item);
     }
 }

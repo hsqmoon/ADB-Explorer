@@ -27,7 +27,7 @@ public class IpcService
         {
             case MessageType.DragCanceled:
                 if (Enum.TryParse(msgContent[1], out NativeMethods.HResult hr) && hr is NativeMethods.HResult.DRAGDROP_S_CANCEL)
-                    Data.CopyPaste.ClearDrag();
+                    App.CopyPaste.ClearDrag();
                 break;
             case MessageType.FileMoved:
                 var content = msgContent[1].Split('\n', 2);
@@ -50,38 +50,65 @@ public class IpcService
         if (Interlocked.Exchange(ref fileMoveRefreshScheduled, 1) == 1)
             return;
 
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(100);
+        _ = FlushFileMovesAsync();
+    }
 
-            if (App.Current?.Dispatcher is not { HasShutdownStarted: false } dispatcher)
+    private static async Task FlushFileMovesAsync()
+    {
+        try
+        {
+            await Task.Delay(100).ConfigureAwait(false);
+
+            if (Application.Current is not App app)
             {
                 Interlocked.Exchange(ref fileMoveRefreshScheduled, 0);
                 return;
             }
 
-            _ = dispatcher.BeginInvoke(new Action(() =>
+            (string DeviceId, string FullPath)[] movedFiles;
+            lock (PendingFileMovesLock)
             {
-                (string DeviceId, string FullPath)[] movedFiles;
-                lock (PendingFileMovesLock)
-                {
-                    movedFiles = [.. PendingFileMoves];
-                    PendingFileMoves.Clear();
-                    Interlocked.Exchange(ref fileMoveRefreshScheduled, 0);
-                }
+                movedFiles = [.. PendingFileMoves];
+                PendingFileMoves.Clear();
+                Interlocked.Exchange(ref fileMoveRefreshScheduled, 0);
+            }
 
-                string deviceId = Data.CurrentADBDevice?.ID;
-                string currentPath = Data.CurrentPath;
+            DirectorySession targetSession = null;
+            FileClass[] filesToRemove = [];
+            await app.EnqueueUiAsync("ipc.file-moves.prepare", () =>
+            {
+                string deviceId = App.ActiveAdbDevice?.ID;
+                string currentPath = App.ExplorerState.CurrentPath;
                 var paths = movedFiles
                     .Where(file => file.DeviceId == deviceId
                         && ADB_Explorer.Helpers.FileHelper.GetParentPath(file.FullPath) == currentPath)
                     .Select(file => file.FullPath)
                     .ToHashSet();
 
-                if (paths.Count > 0 && Data.DirList is not null)
-                    Data.DirList.FileList.RemoveAll(file => paths.Contains(file.FullPath));
-            }), DispatcherPriority.Background);
-        });
+                if (paths.Count == 0 || App.ActiveDirectorySession is null)
+                    return;
+
+                targetSession = App.ActiveDirectorySession;
+                filesToRemove = targetSession.FileList.Where(file => paths.Contains(file.FullPath)).ToArray();
+            });
+
+            foreach (var batch in filesToRemove.Chunk(16))
+            {
+                await app.EnqueueUiAsync("ipc.file-moves.remove", () =>
+                {
+                    if (!ReferenceEquals(App.ActiveDirectorySession, targetSession))
+                        return;
+
+                    foreach (var file in batch)
+                        targetSession.RemoveItem(file);
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref fileMoveRefreshScheduled, 0);
+            App.ReportBackgroundFailure(ex, "ipc.file-moves");
+        }
     }
 
     public static bool SendIpcMessage(HANDLE hWnd, MessageType type, string content = "")
@@ -100,7 +127,7 @@ public class IpcService
 
     public static void NotifyDropCancel(NativeMethods.HResult hr)
     {
-        if (Data.RuntimeSettings.DragWithinSlave)
+        if (App.RuntimeSettings.DragWithinSlave)
             SendIpcMessage(NativeMethods.CursorInfo.GetWindowUnderMouse(), MessageType.DragCanceled, $"{hr}");
     }
 

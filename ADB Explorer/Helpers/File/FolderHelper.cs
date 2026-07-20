@@ -1,7 +1,6 @@
 ﻿using ADB_Explorer.Models;
 using ADB_Explorer.Services;
 using ADB_Explorer.ViewModels;
-using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Helpers;
 
@@ -10,22 +9,22 @@ public static class FolderHelper
     public static void CombineDisplayNames()
     {
         var driveView = AdbLocation.StringFromLocation(Navigation.SpecialLocation.DriveView);
-        if (Data.CurrentDisplayNames.ContainsKey(driveView))
-            Data.CurrentDisplayNames[driveView] = Data.DevicesObject.Current.Name;
+        if (App.ExplorerState.CurrentDisplayNames.ContainsKey(driveView))
+            App.ExplorerState.CurrentDisplayNames[driveView] = App.ActiveDevices.Current.Name;
         else
-            Data.CurrentDisplayNames.Add(driveView, Data.DevicesObject.Current.Name);
+            App.ExplorerState.CurrentDisplayNames.Add(driveView, App.ActiveDevices.Current.Name);
 
-        foreach (var drive in Data.DevicesObject.Current.Drives.OfType<LogicalDriveViewModel>().Where(d => d.Type 
-            is not AbstractDrive.DriveType.Root 
+        foreach (var drive in App.ActiveDevices.Current.Drives.OfType<LogicalDriveViewModel>().Where(d => d.Type
+            is not AbstractDrive.DriveType.Root
             and not AbstractDrive.DriveType.Internal))
         {
-            Data.CurrentDisplayNames.TryAdd(drive.Path, drive.Type is AbstractDrive.DriveType.External
+            App.ExplorerState.CurrentDisplayNames.TryAdd(drive.Path, drive.Type is AbstractDrive.DriveType.External
                 ? drive.ID : drive.DisplayName);
         }
 
         foreach (var item in AdbExplorerConst.DRIVE_TYPES.Where(d => d.Value is AbstractDrive.DriveType.Root or AbstractDrive.DriveType.Internal))
         {
-            Data.CurrentDisplayNames.TryAdd(item.Key, AbstractDrive.GetDriveDisplayName(item.Value));
+            App.ExplorerState.CurrentDisplayNames.TryAdd(item.Key, AbstractDrive.GetDriveDisplayName(item.Value));
         }
 
         foreach (var item in AdbExplorerConst.DRIVE_TYPES)
@@ -36,13 +35,13 @@ public static class FolderHelper
                 .Select(AbstractDrive.GetDriveDisplayName);
 
             if (names.Any())
-                Data.CurrentDisplayNames.TryAdd(item.Key, names.First());
+                App.ExplorerState.CurrentDisplayNames.TryAdd(item.Key, names.First());
         }
 
-        Data.RuntimeSettings.RefreshBreadcrumbs = true;
+        (Application.Current as App)?.RequestUi(UiCommand.RefreshBreadcrumbs);
     }
 
-    public static string FolderExists(string path, bool showError = true)
+    public static async Task<string> FolderExistsAsync(string path, bool showError = true)
     {
         if (path == AdbLocation.StringFromLocation(Navigation.SpecialLocation.PackageDrive))
             return path;
@@ -52,22 +51,26 @@ public static class FolderHelper
 
         try
         {
-            return Data.CurrentADBDevice.TranslateDevicePath(path);
+            return await App.ActiveAdbDevice.TranslateDevicePathAsync(path).ConfigureAwait(false);
         }
         catch (Exception e)
         {
             if (showError && path != AdbExplorerConst.RECYCLE_PATH)
-                DialogService.ShowMessage(e.Message, Strings.Resources.S_NAV_ERR_TITLE, DialogService.DialogIcon.Critical, copyToClipboard: true);
+            {
+                if (Application.Current is App app)
+                {
+                    await app.EnqueueUiAsync(
+                        "navigation.error",
+                        () => DialogService.ShowMessage(
+                            e.Message,
+                            Strings.Resources.S_NAV_ERR_TITLE,
+                            DialogService.DialogIcon.Critical,
+                            copyToClipboard: true)).ConfigureAwait(false);
+                }
+            }
 
             return null;
         }
-    }
-
-    public static bool IsNonArchiveFolder(this ShellItem self)
-    {
-        // A regular file has IsFolder = false, so we get a short-circuit here.
-        // But an archive file (e.g. .zip) has IsFolder = true as well, so we need to check the attributes too.
-        return self.IsFolder && self.FileInfo?.Attributes.HasFlag(FileAttributes.Directory) is true;
     }
 
     /// <summary>

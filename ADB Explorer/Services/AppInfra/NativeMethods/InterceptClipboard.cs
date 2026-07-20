@@ -9,8 +9,6 @@ public static partial class NativeMethods
         private static Action _externalClipAction;
         private static Action<string> _externalIpcAction;
         private static HwndSource _hwndSource;
-        private static Dispatcher _dispatcher;
-        private static int _clipboardRefreshScheduled;
 
         public static HANDLE MainWindowHandle { get; private set; } = IntPtr.Zero;
 
@@ -18,7 +16,6 @@ public static partial class NativeMethods
         {
             _externalClipAction = clipboardAction;
             _externalIpcAction = ipcAction;
-            _dispatcher = window.Dispatcher;
             RoutedEventHandler windowLoadedHandler = null;
 
             windowLoadedHandler = (sender, e) =>
@@ -33,7 +30,10 @@ public static partial class NativeMethods
                 window.Loaded -= windowLoadedHandler;
             };
 
-            window.Loaded += windowLoadedHandler;
+            if (window.IsLoaded)
+                windowLoadedHandler(window, new RoutedEventArgs());
+            else
+                window.Loaded += windowLoadedHandler;
         }
 
         public static void Close()
@@ -42,39 +42,26 @@ public static partial class NativeMethods
             _hwndSource?.RemoveHook(WndProc);
             _hwndSource?.Dispose();
             _hwndSource = null;
-            _dispatcher = null;
             _externalClipAction = null;
             _externalIpcAction = null;
-            Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
         }
 
         public static void ScheduleClipboardRefresh()
         {
-            if (_dispatcher is not { HasShutdownStarted: false } dispatcher
-                || Interlocked.Exchange(ref _clipboardRefreshScheduled, 1) == 1)
-            {
+            if (Application.Current is not App app)
                 return;
-            }
 
-            try
-            {
-                _ = dispatcher.BeginInvoke(new Action(() =>
-                {
-                    Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
-                    _externalClipAction?.Invoke();
-                }), DispatcherPriority.ApplicationIdle);
-            }
-            catch (InvalidOperationException)
-            {
-                Interlocked.Exchange(ref _clipboardRefreshScheduled, 0);
-            }
+            app.EnqueueUiLatest(
+                "clipboard.refresh",
+                "clipboard.refresh",
+                () => _externalClipAction?.Invoke());
         }
 
         private static HANDLE WndProc(HANDLE hwnd, int msg, HANDLE wParam, HANDLE lParam, ref bool handled)
         {
             if ((ClipboardNotificationMessage)msg is ClipboardNotificationMessage.WM_CLIPBOARDUPDATE)
             {
-                if (!Data.RuntimeSettings.IsSplashScreenVisible)
+                if (App.RuntimeSettings.IsWindowLoaded)
                     ScheduleClipboardRefresh();
                 handled = true;
             }

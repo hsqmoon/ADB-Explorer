@@ -16,7 +16,7 @@ public partial class PasteAndPullTooltip : UserControl
 
     private void Button_Click(object sender, RoutedEventArgs e)
     {
-        Data.Settings.HidePasteNamingInfo = PermanentHideCheckBox.IsChecked is true;
+        App.Settings.HidePasteNamingInfo = PermanentHideCheckBox.IsChecked is true;
         Visibility = Visibility.Hidden;
     }
 }

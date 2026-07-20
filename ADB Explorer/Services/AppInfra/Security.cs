@@ -139,7 +139,7 @@ public static class Security
 
     public static void ValidateOps()
     {
-        foreach (var item in Data.FileActions.SelectedFileOps.Value)
+        foreach (var item in App.FileActions.SelectedFileOps.Value)
         {
             ValidateOperation(item);
         }

@@ -1,6 +1,9 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
 using ADB_Explorer.ViewModels;
+using AdvancedSharpAdbClient;
+using AdvancedSharpAdbClient.DeviceCommands;
+using System.Threading.Channels;
 using static ADB_Explorer.Models.AbstractFile;
 
 namespace ADB_Explorer.Services;
@@ -11,7 +14,6 @@ public partial class ADBService
 
     private const string GET_PROP = "getprop";
     private const string ANDROID_VERSION = "ro.build.version.release";
-    private const string BATTERY = "dumpsys battery";
     private const string MMC_PROP = "vold.microsd.uuid";
     private const string OTG_PROP = "vold.otgstorage.uuid";
 
@@ -20,13 +22,28 @@ public partial class ADBService
     private static readonly string[] EMULATED_DRIVES_GREP = ["|", "grep", "-E", "'/mnt/media_rw/|/storage/'"];
 
     private static readonly string[] READLINK_ARGS1 = ["link", "in"]; // Preceded by 'for'
-    private static readonly string[] READLINK_ARGS2 = [";", "do", "target=$(readlink", "-f", "$link", "2>&1);", "echo", "/// $link /// $target ///;", "done"];
-    private static readonly string[] STAT_LINKMODE_ARGS = ["-c", "'/// %n /// %f ///'", "2>&1"];
+    private static readonly string[] READLINK_ARGS2 =
+    [
+        ";", "do",
+        "if [ -z \"$readlink_cmd\" ]; then echo \"/// $link ///  /// u ///\"; continue; fi;",
+        "target=$($readlink_cmd -f \"$link\" 2>/dev/null);",
+        "if [ -z \"$target\" ]; then kind=x;",
+        "elif [ -d \"$target\" ]; then kind=d;",
+        "elif [ -f \"$target\" ]; then kind=f;",
+        "elif [ -b \"$target\" ]; then kind=b;",
+        "elif [ -c \"$target\" ]; then kind=c;",
+        "elif [ -p \"$target\" ]; then kind=p;",
+        "elif [ -S \"$target\" ]; then kind=s;",
+        "else kind=u; fi;",
+        "echo \"/// $link /// $target /// $kind ///\";",
+        "done"
+    ];
 
-    private static readonly string[] INET_ARGS = ["-f", "inet", "addr", "show", "wlan0"];
 
     public class AdbDevice(LogicalDeviceViewModel other) : Device
     {
+        private readonly AdbCommandClient commandClient = new();
+
         public LogicalDeviceViewModel Device { get; } = other;
 
         public override string ID => Device.ID;
@@ -87,18 +104,11 @@ public partial class ADBService
             S_IFSOCK = 0xC000,
         }
 
-        private static FileStat CreateFile(string path, string stdoutLine)
+        private static FileStat CreateFile(string path, IFileStatistics entry)
         {
-            var match = AdbRegEx.RE_LS_FILE_ENTRY().Match(stdoutLine);
-            if (!match.Success)
-            {
-                throw new Exception($"Invalid output for adb ls command: {stdoutLine}");
-            }
-
-            var name = match.Groups["Name"].Value;
-            long? size = long.Parse(match.Groups["Size"].Value, NumberStyles.HexNumber);
-            var time = long.Parse(match.Groups["Time"].Value, NumberStyles.HexNumber);
-            var mode = (UnixFileMode)UInt32.Parse(match.Groups["Mode"].Value, NumberStyles.HexNumber);
+            var name = FileHelper.GetFullName(entry.Path);
+            long? size = entry.Size > long.MaxValue ? long.MaxValue : (long)entry.Size;
+            var mode = (UnixFileMode)(uint)entry.FileMode;
 
             if (SPECIAL_DIRS.Contains(name))
                 return null;
@@ -114,7 +124,7 @@ public partial class ADBService
                 path: FileHelper.ConcatPaths(path, name),
                 type: type,
                 size: size,
-                modifiedTime: (time > 0) ? DateTimeOffset.FromUnixTimeSeconds(time).DateTime.ToLocalTime() : null,
+                modifiedTime: entry.Time == default ? null : entry.Time.LocalDateTime,
                 isLink: mode.HasFlag(UnixFileMode.S_IFLNK));
         }
 
@@ -131,120 +141,207 @@ public partial class ADBService
             return FileType.Unknown;
         }
 
-        public IEnumerable<(string, FileType)> GetLinkType(IEnumerable<string> filePaths, CancellationToken cancellationToken)
+        public async Task<IReadOnlyList<(string, FileType)>> GetLinkTypeAsync(
+            IEnumerable<string> filePaths,
+            CancellationToken cancellationToken)
         {
-            // Run readlink in a loop to support single param version
-            ExecuteDeviceAdbShellCommand(ID,
-                                         "for",
-                                         out string stdout,
-                                         out string stderr,
-                                         cancellationToken,
-                                         [.. READLINK_ARGS1, .. filePaths.Select(f => EscapeAdbShellString(f)), .. READLINK_ARGS2]);
-
-            // Prepare a link->target dictionary, where the RegEx matched
-            var links = AdbRegEx.RE_LINK_TARGETS().Matches(stdout);
-            var linkDict = links.Where(match => match.Success).ToDictionary(match => match.Groups["Source"].Value, match => match.Groups["Target"].Value);
-            var uniqueLinks = linkDict.Values.Where(l => !string.IsNullOrWhiteSpace(l)).Distinct().Select(l => EscapeAdbShellString(l));
-
-            // Get file mode of all unique links
-            ExecuteDeviceAdbShellCommand(ID, "stat", out string statStdout, out string statStderr, cancellationToken, [.. uniqueLinks, .. STAT_LINKMODE_ARGS]);
-            var modes = AdbRegEx.RE_LINK_MODE().Matches(statStdout);
-
-            // Prepare a target->mode dictionary, where the RegEx matches
-            var linkTypes = modes.Where(match => match.Success).ToDictionary(
-                match => match.Groups["Target"].Value,
-                match => ParseFileMode((UnixFileMode)UInt32.Parse(match.Groups["Mode"].Value, NumberStyles.HexNumber)));
-
-            // Iterate over input files using the dictionaries
-            foreach (var file in filePaths)
-            {
-                if (linkDict.TryGetValue(file, out var target))
+            var paths = filePaths.ToArray();
+            // Run readlink in a loop to support single param versions. File type tests are
+            // shell built-ins because some embedded ADB devices do not provide stat at all.
+            string readLinkCommand = string.Join(' ',
+                new[]
                 {
-                    if (linkTypes.TryGetValue(target, out var type))
-                    {
-                        yield return (target, type);
-                        continue;
-                    }
-
-                    yield return (target, FileType.BrokenLink);
-                    continue;
+                    "readlink_cmd=$(command -v readlink 2>/dev/null);",
+                    "if [ -z \"$readlink_cmd\" ] && command -v busybox >/dev/null 2>&1 && busybox readlink --help >/dev/null 2>&1; then readlink_cmd='busybox readlink'; fi;",
+                    "for"
                 }
-                
-                yield return ("", FileType.Unknown);
-            }
+                    .Concat(READLINK_ARGS1)
+                    .Concat(paths.Select(path => EscapeAdbShellString(path)))
+                    .Concat(READLINK_ARGS2));
+            string stdout = await commandClient.ExecuteShellAsync(
+                Device,
+                readLinkCommand,
+                cancellationToken).ConfigureAwait(false);
+
+            return ParseLinkDetails(paths, stdout);
         }
 
-        public void ListDirectory(string path, ConcurrentQueue<FileClass> output, Dispatcher dispatcher, CancellationToken cancellationToken)
+        internal static IReadOnlyList<(string Target, FileType Type)> ParseLinkDetails(
+            IEnumerable<string> filePaths,
+            string output)
         {
-            IEnumerable<string> stdout;
+            var paths = filePaths.ToArray();
+            var links = AdbRegEx.RE_LINK_DETAILS().Matches(output)
+                .Where(match => match.Success)
+                .ToDictionary(
+                    match => match.Groups["Source"].Value,
+                    match => (
+                        match.Groups["Target"].Value,
+                        match.Groups["Type"].Value switch
+                        {
+                            "d" => FileType.Folder,
+                            "f" => FileType.File,
+                            "b" => FileType.BlockDevice,
+                            "c" => FileType.CharDevice,
+                            "p" => FileType.FIFO,
+                            "s" => FileType.Socket,
+                            "x" => FileType.BrokenLink,
+                            _ => FileType.Unknown,
+                        }));
 
+            List<(string Target, FileType Type)> result = [];
+            foreach (var file in paths)
+            {
+                result.Add(links.TryGetValue(file, out var link)
+                    ? link
+                    : ("", FileType.Unknown));
+            }
+
+            return result;
+        }
+
+        public async Task ListDirectoryAsync(string path, ChannelWriter<FileClass> output, CancellationToken cancellationToken)
+        {
             try
             {
-                stdout = ExecuteDeviceAdbCommandAsync(ID, "ls", cancellationToken, EscapeAdbString(path));
-
-                foreach (string stdoutLine in stdout)
+                var client = new AdbClient(AdbServerEndPoint);
+                await foreach (var entry in client.GetDirectoryAsyncListing(
+                    Device.DeviceData,
+                    path,
+                    Device.AndroidVersion >= 11,
+                    cancellationToken).ConfigureAwait(false))
                 {
-                    var item = CreateFile(path, stdoutLine);
+                    var item = CreateFile(path, entry);
 
                     if (item is null)
                         continue;
 
-                    output.Enqueue(FileClass.GenerateAndroidFile(item));
+                    await output.WriteAsync(FileClass.GenerateAndroidFile(item), cancellationToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)
             {
-                return;
+                throw;
             }
             catch (Exception e)
             {
-                var message = e.Message;
-                if (!string.IsNullOrEmpty(message))
-                    message += "\n\n";
-                
-                _ = dispatcher.BeginInvoke(new Action(() => DialogService.ShowMessage(
-                    message + Strings.Resources.S_LS_ERROR,
-                    Strings.Resources.S_LS_ERROR_TITLE,
-                    DialogService.DialogIcon.Critical,
-                    true,
-                    copyToClipboard: true)));
-                return;
+                throw new IOException(Strings.Resources.S_LS_ERROR, e);
+            }
+            finally
+            {
+                output.TryComplete();
             }
         }
 
-        public string TranslateDevicePath(string path)
+        public async Task<string> TranslateDevicePathAsync(
+            string path,
+            CancellationToken cancellationToken = default)
         {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
             if (path.StartsWith('~'))
                 path = path.Length == 1 ? "/" : path[1..];
 
             if (path.StartsWith("//"))
                 path = path[1..];
 
-            int exitCode = ExecuteDeviceAdbShellCommand(ID, "cd", out string stdout, out string stderr, CancellationToken.None, EscapeAdbShellString(path), "&&", "pwd");
-            if (exitCode != 0)
-            {
-                throw new Exception(stderr);
-            }
-            return stdout.TrimEnd(LINE_SEPARATORS);
+            const string errorMarker = "__ADB_EXPLORER_PATH_ERROR__";
+            string output = await commandClient.ExecuteShellAsync(
+                Device,
+                $"cd {EscapeAdbShellString(path)} 2>/dev/null && pwd || echo {errorMarker}",
+                timeout.Token).ConfigureAwait(false);
+            string result = output.TrimEnd(LINE_SEPARATORS);
+            if (result.EndsWith(errorMarker, StringComparison.Ordinal))
+                throw new DirectoryNotFoundException(path);
+
+            return result;
         }
 
-        public List<LogicalDrive> GetDrives()
+        public async Task<ulong> CountFilesAsync(
+            string path,
+            IEnumerable<string> includeNames,
+            IEnumerable<string> excludeNames,
+            CancellationToken cancellationToken)
         {
-            List<LogicalDrive> drives = [];
+            string[] args = PrepFindArgs(path, includeNames, excludeNames, countOnly: true);
+            string command = ShellCommands.TranslateCommand("find", ID);
+            string output = await commandClient.ExecuteShellAsync(
+                Device,
+                $"{command} {string.Join(' ', args)}",
+                cancellationToken).ConfigureAwait(false);
+            return ulong.TryParse(output.Trim(), out ulong count) ? count : 0;
+        }
 
-            var root = ReadDrives(AdbRegEx.RE_EMULATED_STORAGE_SINGLE(), "/");
+        public async Task<ulong?> GetPackagesCountAsync(CancellationToken cancellationToken)
+        {
+            string output = await commandClient.ExecuteShellAsync(
+                Device,
+                "pm list packages | wc -l",
+                cancellationToken).ConfigureAwait(false);
+            return ulong.TryParse(output.Trim(), out ulong count) ? count : null;
+        }
+
+        public async Task<List<Package>> GetPackagesAsync(
+            bool includeSystem,
+            bool includeOptionalParameters,
+            CancellationToken cancellationToken)
+        {
+            string optionalParameters = includeOptionalParameters
+                ? " -U --show-versioncode"
+                : "";
+            var systemTask = includeSystem
+                ? commandClient.ExecuteShellAsync(
+                    Device,
+                    $"pm list packages -s -f{optionalParameters}",
+                    cancellationToken)
+                : Task.FromResult("");
+            var userTask = commandClient.ExecuteShellAsync(
+                Device,
+                $"pm list packages -3 -f{optionalParameters}",
+                cancellationToken);
+            await Task.WhenAll(systemTask, userTask).ConfigureAwait(false);
+
+            List<Package> packages = [];
+            if (includeSystem)
+            {
+                packages.AddRange((await systemTask.ConfigureAwait(false))
+                    .Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(line => line.StartsWith("package:", StringComparison.Ordinal))
+                    .Select(line => Package.New(line, Package.PackageType.System)));
+            }
+
+            packages.AddRange((await userTask.ConfigureAwait(false))
+                .Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries)
+                .Where(line => line.StartsWith("package:", StringComparison.Ordinal))
+                .Select(line => Package.New(line, Package.PackageType.User)));
+            return packages;
+        }
+
+        public async Task<List<LogicalDrive>> GetDrivesAsync(CancellationToken cancellationToken = default)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
+            var requestToken = timeout.Token;
+            List<LogicalDrive> drives = [];
+            var rootTask = ReadDrivesAsync(AdbRegEx.RE_EMULATED_STORAGE_SINGLE(), requestToken, "/");
+            var internalTask = ReadDrivesAsync(AdbRegEx.RE_EMULATED_STORAGE_SINGLE(), requestToken, "/sdcard");
+            var externalTask = ReadDrivesAsync(AdbRegEx.RE_EMULATED_ONLY(), requestToken, EMULATED_DRIVES_GREP);
+            var propsTask = LoadPropertiesAsync(requestToken);
+            await Task.WhenAll(rootTask, internalTask, externalTask, propsTask).ConfigureAwait(false);
+
+            var root = await rootTask.ConfigureAwait(false);
             if (root is null)
                 return null;
             else if (root.Any())
                 drives.Add(root.First());
 
-            var intStorage = ReadDrives(AdbRegEx.RE_EMULATED_STORAGE_SINGLE(), "/sdcard");
+            var intStorage = await internalTask.ConfigureAwait(false);
             if (intStorage is null)
                 return drives;
             if (intStorage.Any())
                 drives.Add(intStorage.First());
 
-            var extStorage = ReadDrives(AdbRegEx.RE_EMULATED_ONLY(), EMULATED_DRIVES_GREP);
+            var extStorage = await externalTask.ConfigureAwait(false);
             if (extStorage is null)
                 return drives;
 
@@ -264,66 +361,137 @@ public partial class ADBService
                 drives.Insert(0, new(path: "/"));
             }
 
+            await ClassifyExtensionDrivesAsync(drives, requestToken).ConfigureAwait(false);
             return drives;
         }
 
-        private IEnumerable<LogicalDrive> ReadDrives(Regex re, params string[] args)
+        private async Task ClassifyExtensionDrivesAsync(
+            List<LogicalDrive> drives,
+            CancellationToken cancellationToken)
         {
-            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
-            int exitCode = ExecuteDeviceAdbShellCommand(ID, "df", out string stdout, out string stderr, cancellation.Token, args);
-            if (exitCode != 0)
-                return null;
+            var extensionDrives = drives
+                .Where(drive => drive.Type is AbstractDrive.DriveType.Unknown)
+                .ToArray();
+            if (extensionDrives.Length == 0)
+                return;
 
-            return re.Matches(stdout).Select(m => new LogicalDrive(m.Groups, isEmulator: Type is DeviceType.Emulator, forcePath: args[0] == "/" ? "/" : ""));
+            LogicalDrive mmcDrive = null;
+            if (!string.IsNullOrEmpty(MmcProp))
+            {
+                mmcDrive = extensionDrives.FirstOrDefault(drive => drive.ID == MmcProp);
+            }
+            else if (OtgProp is null)
+            {
+                string output = await commandClient.ExecuteShellAsync(
+                    Device,
+                    $"stat -c '%t,%T' {string.Join(' ', MMC_BLOCK_DEVICES)} 2>/dev/null; sm list-volumes public 2>/dev/null",
+                    cancellationToken).ConfigureAwait(false);
+                var nodeMatch = AdbRegEx.RE_MMC_BLOCK_DEVICE_NODE().Match(output);
+                if (nodeMatch.Success)
+                {
+                    if (extensionDrives.Length == 1)
+                    {
+                        mmcDrive = extensionDrives[0];
+                    }
+                    else if (int.TryParse(
+                            nodeMatch.Groups["major"].Value,
+                            NumberStyles.HexNumber,
+                            CultureInfo.InvariantCulture,
+                            out int major)
+                        && int.TryParse(
+                            nodeMatch.Groups["minor"].Value,
+                            NumberStyles.HexNumber,
+                            CultureInfo.InvariantCulture,
+                            out int minor))
+                    {
+                        var volumeMatch = Regex.Match(
+                            output,
+                            $@"{major},{minor}\s+mounted\s+(?<id>[\w-]+)");
+                        if (volumeMatch.Success)
+                            mmcDrive = extensionDrives.FirstOrDefault(
+                                drive => drive.ID == volumeMatch.Groups["id"].Value);
+                    }
+                }
+            }
+
+            if (mmcDrive is not null)
+                mmcDrive.Type = AbstractDrive.DriveType.Expansion;
+            DeviceHelper.SetExternalDrives(extensionDrives);
+        }
+
+        private async Task<IEnumerable<LogicalDrive>> ReadDrivesAsync(
+            Regex re,
+            CancellationToken cancellationToken,
+            params string[] args)
+        {
+            try
+            {
+                string output = await commandClient.ExecuteShellAsync(
+                    Device,
+                    $"df {string.Join(' ', args)}",
+                    cancellationToken).ConfigureAwait(false);
+                return re.Matches(output).Select(m => new LogicalDrive(
+                    m.Groups,
+                    isEmulator: Type is DeviceType.Emulator,
+                    forcePath: args[0] == "/" ? "/" : ""));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private Dictionary<string, string> props;
-        public Dictionary<string, string> Props
+        private async Task LoadPropertiesAsync(CancellationToken cancellationToken)
         {
-            get
+            if (props is not null)
+                return;
+
+            try
             {
-                if (props is null)
-                {
-                    int exitCode = ExecuteDeviceAdbShellCommand(ID, GET_PROP, out string stdout, out string stderr, CancellationToken.None);
-                    if (exitCode == 0)
-                    {
-                        props = stdout.Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Where(
-                            l => l[0] == '[' && l[^1] == ']').TryToDictionary(
-                                line => line.Split(':')[0].Trim('[', ']', ' '),
-                                line => line.Split(':')[1].Trim('[', ']', ' '));
-                    }
-                    else
-                        props = [];
-
-                }
-
-                return props;
+                string output = await commandClient.ExecuteShellAsync(
+                    Device,
+                    GET_PROP,
+                    cancellationToken).ConfigureAwait(false);
+                props = output.Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(line => line.Length > 1 && line[0] == '[' && line[^1] == ']')
+                    .Select(line => line.Split(':', 2))
+                    .Where(parts => parts.Length == 2)
+                    .ToDictionary(
+                        parts => parts[0].Trim('[', ']', ' '),
+                        parts => parts[1].Trim('[', ']', ' '),
+                        StringComparer.Ordinal);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                props = [];
             }
         }
 
-        public string MmcProp => Props.GetValueOrDefault(MMC_PROP);
-        public string OtgProp => Props.GetValueOrDefault(OTG_PROP);
+        public string MmcProp => props?.GetValueOrDefault(MMC_PROP);
+        public string OtgProp => props?.GetValueOrDefault(OTG_PROP);
 
         public byte? AndroidVersion;
 
-        public Task<string> GetAndroidVersion() => Task.Run(() =>
+        public async Task<string> GetAndroidVersion(CancellationToken cancellationToken = default)
         {
-            var version = Props.GetValueOrDefault(ANDROID_VERSION, "");
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
+            string version = (await commandClient.ExecuteShellAsync(
+                Device,
+                $"getprop {ANDROID_VERSION}",
+                timeout.Token).ConfigureAwait(false)).Trim();
             AndroidVersion = byte.TryParse(version.Split('.')[0], out byte ver) ? ver : null;
 
             return version;
-        });
-
-        public static Dictionary<string, string> GetBatteryInfo(LogicalDevice device)
-        {
-            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
-            if (ExecuteDeviceAdbShellCommand(device.ID, BATTERY, out string stdout, out string stderr, cancellation.Token) == 0)
-            {
-                return stdout.Split(LINE_SEPARATORS, StringSplitOptions.RemoveEmptyEntries).Where(l => l.Contains(':')).ToDictionary(
-                    line => line.Split(':')[0].Trim(),
-                    line => line.Split(':')[1].Trim());
-            }
-            return null;
         }
 
         public static void Reboot(string deviceId, string arg)
@@ -332,34 +500,5 @@ public partial class ADBService
                 throw new Exception(string.IsNullOrEmpty(stderr) ? stdout : stderr);
         }
 
-        public static bool GetDeviceIp(DeviceViewModel device)
-        {
-            using var cancellation = new CancellationTokenSource(AdbExplorerConst.ADB_POLL_COMMAND_TIMEOUT);
-            if (ExecuteDeviceAdbShellCommand(device.ID, "ip", out string stdout, out _, cancellation.Token, INET_ARGS) != 0)
-                return false;
-
-            var match = AdbRegEx.RE_DEVICE_WLAN_INET().Match(stdout);
-            if (!match.Success)
-                return false;
-
-            device.SetIpAddress(match.Groups["IP"].Value);
-
-            return true;
-        }
-
-        public static bool ForceMediaScan(LogicalDeviceViewModel device)
-        {
-            // content call --method scan_volume --uri content://media --arg external_primary
-            var res = ExecuteDeviceAdbShellCommand(device.ID,
-                "content",
-                out _,
-                out _,
-                CancellationToken.None,
-                "call --method scan_volume",
-                "--uri content://media",
-                "--arg external_primary");
-
-            return res == 0;
-        }
     }
 }

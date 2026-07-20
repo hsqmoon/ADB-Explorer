@@ -170,17 +170,17 @@ internal static class DiskUsageHelper
             {
                 var totalUsage = newUsage.Subtract(prevUsage);
 
-                if (App.Current?.Dispatcher is { HasShutdownStarted: false } dispatcher)
+                if (Application.Current is App app)
                 {
-                    _ = dispatcher.BeginInvoke(new Action(() =>
+                    app.EnqueueUiLatest("adb.disk-usage", "adb.disk-usage", () =>
                     {
-                        Data.RuntimeSettings.AdbReadRate = totalUsage.ReadString;
-                        Data.RuntimeSettings.AdbWriteRate = totalUsage.WriteString;
-                        Data.RuntimeSettings.AdbOtherRate = totalUsage.OtherString;
+                        App.RuntimeSettings.AdbReadRate = totalUsage.ReadString;
+                        App.RuntimeSettings.AdbWriteRate = totalUsage.WriteString;
+                        App.RuntimeSettings.AdbOtherRate = totalUsage.OtherString;
 
-                        Data.RuntimeSettings.IsAdbReadActive = totalUsage.IsReadActive;
-                        Data.RuntimeSettings.IsAdbWriteActive = totalUsage.IsWriteActive;
-                    }), DispatcherPriority.Background);
+                        App.RuntimeSettings.IsAdbReadActive = totalUsage.IsReadActive;
+                        App.RuntimeSettings.IsAdbWriteActive = totalUsage.IsWriteActive;
+                    });
                 }
             }
 

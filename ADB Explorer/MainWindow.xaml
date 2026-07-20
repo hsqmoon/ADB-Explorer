@@ -3,10 +3,10 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:app_prop="clr-namespace:ADB_Explorer.Properties"
+    xmlns:app="clr-namespace:ADB_Explorer"
     xmlns:controls="clr-namespace:ADB_Explorer.Controls"
     xmlns:converters="clr-namespace:ADB_Explorer.Converters"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-    xmlns:emoji="clr-namespace:Emoji.Wpf;assembly=Emoji.Wpf"
     xmlns:helpers="clr-namespace:ADB_Explorer.Helpers"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:models="clr-namespace:ADB_Explorer.Models"
@@ -25,7 +25,6 @@
     Background="{DynamicResource AdbWindowBackground}"
     Closing="Window_Closing"
     Cursor="{Binding ElementName=UnfinishedBlock, Path=Cursor}"
-    LocationChanged="MainWin_LocationChanged"
     MouseDown="Window_MouseDown"
     MouseUp="Window_MouseUp"
     PreviewKeyDown="MainWin_PreviewKeyDown"
@@ -39,7 +38,6 @@
     mc:Ignorable="d">
     <Window.Resources>
         <sys:Int16 x:Key="FontSize">13</sys:Int16>
-        <CollectionViewSource x:Key="FileListView" Source="{Binding Source={x:Static Member=models:Data.DirList}, Path=FileList}" />
         <ContextMenu x:Key="RowContextMenu" Style="{StaticResource ExplorerContextMenuStyle}" />
         <converters:StringFormatConverter x:Key="StringFormatConverter" />
         <Style
@@ -119,7 +117,7 @@
                             x:Name="SearchBox"
                             Grid.Column="2"
                             Height="34"
-                            IsExpanded="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=IsSearchBoxFocused, Mode=TwoWay}"
+                            IsExpanded="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=IsSearchBoxFocused, Mode=TwoWay}"
                             Style="{StaticResource SearchBoxStyle}" />
                     </Grid>
                 </StackPanel>
@@ -144,7 +142,7 @@
                                 Margin="4"
                                 helpers:ExpanderHelper.IsTransparent="True"
                                 Header="{Binding Source={x:Static Member=strings:Resources.S_SAVED_LOCATIONS}}"
-                                IsExpanded="{Binding Source={x:Static Member=models:Data.Settings}, Path=HomeLocationsExpanded, Mode=TwoWay}">
+                                IsExpanded="{Binding Source={x:Static Member=app:App.Settings}, Path=HomeLocationsExpanded, Mode=TwoWay}">
                                 <ListView x:Name="HomeSavedLocationsList" Style="{StaticResource HomeSavedLocationsListStyle}" />
                             </Expander>
                             <Expander
@@ -174,9 +172,9 @@
                         GridLinesVisibility="None"
                         HeadersVisibility="Column"
                         IsReadOnly="False"
-                        ItemsSource="{Binding Source={StaticResource FileListView}, NotifyOnSourceUpdated=True}"
                         KeyboardNavigation.TabNavigation="Once"
                         LoadingRow="ExplorerGrid_LoadingRow"
+                        UnloadingRow="ExplorerGrid_UnloadingRow"
                         MouseDown="ExplorerGrid_MouseDown"
                         MouseMove="ExplorerGrid_MouseMove"
                         RowStyle="{StaticResource RowStyle}"
@@ -203,7 +201,7 @@
                                 x:Name="NameColumn"
                                 Width="300"
                                 Header="{Binding Source={x:Static Member=strings:Resources.S_COLUMN_NAME}}"
-                                IsReadOnly="{Binding Source={x:Static Member=models:Data.FileActions}, Path=NameReadOnly}"
+                                IsReadOnly="{Binding Source={x:Static Member=app:App.FileActions}, Path=NameReadOnly}"
                                 SortMemberPath="FullName">
                                 <DataGridTemplateColumn.CellEditingTemplate>
                                     <DataTemplate>
@@ -217,7 +215,7 @@
                                 </DataGridTemplateColumn.CellEditingTemplate>
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <emoji:TextBlock Style="{StaticResource DirectoryGridCellStyle}" Text="{Binding DisplayName}" />
+                                        <TextBlock Style="{StaticResource DirectoryGridCellStyle}" Text="{Binding DisplayName}" />
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
@@ -259,7 +257,7 @@
                                 SortMemberPath="TypeName">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <emoji:TextBlock
+                                        <TextBlock
                                             FontSize="{Binding Source={StaticResource FontSize}}"
                                             Style="{StaticResource DirectoryGridCellStyle}"
                                             Text="{Binding TypeName}" />
@@ -351,7 +349,7 @@
                         <Grid.Style>
                             <Style TargetType="Grid">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.FileActions}, Path=IsEditorOpen}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.FileActions}, Path=IsEditorOpen}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -363,7 +361,7 @@
                             <ColumnDefinition
                                 Width="0.3*"
                                 MinWidth="90"
-                                MaxWidth="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=MaxSearchBoxWidth}" />
+                                MaxWidth="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=MaxSearchBoxWidth}" />
                         </Grid.ColumnDefinitions>
                         <Grid Grid.Column="2">
                             <Grid>
@@ -417,7 +415,7 @@
                         <controls:AdbTerminalControl.Style>
                             <Style TargetType="controls:AdbTerminalControl">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=IsTerminalOpen}" Value="False">
+                                    <DataTrigger Binding="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=IsTerminalOpen}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -514,7 +512,7 @@
                     Grid.Column="2"
                     HorizontalAlignment="Right"
                     VerticalAlignment="Center"
-                    DataContext="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=CurrentDevice}"
+                    DataContext="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=CurrentDevice}"
                     Orientation="Horizontal">
                     <StackPanel Orientation="Horizontal">
                         <controls:TransferIndicator Margin="0,1,0,0" Style="{StaticResource DiskUsageIconStyle}" />
@@ -597,7 +595,7 @@
                                                 x:Name="PairingQrImage"
                                                 Margin="6"
                                                 RenderOptions.EdgeMode="Aliased"
-                                                Source="{Binding Source={x:Static Member=models:Data.QrClass}, Path=Image}" />
+                                                Source="{Binding Source={x:Static Member=app:App.QrClass}, Path=Image}" />
                                         </Border>
                                         <StackPanel
                                             Margin="0,4"
@@ -607,7 +605,7 @@
                                             <TextBlock>
                                                 <TextBlock.Text>
                                                     <MultiBinding Converter="{StaticResource StringFormatConverter}" ConverterParameter="{x:Static strings:Resources.S_AWAITING_RESPONSE}">
-                                                        <Binding Path="TimePassedString" Source="{x:Static Member=models:Data.MdnsService}" />
+                                                        <Binding Path="TimePassedString" Source="{x:Static Member=app:App.MdnsService}" />
                                                     </MultiBinding>
                                                 </TextBlock.Text>
                                             </TextBlock>
@@ -633,7 +631,6 @@
                                 </Expander>
                                 <Grid>
                                     <Grid Margin="6,4,0,0" HorizontalAlignment="Left">
-                                        <ui:ProgressRing IsActive="True" Style="{StaticResource DevicesPollingProgressRingStyle}" />
                                         <Button
                                             Click="RefreshDevicesButton_Click"
                                             Style="{StaticResource DevicesManualPollingButtonStyle}"
@@ -660,7 +657,7 @@
                                                     <TextBlock>
                                                         <TextBlock.Text>
                                                             <MultiBinding Converter="{StaticResource StringFormatConverter}" ConverterParameter="{x:Static strings:Resources.S_SECONDS_SHORT}">
-                                                                <Binding Path="TimeFromLastResponse" Source="{x:Static Member=models:Data.RuntimeSettings}" />
+                                                                <Binding Path="TimeFromLastResponse" Source="{x:Static Member=app:App.RuntimeSettings}" />
                                                             </MultiBinding>
                                                         </TextBlock.Text>
                                                     </TextBlock>
@@ -699,7 +696,7 @@
                                 </Grid.RowDefinitions>
                                 <ListView
                                     x:Name="DevicesList"
-                                    ItemsSource="{Binding Source={x:Static Member=models:Data.DevicesObject}, Path=UIList}"
+                                    ItemsSource="{Binding Source={x:Static Member=app:App.ActiveDevices}, Path=VisibleDevices}"
                                     Style="{StaticResource DevicesListViewStyle}" />
                                 <Border
                                     Grid.Row="1"
@@ -715,7 +712,7 @@
             x:Name="SettingsSplitView"
             d:IsHidden="True"
             FocusVisualStyle="{x:Null}"
-            IsPaneOpen="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=IsSettingsPaneOpen, Mode=TwoWay}"
+            IsPaneOpen="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=IsSettingsPaneOpen, Mode=TwoWay}"
             OpenPaneLength="350"
             PanePlacement="Right">
             <ui:SplitView.Resources>
@@ -778,7 +775,7 @@
                                     <Grid.Style>
                                         <Style TargetType="Grid">
                                             <Style.Triggers>
-                                                <DataTrigger Binding="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=SortedView}" Value="False">
+                                                <DataTrigger Binding="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=SortedView}" Value="False">
                                                     <Setter Property="Visibility" Value="Collapsed" />
                                                 </DataTrigger>
                                             </Style.Triggers>
@@ -792,7 +789,7 @@
                                         ui:ControlHelper.PlaceholderText="{x:Static strings:Resources.S_SEARCH_SETTINGS}"
                                         GotFocus="SettingsSearchBox_FocusChanged"
                                         LostFocus="SettingsSearchBox_FocusChanged"
-                                        Text="{Binding Source={x:Static Member=models:Data.RuntimeSettings}, Path=SearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                        Text="{Binding Source={x:Static Member=app:App.RuntimeSettings}, Path=SearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                     <ui:FontIcon
                                         Margin="6,0,0,0"
                                         HorizontalAlignment="Left"
@@ -873,7 +870,7 @@
                                                 <ui:HyperlinkButton
                                                     Click="AppDataHyperlink_Click"
                                                     Content="{x:Static strings:Resources.S_APP_DATA_FOLDER}"
-                                                    ToolTip="{Binding Source={x:Static Member=models:Data.AppDataPath}}" />
+                                                    ToolTip="{Binding Source={x:Static Member=app:App.AppDataPath}}" />
                                                 <ui:HyperlinkButton
                                                     Content="{x:Static strings:Resources.S_GITHUB_REPO}"
                                                     NavigateUri="{Binding Source={x:Static Member=resources:Links.ADB_EXPLORER_GITHUB}}"
@@ -928,6 +925,5 @@
                 </Border>
             </ui:SplitView.Pane>
         </ui:SplitView>
-        <controls:SplashScreen d:Visibility="Collapsed" />
     </Grid>
 </Window>

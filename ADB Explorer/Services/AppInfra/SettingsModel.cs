@@ -1,7 +1,7 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.ViewModels;
 using System.Linq.Expressions;
-using static ADB_Explorer.Models.Data;
+using static ADB_Explorer.App;
 using static ADB_Explorer.Services.SettingsAction;
 
 namespace ADB_Explorer.Services;
@@ -44,7 +44,6 @@ public static class UISettings
             new SettingsGroup("ADB",
             [
                 new BoolSetting(() => Settings.EnableMdns, Strings.Resources.S_SETTINGS_ENABLE_MDNS),
-                new BoolSetting(() => Settings.PollDevices, Strings.Resources.S_SETTINGS_POLL_DEVICES),
                 new BoolSetting(() => Settings.PollBattery, Strings.Resources.S_SETTINGS_POLL_BATTERY),
                 new BoolSetting(() => Settings.EnableLog, Strings.Resources.S_BUTTON_LOG),
             ]),
@@ -59,7 +58,6 @@ public static class UISettings
             new SettingsGroup(Strings.Resources.S_FILE_OP_TOOLTIP,
             [
                 new BoolSetting(() => Settings.EnableCompactView, Strings.Resources.S_SETTINGS_COMPACT_VIEW),
-                new BoolSetting(() => Settings.StopPollingOnSync, Strings.Resources.S_SETTINGS_STOP_ON_SYNC),
                 new BoolSetting(() => Settings.AllowMultiOp, Strings.Resources.S_SETTINGS_PARALLEL_OPERATIONS),
                 new BoolSetting(() => Settings.RescanOnPush, Strings.Resources.S_SETTINGS_MEDIA_RESCAN),
                 new BoolSetting(() => Settings.KeepDateModified, Strings.Resources.S_SETTINGS_KEEP_MODIFIED_DATE),
@@ -127,7 +125,6 @@ public static class UISettings
                                     SettingsActions.Find(a => a.Name is ActionType.ResetApp),
                                     SettingsActions.Find(a => a.Name is ActionType.AnimationInfo),
                                 ]),
-                new BoolSetting(() => Settings.EnableSplash, Strings.Resources.S_SETTINGS_SPLASH),
             ]),
             new Ungrouped(
             [

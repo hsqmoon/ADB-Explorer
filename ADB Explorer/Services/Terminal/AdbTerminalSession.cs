@@ -604,7 +604,7 @@ public sealed class AdbTerminalSession : ViewModelBase, IAsyncDisposable
     private static Task<ITerminalTransport> StartAdbProcess(string deviceId, int columns, int rows)
     {
         return AdbTerminalTransport.ConnectAsync(
-            Data.RuntimeSettings.AdbServerEndPoint,
+            App.RuntimeSettings.AdbServerEndPoint,
             deviceId,
             columns,
             rows);
@@ -625,6 +625,19 @@ public sealed class AdbTerminalSession : ViewModelBase, IAsyncDisposable
             return;
         }
 
-        _ = dispatcher.BeginInvoke(action, DispatcherPriority.DataBind);
+        if (Application.Current is App app)
+            _ = ApplyUiAsync(app, action);
+    }
+
+    private static async Task ApplyUiAsync(App app, Action action)
+    {
+        try
+        {
+            await app.EnqueueUiAsync("terminal.session-state", action).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "terminal.session-state");
+        }
     }
 }

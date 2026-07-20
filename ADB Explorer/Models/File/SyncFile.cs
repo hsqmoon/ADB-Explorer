@@ -24,7 +24,7 @@ public class SyncFile : FilePath
     {
         get
         {
-            if (!Data.Settings.KeepDateModified)
+            if (!App.Settings.KeepDateModified)
                 return null;
 
             return UnixTime.FromUnixTime();
@@ -128,7 +128,7 @@ public class SyncFile : FilePath
     public void AddUpdates(params FileOpProgressInfo[] newUpdates)
         => AddUpdates(newUpdates.Where(o => o is not null));
 
-    public void AddUpdates(IEnumerable<FileOpProgressInfo> newUpdates, FileOperation fileOp = null, bool executeInDispatcher = true)
+    public void AddUpdates(IEnumerable<FileOpProgressInfo> newUpdates, FileOperation fileOp = null)
     {
         if (!newUpdates.Any())
             return;
@@ -172,10 +172,7 @@ public class SyncFile : FilePath
                     PathType = PathType
                 };
 
-                ExecuteInDispatcher(() =>
-                {
-                    Children.Add(file);
-                }, executeInDispatcher);
+                Children.Add(file);
                 childrenByPath[group.Key] = file;
             }
 
@@ -223,14 +220,6 @@ public class SyncFile : FilePath
         OnPropertyChanged(nameof(CurrentPercentage));
         OnPropertyChanged(nameof(BytesTransferred));
 
-        var shellItem = ShellItem;
-        ShellItem = null;
-        try
-        {
-            shellItem?.Dispose();
-        }
-        catch
-        { }
     }
 }
 

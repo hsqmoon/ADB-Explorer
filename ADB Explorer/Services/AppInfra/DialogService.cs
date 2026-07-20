@@ -27,24 +27,91 @@ public static class DialogService
     };
 
     private static readonly ContentDialog windowDialog = new();
+    private static readonly SemaphoreSlim messageGate = new(1, 1);
 
     public static void ShowMessage(string content, string title = "", DialogIcon icon = DialogIcon.None, bool censorContent = true, bool hidePanes = true, bool copyToClipboard = false)
     {
         if (censorContent)
-        {
             content = content.Replace(AdbExplorerConst.RECYCLE_PATH, Strings.Resources.S_DRIVE_TRASH);
+
+        string message = content;
+        if (Application.Current is App app && app.MainWindow is MainWindow)
+        {
+            _ = ShowMessageAsync(app, message, title, icon, hidePanes, copyToClipboard);
+            return;
         }
 
         if (copyToClipboard)
-            Data.FileActions.MessageToCopy = content;
+            App.FileActions.MessageToCopy = message;
+        ShowDialog(message, title, icon, hidePanes);
+    }
 
-        ShowDialog(content, title, icon, hidePanes);
+    private static async Task ShowMessageAsync(
+        App app,
+        string message,
+        string title,
+        DialogIcon icon,
+        bool hidePanes,
+        bool copyToClipboard)
+    {
+        await messageGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (copyToClipboard)
+            {
+                await app.EnqueueUiAsync(
+                    "dialog.message.copy-state",
+                    () => App.FileActions.MessageToCopy = message).ConfigureAwait(false);
+            }
+
+            await app.EnqueueUiAsync(
+                "dialog.message.title",
+                () => ConfigureDialogTitle(title)).ConfigureAwait(false);
+            await app.EnqueueUiAsync(
+                "dialog.message.content",
+                () => ConfigureDialogContent(message)).ConfigureAwait(false);
+            await app.EnqueueUiAsync(
+                "dialog.message.buttons",
+                () => ConfigureDialogButtons(icon, Strings.Resources.S_BUTTON_OK)).ConfigureAwait(false);
+            if (hidePanes)
+            {
+                await app.EnqueueUiAsync(
+                    "dialog.message.hide-panes",
+                    HidePanes).ConfigureAwait(false);
+            }
+
+            Task<ContentDialogResult> dialogTask = null;
+            await app.EnqueueUiAsync(
+                "dialog.message.show",
+                () => dialogTask = windowDialog.ShowAsync()).ConfigureAwait(false);
+            if (dialogTask is not null)
+                await dialogTask.ConfigureAwait(false);
+
+            if (copyToClipboard)
+            {
+                await app.EnqueueUiAsync(
+                    "dialog.message.copy-clear",
+                    () =>
+                    {
+                        if (App.FileActions.MessageToCopy == message)
+                            App.FileActions.MessageToCopy = "";
+                    }).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "dialog.message");
+        }
+        finally
+        {
+            messageGate.Release();
+        }
     }
 
     private static void HidePanes()
     {
-        Data.RuntimeSettings.IsSettingsPaneOpen = 
-        Data.RuntimeSettings.IsDevicesPaneOpen = false;
+        App.RuntimeSettings.IsSettingsPaneOpen = false;
+        App.RuntimeSettings.IsDevicesPaneOpen = false;
     }
 
     public static ContentDialog ShowDialog(object content, string title, DialogIcon icon = DialogIcon.None, bool hidePanes = true, string buttonText = null)
@@ -52,21 +119,32 @@ public static class DialogService
         if (buttonText is null)
             buttonText = Strings.Resources.S_BUTTON_OK;
 
-        windowDialog.FlowDirection = Data.RuntimeSettings.IsRTL
-            ? FlowDirection.RightToLeft
-            : FlowDirection.LeftToRight;
-
-        windowDialog.Content = content;
-        windowDialog.Title = title;
-        windowDialog.PrimaryButtonText = null;
-        windowDialog.CloseButtonText = buttonText;
-        DialogHelper.SetDialogIcon(windowDialog, Icon(icon));
+        ConfigureDialogTitle(title);
+        ConfigureDialogContent(content);
+        ConfigureDialogButtons(icon, buttonText);
 
         if (hidePanes)
             HidePanes();
 
         windowDialog.ShowAsync();
         return windowDialog;
+    }
+
+    private static void ConfigureDialogTitle(string title)
+    {
+        windowDialog.FlowDirection = App.RuntimeSettings.IsRTL
+            ? FlowDirection.RightToLeft
+            : FlowDirection.LeftToRight;
+        windowDialog.Title = title;
+    }
+
+    private static void ConfigureDialogContent(object content) => windowDialog.Content = content;
+
+    private static void ConfigureDialogButtons(DialogIcon icon, string buttonText)
+    {
+        windowDialog.PrimaryButtonText = null;
+        windowDialog.CloseButtonText = buttonText;
+        DialogHelper.SetDialogIcon(windowDialog, Icon(icon));
     }
 
     private static TextBlock DialogContentTextBlock;

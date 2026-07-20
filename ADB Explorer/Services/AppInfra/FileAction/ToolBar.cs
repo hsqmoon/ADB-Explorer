@@ -44,7 +44,7 @@ internal static class MainToolBar
     public static ObservableList<IMenuItem> List { get; } = [
         new AnimatedNotifyMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.OpenDevices),
-            Data.DevicesObject.ObservableCount,
+            App.ActiveDevices.ObservableCount,
             "\uE8CC"),
         new MenuSeparator(),
         new CompoundIconMenu(
@@ -56,10 +56,10 @@ internal static class MainToolBar
             [
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.PushFolders), AppActions.Icons[FileAction.FileActionType.PushFolders]),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.PushFiles), AppActions.Icons[FileAction.FileActionType.NewFile]),
-                new SubMenuSeparator(Data.FileActions.IsApkActionsVisible),
+                new SubMenuSeparator(App.FileActions.IsApkActionsVisible),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.PushPackages),
                     AppActions.Icons[FileAction.FileActionType.Package],
-                    isVisible: Data.FileActions.IsApkActionsVisible),
+                    isVisible: App.FileActions.IsApkActionsVisible),
             ]),
         new MenuSeparator(),
         new AltTextMenu(
@@ -72,24 +72,24 @@ internal static class MainToolBar
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.NewFolder), "\uE8F4"),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.NewFile), AppActions.Icons[FileAction.FileActionType.NewFile]),
             ],
-            isVisible: Data.FileActions.IsNewMenuVisible),
+            isVisible: App.FileActions.IsNewMenuVisible),
         new IconMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Cut),
             AppActions.Icons[FileAction.FileActionType.Cut],
             StyleHelper.ContentAnimation.UpMarquee,
             18,
-            Data.FileActions.IsCutState,
+            App.FileActions.IsCutState,
             altAction: AppActions.List.Find(a => a.Name is FileAction.FileActionType.KeyboardCut)),
         new IconMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Copy),
             AppActions.Icons[FileAction.FileActionType.Copy],
             StyleHelper.ContentAnimation.Bounce,
             18,
-            Data.FileActions.IsCopyState,
+            App.FileActions.IsCopyState,
             altAction: AppActions.List.Find(a => a.Name is FileAction.FileActionType.KeyboardCopy)),
         new DynamicAltTextMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Paste),
-            Data.FileActions.CutItemsCount,
+            App.FileActions.CutItemsCount,
             AppActions.Icons[FileAction.FileActionType.Paste],
             StyleHelper.ContentAnimation.Bounce,
             iconSize: 18,
@@ -99,12 +99,12 @@ internal static class MainToolBar
             AppActions.Icons[FileAction.FileActionType.Rename],
             StyleHelper.ContentAnimation.Bounce,
             18,
-            isVisible: Data.FileActions.IsNewMenuVisible),
+            isVisible: App.FileActions.IsNewMenuVisible),
         new IconMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Restore),
             AppActions.Icons[FileAction.FileActionType.Restore],
             iconSize: 18,
-            isVisible: Data.FileActions.IsRestoreMenuVisible),
+            isVisible: App.FileActions.IsRestoreMenuVisible),
         new IconMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Delete),
             AppActions.Icons[FileAction.FileActionType.Delete],
@@ -114,13 +114,13 @@ internal static class MainToolBar
             AppActions.Icons[FileAction.FileActionType.FollowLink],
             StyleHelper.ContentAnimation.RightMarquee,
             18,
-            isVisible: Data.FileActions.IsUninstallVisible),
+            isVisible: App.FileActions.IsUninstallVisible),
         new IconMenu(
             AppActions.List.Find(a => a.Name is FileAction.FileActionType.Uninstall),
             AppActions.Icons[FileAction.FileActionType.Uninstall],
             StyleHelper.ContentAnimation.DownMarquee,
             18,
-            isVisible: Data.FileActions.IsUninstallVisible),
+            isVisible: App.FileActions.IsUninstallVisible),
         new IconMenu(description: Strings.Resources.S_MENU_MORE,
             icon: AppActions.Icons[FileAction.FileActionType.More],
             iconSize: 20,
@@ -129,17 +129,17 @@ internal static class MainToolBar
                 new CompoundIconSubMenu(AppActions.List.Find(a => a.Name is FileAction.FileActionType.CopyItemPath), new Controls.PathIcon()),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.SearchApkOnWeb),
                     AppActions.Icons[FileAction.FileActionType.SearchApkOnWeb],
-                    isVisible: Data.FileActions.IsApkActionsVisible),
+                    isVisible: App.FileActions.IsApkActionsVisible),
                 new SubMenuSeparator(),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.FollowLink), AppActions.Icons[FileAction.FileActionType.FollowLink]),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.PasteLink), AppActions.Icons[FileAction.FileActionType.PasteLink]),
                 new SubMenuSeparator(),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.UpdateModified), AppActions.Icons[FileAction.FileActionType.UpdateModified]),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.Edit), AppActions.Icons[FileAction.FileActionType.Edit]),
-                new SubMenuSeparator(Data.FileActions.IsApkActionsVisible),
+                new SubMenuSeparator(App.FileActions.IsApkActionsVisible),
                 new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.Package),
                     AppActions.Icons[FileAction.FileActionType.Package],
-                    isVisible: Data.FileActions.IsApkActionsVisible,
+                    isVisible: App.FileActions.IsApkActionsVisible,
                     children:
                     [
                         new (AppActions.List.Find(a => a.Name is FileAction.FileActionType.Install), AppActions.Icons[FileAction.FileActionType.Install]),
@@ -153,6 +153,8 @@ internal static class MainToolBar
 
 internal static class ExplorerContextMenu
 {
+    public static ObservableList<SubMenu> VisibleList { get; } = [];
+
     public static void UpdateSeparators()
     {
         var list = List.ToArray();
@@ -177,8 +179,8 @@ internal static class ExplorerContextMenu
 
         if (App.Current.Dispatcher.CheckAccess())
             updateSeparators();
-        else
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(updateSeparators));
+        else if (Application.Current is App app)
+            app.EnqueueUiLatest("toolbar.separators", "toolbar.separators", updateSeparators);
     }
 
     public static ObservableList<SubMenu> List { get; } = [
@@ -356,7 +358,7 @@ internal static class PeekDetailed
 {
     public static BaseAction Action { get; } = new(
             () => true,
-            () => Data.RuntimeSettings.IsDetailedPeekMode = true);
+            () => App.RuntimeSettings.IsDetailedPeekMode = true);
 }
 
 internal static class DialogExtraButtons

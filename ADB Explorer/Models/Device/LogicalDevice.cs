@@ -91,14 +91,11 @@ public class LogicalDevice : Device
         };
     }
 
-    public void EnableRoot(bool enable)
+    public RootStatus ChangeRoot(bool enable, CancellationToken cancellationToken = default)
     {
-        Root = enable
-            ? ADBService.Root(this) ? RootStatus.Enabled : RootStatus.Forbidden
-            : ADBService.Unroot(this) ? RootStatus.Disabled : RootStatus.Unchecked;
-
-        if (Data.CurrentADBDevice.ID == ID)
-            Data.RuntimeSettings.IsRootActive = Root is RootStatus.Enabled;
+        return enable
+            ? ADBService.Root(this, cancellationToken) ? RootStatus.Enabled : RootStatus.Forbidden
+            : ADBService.Unroot(this, cancellationToken) ? RootStatus.Disabled : RootStatus.Unchecked;
     }
 
     public void RefreshConnection(LogicalDevice other)
@@ -110,16 +107,14 @@ public class LogicalDevice : Device
             ? other.IpAddress
             : IpAddress;
 
-        Name = other.Name;
+        if (!string.IsNullOrWhiteSpace(other.Name))
+            Name = other.Name;
         Type = other.Type;
         IpAddress = nextIpAddress;
         DeviceData = other.DeviceData;
     }
 
-    public void UpdateBattery()
-    {
-        Battery.Update(ADBService.AdbDevice.GetBatteryInfo(this));
-    }
+    public void ApplyBatteryInfo(Dictionary<string, string> batteryInfo) => Battery.Update(batteryInfo);
 
     #region Drive handling
 
@@ -137,67 +132,11 @@ public class LogicalDevice : Device
     }
 
     /// <summary>
-    /// Update <see cref="Device"/> with new drives
-    /// </summary>
-    /// <param name="drives">The new drives to be assigned</param>
-    /// <param name="asyncClassify"><see langword="true"/> to update only after fully acquiring all information</param>
-    public async Task<bool> UpdateDrives(IEnumerable<Drive> drives, Dispatcher dispatcher, bool asyncClassify = false)
-    {
-        bool collectionChanged;
-
-        // MMC and OTG drives are searched for and only then UI is updated with all changes
-        if (asyncClassify)
-        {
-            collectionChanged = await UpdateExtensionDrivesAsync(drives, dispatcher);
-        }
-        // All drives are first updated in UI, and only then MMC and OTG drives are searched for
-        else
-        {
-            collectionChanged = SetDrives(drives);
-            UpdateExtensionDrives(drives, dispatcher);
-        }
-
-        return collectionChanged;
-    }
-
-    private void UpdateExtensionDrives(IEnumerable<Drive> drives, Dispatcher dispatcher)
-    {
-        var mmcTask = Task.Run(() => DeviceHelper.GetMmcDrive(drives.OfType<LogicalDrive>(), ID));
-        mmcTask.ContinueWith((t) =>
-        {
-            if (t.IsCanceled || t.IsFaulted)
-                return;
-
-            _ = dispatcher.BeginInvoke(new Action(() =>
-            {
-                SetMmcDrive(t.Result);
-                SetExternalDrives();
-            }));
-        });
-    }
-
-    private async Task<bool> UpdateExtensionDrivesAsync(IEnumerable<Drive> drives, Dispatcher dispatcher)
-    {
-        await Task.Run(() =>
-        {
-            if (DeviceHelper.GetMmcDrive(drives.OfType<LogicalDrive>(), ID) is LogicalDrive mmc)
-                mmc.Type = AbstractDrive.DriveType.Expansion;
-
-            DeviceHelper.SetExternalDrives(drives.OfType<LogicalDrive>());
-        });
-
-        var result = false;
-        await dispatcher.BeginInvoke(() => result = SetDrives(drives));
-
-        return result;
-    }
-
-    /// <summary>
     /// Update drive parameters, add new drives, remove non-existent drives
     /// </summary>
     /// <param name="drives"></param>
     /// <returns><see langword="true"/> if drives have been added or removed</returns>
-    private bool SetDrives(IEnumerable<Drive> drives)
+    public bool UpdateDrives(IEnumerable<Drive> drives)
     {
         if (drives is null)
             return false;
@@ -249,31 +188,8 @@ public class LogicalDevice : Device
             .ToList();
         var removed = removedDrives.Count > 0;
         Drives.RemoveAll(removedDrives);
-        removedDrives.ForEach(drive => drive.DetachRuntimeSettings());
 
         return added || removed;
-    }
-
-    public void SetMmcDrive(LogicalDrive mmcDrive)
-    {
-        if (mmcDrive is null)
-            return;
-
-        ((LogicalDriveViewModel)Drives.FirstOrDefault(d => d.Path == mmcDrive.Path))?.SetExtension();
-    }
-
-    /// <summary>
-    /// Sets type of all <see cref="DriveViewModel"/> with unknown type as external. Changes the local property.
-    /// </summary>
-    public void SetExternalDrives()
-    {
-        if (drives is null)
-            return;
-
-        foreach (var item in Drives.Where(d => d.Type == AbstractDrive.DriveType.Unknown))
-        {
-            ((LogicalDriveViewModel)item).SetExtension(false);
-        }
     }
 
     #endregion

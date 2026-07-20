@@ -25,7 +25,6 @@ public class FileToIconConverter
     private const int UNKNOWN_ICON_INDEX = 175;
     private const int BROKEN_LINK_ICON_INDEX = 271;
 
-    private static readonly Dictionary<string, object> iconDic = [];
     private static readonly SysImageList _imgList = new(SysImageListSize.SHIL_JUMBO);
 
     // <summary>
@@ -113,27 +112,6 @@ public class FileToIconConverter
         }
     }
 
-    private static string ReturnKey(string fileName, IconSize size, AbstractFile.SpecialFileType specialType, bool bitmapSource = true)
-    {
-        string key;
-
-        if (specialType.HasFlag(AbstractFile.SpecialFileType.Regular))
-            key = Path.GetExtension(fileName).ToLower();
-        else
-            key = $"#{Enum.GetName(specialType).ToUpper()}#";
-
-        var sizeKey = size switch
-        {
-            IconSize.Jumbo or IconSize.Thumbnail => "J",
-            IconSize.ExtraLarge => "XL",
-            IconSize.Large => "L",
-            IconSize.Small => "S",
-            _ => "",
-        };
-
-        return $"{key}+{sizeKey}+{(bitmapSource ? "Src" : "Bmp")}";
-    }
-
     private static Bitmap LoadJumbo(int index, int desiredSize)
     {
         // Used to contain code to support OSs before Windows Vista
@@ -188,51 +166,19 @@ public class FileToIconConverter
         };
     }
 
-    private static T AddToDic<T>(string fileName, IconSize size, int desiredSize, AbstractFile.SpecialFileType specialType = AbstractFile.SpecialFileType.Regular)
+    private static BitmapSource CreateImage(
+        string fileName,
+        IconSize size,
+        int desiredSize,
+        AbstractFile.SpecialFileType specialType = AbstractFile.SpecialFileType.Regular) =>
+        GetImage(fileName, size, desiredSize, specialType);
+
+    private static BitmapSource CreateImage(Icon icon)
     {
-        var bitmapSource = typeof(T) == typeof(BitmapSource);
-        var key = ReturnKey(fileName, size, specialType, bitmapSource);
-
-        lock (iconDic)
-        {
-            if (!iconDic.TryGetValue(key, out object image))
-            {
-                image = bitmapSource
-                    ? GetImage(fileName, size, desiredSize, specialType)
-                    : GetBitmap(fileName, size, desiredSize, specialType);
-                iconDic.Add(key, image);
-            }
-
-            return (T)image;
-        }
-    }
-
-    private static T AddToDic<T>(Icon icon, IconSize size, AbstractFile.SpecialFileType specialType)
-    {
-        var bitmapSource = typeof(T) == typeof(BitmapSource);
-        var key = ReturnKey("", size, specialType, bitmapSource);
-
-        lock (iconDic)
-        {
-            if (!iconDic.TryGetValue(key, out object image))
-            {
-                if (bitmapSource)
-                {
-                    using var bitmap = icon.ToBitmap();
-                    var source = LoadBitmap(bitmap);
-                    source.Freeze();
-                    image = source;
-                }
-                else
-                {
-                    image = icon.ToBitmap();
-                }
-
-                iconDic.Add(key, image);
-            }
-
-            return (T)image;
-        }
+        using var bitmap = icon.ToBitmap();
+        var source = LoadBitmap(bitmap);
+        source.Freeze();
+        return source;
     }
 
     private static BitmapSource GetImage(string fileName, IconSize size, int desiredSize, AbstractFile.SpecialFileType specialType = AbstractFile.SpecialFileType.Regular)
@@ -245,9 +191,11 @@ public class FileToIconConverter
 
     private static Bitmap GetBitmap(string fileName, IconSize size, int desiredSize, AbstractFile.SpecialFileType specialType = AbstractFile.SpecialFileType.Regular)
     {
-        var lookup = !ReturnKey(fileName, size, specialType).StartsWith('.')
-            ? fileName
-            : $"aaa{Path.GetExtension(fileName).ToLower()}";
+        string extension = Path.GetExtension(fileName).ToLowerInvariant();
+        var lookup = specialType.HasFlag(AbstractFile.SpecialFileType.Regular)
+            && extension.StartsWith('.')
+                ? $"aaa{extension}"
+                : fileName;
 
         var specialIndex = SpecialTypeIndex(specialType);
 
@@ -302,13 +250,12 @@ public class FileToIconConverter
             _ => IconSize.Jumbo,
         };
 
-        return AddToDic<BitmapSource>(fileName, size, iconSize, specialType);
+        return CreateImage(fileName, size, iconSize, specialType);
     }
 
-    public static IEnumerable<BitmapSource> GetImage(FilePath file, bool smallIcon = true)
+    public static IEnumerable<BitmapSource> GetImage(string fileName, AbstractFile.SpecialFileType specialType, bool smallIcon = true)
     {
         var size = smallIcon ? IconSize.Small : IconSize.Jumbo;
-        var specialType = file.SpecialType;
 
         if (specialType is 0)
             yield break;
@@ -317,60 +264,19 @@ public class FileToIconConverter
         {
             using Icon apkIcon = new(Properties.AppGlobal.APK_icon, IconToSize(size));
 
-            yield return AddToDic<BitmapSource>(apkIcon, size, AbstractFile.SpecialFileType.Apk);
+            yield return CreateImage(apkIcon);
         }
         else
         {
             // Get icon without link overlay
-            yield return AddToDic<BitmapSource>(file.FullName, size, smallIcon ? 16 : 96, specialType & ~AbstractFile.SpecialFileType.LinkOverlay);
+            yield return CreateImage(fileName, size, smallIcon ? 16 : 96, specialType & ~AbstractFile.SpecialFileType.LinkOverlay);
         }
 
         if (specialType.HasFlag(AbstractFile.SpecialFileType.LinkOverlay))
         {
             // Get link overlay if required
-            yield return AddToDic<BitmapSource>(file.FullName, size, smallIcon ? 16 : 96, AbstractFile.SpecialFileType.LinkOverlay);
+            yield return CreateImage(fileName, size, smallIcon ? 16 : 96, AbstractFile.SpecialFileType.LinkOverlay);
         }
     }
 
-    private static T GetImage<T>(FilePath file)
-    {
-        var specialType = file.SpecialType;
-        if (specialType.HasFlag(AbstractFile.SpecialFileType.Apk))
-        {
-            using Icon apkIcon = new(Properties.AppGlobal.APK_icon, IconToSize(IconSize.Jumbo));
-
-            return AddToDic<T>(apkIcon, IconSize.Jumbo, AbstractFile.SpecialFileType.Apk);
-        }
-        else
-        {
-            // Get icon without link overlay
-            return AddToDic<T>(file.FullName, IconSize.Jumbo, 96, specialType & ~AbstractFile.SpecialFileType.LinkOverlay);
-        }
-    }
-
-    public static Bitmap GetBitmap(FilePath file)
-        => GetImage<Bitmap>(file);
-
-    public static BitmapSource GetBitmapSource(FilePath file, int iconSize)
-    {
-        var specialType = file.SpecialType;
-        IconSize size = iconSize switch
-        {
-            <= 16 => IconSize.Small,
-            <= 32 => IconSize.Large,
-            <= 48 => IconSize.ExtraLarge,
-            _ => IconSize.Jumbo,
-        };
-
-        if (specialType.HasFlag(AbstractFile.SpecialFileType.Apk))
-        {
-            using Icon apkIcon = new(Properties.AppGlobal.APK_icon, IconToSize(size));
-            return AddToDic<BitmapSource>(apkIcon, size, AbstractFile.SpecialFileType.Apk);
-        }
-
-        return AddToDic<BitmapSource>(file.FullName, size, iconSize, specialType & ~AbstractFile.SpecialFileType.LinkOverlay);
-    }
-
-    public static BitmapSource GetBitmapSource(FilePath file)
-        => GetImage<BitmapSource>(file);
 }

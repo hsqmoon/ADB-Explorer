@@ -30,11 +30,23 @@ public class CommandHandler : ICommand
         _canExecute = canExecute;
     }
 
+    private event EventHandler canExecuteChanged;
+
     public event EventHandler CanExecuteChanged
     {
-        add => CommandManager.RequerySuggested += value;
-        remove => CommandManager.RequerySuggested -= value;
+        add
+        {
+            canExecuteChanged += value;
+            CommandManager.RequerySuggested += value;
+        }
+        remove
+        {
+            canExecuteChanged -= value;
+            CommandManager.RequerySuggested -= value;
+        }
     }
+
+    public void RaiseCanExecuteChanged() => canExecuteChanged?.Invoke(this, EventArgs.Empty);
 
 }
 
@@ -61,4 +73,6 @@ public class BaseAction : ViewModelBase
     }
 
     public void Execute() => Command.Execute(null);
+
+    public void RaiseCanExecuteChanged() => (command as CommandHandler)?.RaiseCanExecuteChanged();
 }

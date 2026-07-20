@@ -12,7 +12,7 @@ using System.Xml;
 using static ADB_Explorer.Helpers.VisibilityHelper;
 using static ADB_Explorer.Models.AbstractFile;
 using static ADB_Explorer.Models.AdbExplorerConst;
-using static ADB_Explorer.Models.Data;
+using static ADB_Explorer.App;
 using static ADB_Explorer.Services.FileAction;
 
 namespace ADB_Explorer;
@@ -24,19 +24,25 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private const int MAX_LOG_TEXT_LENGTH = 200_000;
 
-    private readonly DispatcherTimer ServerWatchdogTimer = new() { Interval = RESPONSE_TIMER_INTERVAL };
-    private readonly DispatcherTimer ConnectTimer = new() { Interval = CONNECT_TIMER_INIT };
     private readonly DispatcherTimer SelectionTimer = new() { Interval = SELECTION_CHANGED_DELAY };
-    private readonly DispatcherTimer DiskUsageTimer = new() { Interval = DISK_USAGE_INTERVAL_IDLE };
-
-    private readonly SemaphoreSlim DiskUsageMutex = new(1, 1);
-    private readonly SemaphoreSlim DeviceRefreshMutex = new(1, 1);
-    private readonly SemaphoreSlim ConnectTimerMutex = new(1, 1);
-    private readonly object DeviceListUpdateLock = new();
-    private IReadOnlyList<LogicalDevice> PendingDeviceList;
-    private bool DeviceListUpdateScheduled;
-    private int navigationRequestVersion;
+    private IUiWorkScheduler UiScheduler;
+    private int dragIconVersion;
     private readonly ThemeService ThemeService = new();
+    private DirectorySession CurrentDirectorySession => ((App)Application.Current).CurrentDirectorySession;
+    private FileOperationQueue FileOpQ => App.ActiveFileOperations;
+    private Devices DevicesObject => App.ActiveDevices;
+    private string CurrentPath => App.ExplorerState.CurrentPath;
+    private DriveViewModel CurrentDrive => App.ExplorerState.CurrentDrive;
+    private IEnumerable<FileClass> SelectedFiles
+    {
+        get => App.ExplorerState.SelectedFiles;
+        set => App.ExplorerState.SelectedFiles = value;
+    }
+    private IEnumerable<Package> SelectedPackages
+    {
+        get => App.ExplorerState.SelectedPackages;
+        set => App.ExplorerState.SelectedPackages = value;
+    }
 
     private static Point NullPoint => new(-1, -1);
     private bool HasSavedWindowBounds =>
@@ -54,31 +60,38 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public string SelectedFilesTotalSize => (SelectedFiles is not null && FileHelper.TotalSize(SelectedFiles) is long size and > 0) ? size.BytesToSize() : "";
     public string SelectedFilesCount => $"{ExplorerGrid.SelectedItems.Count}";
 
-    private string prevPath = "";
-
-    /// <summary>
-    /// Back / Forward Navigation
-    /// </summary>
-    private bool bfNavigation;
-
     private int ClickCount = 0;
     private bool WasSelected;
     private bool WasEditing;
     private bool WasDragging;
     private Point MouseDownPoint;
-    private FileToIconConverter FileToIcon;
     private DateTime appDataClick;
-    private readonly DragWindow dw = new();
+    private DragWindow dw;
     private readonly Queue<Log> pendingLogEntries = new();
     private readonly object pendingLogEntriesLock = new();
-    private bool isDeviceFilterRefreshScheduled;
-    private bool isExplorerContextMenuRefreshScheduled;
-    private bool isFileOpControlsRefreshScheduled;
-    private bool isLogRefreshScheduled;
-    private bool isMainToolBarRefreshScheduled;
-    private int fileOpViewRefreshScheduled;
     private bool rebuildLogRequested;
-    private bool isSettingsControlsRefreshScheduled;
+    private DeviceViewModel[] pendingVisibleDevices = [];
+    private long visibleDevicesVersion;
+    private long applyingVisibleDevicesVersion = -1;
+    private int visibleDeviceIndex;
+    private object[] pendingExplorerSelection = [];
+    private long explorerSelectionVersion;
+    private long applyingExplorerSelectionVersion = -1;
+    private int explorerSelectionIndex;
+    private bool selectExplorerItems;
+    private bool suppressExplorerSelectionChanged;
+    private int explorerSelectionResetVersion;
+    private SubMenu[] pendingExplorerContextItems = [];
+    private long explorerContextVersion;
+    private long applyingExplorerContextVersion = -1;
+    private int explorerContextIndex;
+    private CancellationTokenSource packageViewCancellation;
+    private Package[] pendingVisiblePackages = [];
+    private long packageViewVersion;
+    private long applyingPackageViewVersion = -1;
+    private int packageViewIndex;
+    private string packageSortProperty = nameof(Package.Type);
+    private ListSortDirection packageSortDirection = ListSortDirection.Descending;
 
     private bool IsInEditMode
     {
@@ -109,30 +122,30 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     protected void OnPropertyChanged(string propertyName) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
     public MainWindow()
+    { }
+
+    internal void InitializeView()
     {
+        var app = (App)Application.Current;
+        UiScheduler = app.AttachRuntime(this);
+        app.StartRuntime();
         InitializeComponent();
 
         KeyDown += new KeyEventHandler(OnButtonKeyDown);
         PreviewTextInput += new TextCompositionEventHandler(MainWindow_PreviewTextInput);
 
-        DevicesObject = new();
-        DevicesList.ItemsSource = DevicesObject.UIList;
+        DevicesList.ItemsSource = DevicesObject.VisibleDevices;
 
-        FileOpQ = new();
-        Task launchTask = Task.Run(LaunchSequence);
+        ApplyFileOperationFilters();
 
-        ConnectTimer.Tick += ConnectTimer_Tick;
-        ServerWatchdogTimer.Tick += ServerWatchdogTimer_Tick;
-        DiskUsageTimer.Tick += DiskUsageTimer_Tick;
         SelectionTimer.Tick += SelectionTimer_Tick;
 
         Settings.PropertyChanged += Settings_PropertyChanged;
-        RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
+        RuntimeSettings.UiChangeRequested += RuntimeSettings_UiChangeRequested;
         ThemeService.PropertyChanged += ThemeService_PropertyChanged;
         CommandLog.CollectionChanged += CommandLog_CollectionChanged;
         FileOpQ.PropertyChanged += FileOperationQueue_PropertyChanged;
         FileActions.PropertyChanged += FileActions_PropertyChanged;
-        DevicesObject.PropertyChanged += DevicesObject_PropertyChanged;
         DevicesObject.UIList.CollectionChanged += UIList_CollectionChanged;
         FileOpFilters.CheckedFilterCount.PropertyChanged += CheckedFilterCount_PropertyChanged;
 
@@ -143,54 +156,75 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         });
 
         UpperProgressBar.DataContext = FileOpQ;
-        CurrentOperationDetailedDataGrid.ItemsSource = FileOpQ.Operations;
-        ((DataGrid)FindResource("CurrentOperationDataGrid")).ItemsSource = FileOpQ.Operations;
+        CurrentOperationDetailedDataGrid.ItemsSource = FileOpQ.VisibleOperations;
+        ((DataGrid)FindResource("CurrentOperationDataGrid")).ItemsSource = FileOpQ.VisibleOperations;
         UpdateFileOp();
 
         NativeMethods.InterceptClipboard.Init(this, CopyPaste.GetClipboardPasteItems, IpcService.AcceptIpcMessage);
-        App.Current.MainWindow = this;
-        dw.Show();
 
 #if DEBUG
         DeviceHelper.TestDevices();
 #endif
-
-        Task.Run(() =>
-        {
-            SetTheme();
-            SettingsHelper.SplashScreenTask();
-
-            launchTask.Wait();
-            RuntimeSettings.IsWindowLoaded = true;
-        });
     }
 
-    private void FinalizeSplash()
+    internal void InitializeTheme() => SetTheme();
+
+    internal void InitializeFont() => SettingsHelper.SetSymbolFont();
+
+    internal void InitializeRenderMode() => SetRenderMode();
+
+    internal Task StartThemeWatcherAsync(CancellationToken cancellationToken) =>
+        ThemeService.StartWatchingAsync(cancellationToken);
+
+    internal void InitializeSettingsSources()
     {
-        RuntimeSettings.IsSplashScreenVisible = false;
+        AdbHelper.InitializeMdns();
+        SettingsList.ItemsSource = UISettings.GroupedSettings;
+        SortedSettings.ItemsSource = UISettings.SortSettings;
+        NotificationsList.ItemsSource = UISettings.Notifications;
+    }
+
+    internal void InitializeToolbars()
+    {
+        NavigationToolBar.ItemsSource = Services.NavigationToolBar.List;
+        MainToolBar.ItemsSource = Services.MainToolBar.List;
+    }
+
+    internal void InitializeSettingsState()
+    {
+        FileActionLogic.UpdateFileActions();
+        ScheduleFilterDevices();
+
+        FileActions.IsLogToggleVisible.Value = Settings.EnableLog;
+        Settings.UnrootOnDisconnect ??= false;
+    }
+
+    internal void InitializeFileOperationModel() => FileOpColumns.Init();
+
+    internal void InitializeFileOperationColumns() =>
+        FileOpColumns.List.ForEach(c => CurrentOperationDetailedDataGrid.Columns.Add(c.Column));
+
+    internal void InitializeFileOperationFilter() => UpdateFileOpFilterCheck();
+
+    internal void ActivateRuntime()
+    {
         RuntimeSettings.IsDevicesPaneOpen = true;
+        RuntimeSettings.IsWindowLoaded = true;
 
-        ConnectTimer.Start();
-        ServerWatchdogTimer.Start();
-        DiskUsageTimer.Start();
-
-        SettingsHelper.InitNotifications();
-        NativeMethods.InterceptClipboard.ScheduleClipboardRefresh();
-        ScheduleMainToolBarRefresh();
+        SearchBoxMaxWidth();
+        AppActions.RaiseCanExecuteChanged();
     }
 
-    private void DiskUsageTimer_Tick(object sender, EventArgs e)
+    internal void ShowAuxiliaryWindows()
     {
-        if (FileOpQ.HasRunningSyncOperations)
-            return;
+        dw = new();
+        dw.Show();
+    }
 
-        if (!DiskUsageMutex.Wait(0))
-            return;
-
-        Task.Run(DiskUsageHelper.GetAdbDiskUsage).ContinueWith(t =>
-        {
-            DiskUsageMutex.Release();
-        });
+    internal void SetAdbRuntimeAvailable(bool adbReady)
+    {
+        if (adbReady)
+            DeviceHelper.UpdateWsaPkgStatus();
     }
 
     private void MainWindow_PreviewTextInput(object sender, TextCompositionEventArgs e)
@@ -216,7 +250,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 if (selected != 1 || selectedIndex < i)
                 {
-                    FileActions.ItemToSelect = item;
+                    SelectExplorerItem(item);
                     break;
                 }
                 else 
@@ -225,14 +259,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         if (selectedIndex == ExplorerGrid.SelectedIndex && altItem is not null)
-            FileActions.ItemToSelect = altItem;
+            SelectExplorerItem(altItem);
     }
 
     private void CheckedFilterCount_PropertyChanged(object sender, PropertyChangedEventArgs<int> e)
     {
         UpdateFileOpFilterCheck();
 
-        SortFileOps();
+        ApplyFileOperationFilters();
     }
 
     private static void UpdateFileOpFilterCheck()
@@ -246,18 +280,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ScheduleFilterDevices();
     }
 
-    private void DevicesObject_PropertyChanged(object sender, PropertyChangedEventArgs e)
+    internal void RefreshServerHealth()
     {
-        if (e.PropertyName == nameof(DevicesObject.UIList))
-            ScheduleFilterDevices();
-    }
+        RuntimeSettings.RefreshServerResponseStatus();
 
-    private void ServerWatchdogTimer_Tick(object sender, EventArgs e)
-    {
-        RuntimeSettings.LastServerResponse = RuntimeSettings.LastServerResponse;
-
-        if (Settings.PollDevices
-            && MdnsService?.State is MDNS.MdnsState.Running
+        if (MdnsService?.State is MDNS.MdnsState.Running
             && DateTime.Now.Subtract(RuntimeSettings.LastServerResponse) > MDNS_FORCE_CONNECT_TIME)
         {
             MdnsService.State = MDNS.MdnsState.Disabled;
@@ -265,16 +292,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
+    private void RuntimeSettings_UiChangeRequested(RuntimeUiChange change)
     {
         if (Dispatcher.HasShutdownStarted)
             return;
 
         void HandlePropertyChange()
         {
-            switch (e.PropertyName)
+            switch (change)
             {
-                case nameof(AppRuntimeSettings.IsMdnsExpanderOpen):
+                case RuntimeUiChange.MdnsExpander:
                     if (MdnsService?.State is not MDNS.MdnsState.Disabled)
                     {
                         DeviceHelper.CollapseDevices();
@@ -284,278 +311,139 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     }
                     break;
 
-                case nameof(AppRuntimeSettings.SearchText):
+                case RuntimeUiChange.SearchText:
                     FilterSettings();
                     break;
 
-                case nameof(AppRuntimeSettings.BrowseDrive) when RuntimeSettings.BrowseDrive:
-                    InitNavigation(RuntimeSettings.BrowseDrive.Path);
-                    break;
-
-                case nameof(AppRuntimeSettings.PathBoxNavigation):
-                    if (RuntimeSettings.PathBoxNavigation == "-")
-                    {
-                        bfNavigation = true;
-                        NavigateToLocation(NavHistory.GoBack());
-                    }
-                    else
-                    {
-                        if (FileActions.IsExplorerVisible)
-                            NavigateToLocation(new(RuntimeSettings.PathBoxNavigation));
-                        else
-                        {
-                            InitNavigation(RuntimeSettings.PathBoxNavigation);
-                        }
-                    }
-                    break;
-
-                case nameof(AppRuntimeSettings.LocationToNavigate):
-                    if (RuntimeSettings.LocationToNavigate is null)
-                        return;
-
-                    switch (RuntimeSettings.LocationToNavigate.Location)
-                    {
-                        case Navigation.SpecialLocation.Back:
-                            bfNavigation = true;
-                            NavigateToLocation(NavHistory.GoBack());
-                            break;
-                        case Navigation.SpecialLocation.Forward:
-                            bfNavigation = true;
-                            NavigateToLocation(NavHistory.GoForward());
-                            break;
-                        case Navigation.SpecialLocation.Up:
-                            bfNavigation = false;
-                            NavigateToPath(ParentPath);
-                            break;
-                        default:
-                            bfNavigation = false;
-                            if (FileActions.IsDriveViewVisible && RuntimeSettings.LocationToNavigate.Location is Navigation.SpecialLocation.DriveView)
-                                _ = FileActionLogic.RefreshDrives(true);
-                            else
-                                NavigateToLocation(RuntimeSettings.LocationToNavigate);
-                            break;
-                    }
-                    break;
-
-                case nameof(AppRuntimeSettings.NewFolder):
-                    NewItem(true);
-                    break;
-
-                case nameof(AppRuntimeSettings.NewFile):
-                    NewItem(false);
-                    break;
-
-                case nameof(AppRuntimeSettings.Rename):
-                    IsInEditMode ^= true;
-                    break;
-
-                case nameof(AppRuntimeSettings.SelectAll):
-                    if (ExplorerGrid.Items.Count == ExplorerGrid.SelectedItems.Count)
-                        ExplorerGrid.UnselectAll();
-                    else
-                        ExplorerGrid.SelectAll();
-                    break;
-
-                case nameof(AppRuntimeSettings.Refresh):
-                    RefreshLocation();
-                    break;
-
-                case nameof(AppRuntimeSettings.IsPathBoxFocused):
+                case RuntimeUiChange.PathBoxFocus:
                     IsPathBoxFocused(RuntimeSettings.IsPathBoxFocused
                                      ?? NavigationBox.Mode
                                      is NavigationBox.ViewMode.Breadcrumbs);
-
-                    RuntimeSettings.AutoHideSearchBox = true;
                     break;
 
-                case nameof(AppRuntimeSettings.IsSearchBoxFocused):
-                    if (!RuntimeSettings.IsSearchBoxFocused)
+                case RuntimeUiChange.SearchBoxFocus:
+                    if (!RuntimeSettings.IsSearchBoxFocused && SearchBox.IsKeyboardFocusWithin)
                         SettingsSplitView.Focus();
                     break;
 
-                case nameof(AppRuntimeSettings.IsTerminalOpen):
+                case RuntimeUiChange.TerminalVisibility:
                     if (RuntimeSettings.IsTerminalOpen)
                         _ = TerminalControl.OpenAsync(CurrentTerminalDeviceId);
                     else
                         _ = TerminalControl.CloseAsync();
                     break;
 
-                case nameof(AppRuntimeSettings.CurrentDevice):
+                case RuntimeUiChange.CurrentDevice:
                     if (RuntimeSettings.IsTerminalOpen)
                         _ = TerminalControl.SetDeviceAsync(CurrentTerminalDeviceId);
                     break;
 
-                case nameof(AppRuntimeSettings.AutoHideSearchBox):
-                    if (Width < MAX_WINDOW_WIDTH_FOR_SEARCH_AUTO_COLLAPSE)
-                        RuntimeSettings.IsSearchBoxFocused = false;
-
-                    if (NavigationBox.Mode is not NavigationBox.ViewMode.Path)
-                        SettingsSplitView.Focus();
-                    break;
-
-                case nameof(AppRuntimeSettings.ExplorerSource):
-                    ExplorerGrid.ItemsSource = RuntimeSettings.ExplorerSource;
-                    FilterExplorerItems();
-                    break;
-
-                case nameof(AppRuntimeSettings.FilterDrives):
-                    FilterDrives();
-                    break;
-
-                case nameof(AppRuntimeSettings.FilterDevices):
-                    ScheduleFilterDevices();
-                    break;
-
-                case nameof(AppRuntimeSettings.FilterActions):
-                    if (FileActions.IsAppDrive || FileActions.IsRecycleBin || DevicesObject.Current is null)
-                        FilterFileActions();
-                    ScheduleExplorerContextMenuRefresh();
-                    break;
-
-                case nameof(AppRuntimeSettings.ClearNavBox):
-                    ClearNavBox();
-                    break;
-
-                case nameof(AppRuntimeSettings.InitLister):
-                    InitLister();
-                    break;
-
-                case nameof(AppRuntimeSettings.DriveViewNav):
-                    DriveViewNav();
-                    break;
-
-                case nameof(AppRuntimeSettings.GroupsExpanded):
+                case RuntimeUiChange.SettingsGroups:
                     SettingsAboutExpander.IsExpanded = RuntimeSettings.GroupsExpanded;
                     break;
 
-                case nameof(AppRuntimeSettings.RefreshFileOpControls):
-                    ScheduleFileOpControlsRefresh();
-                    break;
-
-                case nameof(AppRuntimeSettings.ClearLogs):
-                    ClearLogs();
-                    break;
-
-                case nameof(AppRuntimeSettings.RefreshSettingsControls):
-                    ScheduleSettingsControlsRefresh();
-                    break;
-
-                case nameof(AppRuntimeSettings.SortFileOps):
-                    SortFileOps();
-                    break;
-
-                case nameof(AppRuntimeSettings.RefreshExplorerSorting):
-                    FilterExplorerItems(true);
-                    break;
-
-                case nameof(AppRuntimeSettings.FinalizeSplash):
-                    FinalizeSplash();
-                    break;
-
-                case nameof(AppRuntimeSettings.MainCursor):
+                case RuntimeUiChange.Cursor:
                     Cursor = RuntimeSettings.MainCursor;
                     break;
 
-                case nameof(AppRuntimeSettings.RefreshBreadcrumbs):
-                    NavigationBox.Refresh();
+                case RuntimeUiChange.PaneVisibility:
+                    DeviceHelper.CollapseDevices();
+                    if (RuntimeSettings.IsDevicesPaneOpen)
+                        ScheduleFilterDevices();
                     break;
+
             }
         }
 
-        if (Dispatcher.CheckAccess())
-            HandlePropertyChange();
-        else
-            _ = Dispatcher.BeginInvoke((Action)HandlePropertyChange, DispatcherPriority.Background);
+        UiScheduler.EnqueueLatest(
+            $"runtime-change.{change}",
+            $"runtime-change.{change}",
+            HandlePropertyChange);
+    }
+
+    private void ApplyFileOperationFilters() => FileOpQ.SetVisibleFilters(
+        FileOpFilters.List
+            .Where(filter => filter.IsChecked is true)
+            .Select(filter => filter.Type));
+
+    internal void SetExplorerSource(System.Collections.IEnumerable source)
+    {
+        if (!ReferenceEquals(ExplorerGrid.ItemsSource, source))
+            ExplorerGrid.ItemsSource = source;
+
+        UiScheduler.EnqueueLatest(
+            "explorer.filter",
+            "explorer.filter",
+            FilterExplorerItems);
+        if (App.ExplorerState.Packages.Count == 0
+            && App.ExplorerState.VisiblePackages.Count > 0)
+        {
+            SchedulePackageViewRefresh();
+        }
+    }
+
+    internal void SelectExplorerItem(object item)
+    {
+        if (item is null)
+        {
+            ExplorerGrid.UnselectAll();
+            return;
+        }
+
+        ExplorerGrid.ScrollIntoView(item);
+        ExplorerGrid.SelectedItem = item;
+    }
+
+    internal void ExecuteUiCommand(UiCommand command)
+    {
+        switch (command)
+        {
+            case UiCommand.NewFolder:
+                NewItem(true);
+                break;
+            case UiCommand.NewFile:
+                NewItem(false);
+                break;
+            case UiCommand.Rename:
+                IsInEditMode ^= true;
+                break;
+            case UiCommand.SelectAll:
+                ScheduleToggleExplorerSelection();
+                break;
+            case UiCommand.FilterDrives:
+                FilterDrives();
+                break;
+            case UiCommand.FilterDevices:
+                ScheduleFilterDevices();
+                break;
+            case UiCommand.FilterActions:
+                ScheduleExplorerContextMenuRefresh();
+                break;
+            case UiCommand.ClearNavigation:
+                ClearNavBox();
+                break;
+            case UiCommand.AutoHideSearch:
+                if (Width < MAX_WINDOW_WIDTH_FOR_SEARCH_AUTO_COLLAPSE)
+                    RuntimeSettings.IsSearchBoxFocused = false;
+                if (NavigationBox.Mode is not NavigationBox.ViewMode.Path)
+                    SettingsSplitView.Focus();
+                break;
+            case UiCommand.ClearLogs:
+                ClearLogs();
+                break;
+            case UiCommand.SortFileOperations:
+                FileOpQ.RefreshView();
+                break;
+            case UiCommand.RefreshBreadcrumbs:
+                NavigationBox.Refresh();
+                break;
+        }
     }
 
     private void ClearNavBox()
     {
         NavigationBox.Path = null;
         NavigationBox.Mode = NavigationBox.ViewMode.None;
-    }
-
-    private void ScheduleFileOpControlsRefresh()
-    {
-        if (Dispatcher.HasShutdownStarted)
-            return;
-
-        if (!Dispatcher.CheckAccess())
-        {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleFileOpControlsRefresh), DispatcherPriority.Background);
-            return;
-        }
-
-        if (isFileOpControlsRefreshScheduled)
-            return;
-
-        isFileOpControlsRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            try
-            {
-                FileOpControlsMenu.Items.Refresh();
-            }
-            finally
-            {
-                isFileOpControlsRefreshScheduled = false;
-            }
-        }), DispatcherPriority.Background);
-    }
-
-    private void ScheduleSettingsControlsRefresh()
-    {
-        if (Dispatcher.HasShutdownStarted)
-            return;
-
-        if (!Dispatcher.CheckAccess())
-        {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleSettingsControlsRefresh), DispatcherPriority.Background);
-            return;
-        }
-
-        if (isSettingsControlsRefreshScheduled)
-            return;
-
-        isSettingsControlsRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            try
-            {
-                SettingsControlsMenu.Items.Refresh();
-            }
-            finally
-            {
-                isSettingsControlsRefreshScheduled = false;
-            }
-        }), DispatcherPriority.Background);
-    }
-
-    private void ScheduleMainToolBarRefresh()
-    {
-        if (Dispatcher.HasShutdownStarted || RuntimeSettings.IsSplashScreenVisible)
-            return;
-
-        if (!Dispatcher.CheckAccess())
-        {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleMainToolBarRefresh), DispatcherPriority.Background);
-            return;
-        }
-
-        if (isMainToolBarRefreshScheduled)
-            return;
-
-        isMainToolBarRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            try
-            {
-                MainToolBar.Items?.Refresh();
-            }
-            finally
-            {
-                isMainToolBarRefreshScheduled = false;
-            }
-        }), DispatcherPriority.ApplicationIdle);
     }
 
     private void SettingsSearchBox_FocusChanged(object sender, RoutedEventArgs e)
@@ -571,37 +459,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         switch (e.PropertyName)
         {
-            case nameof(FileActionsEnable.RefreshPackages) when FileActions.RefreshPackages:
-                if (FileActions.IsAppDrive)
-                {
-                    if (Dispatcher.CheckAccess())
-                        _navigateToPath(CurrentPath);
-                    else
-                        _ = Dispatcher.BeginInvoke(new Action(() => _navigateToPath(CurrentPath)));
-
-                    FileActions.RefreshPackages = false;
-                }
-
-                break;
-
             case nameof(FileActionsEnable.ExplorerFilter):
                 FilterExplorerItems();
 
                 break;
 
-            case nameof(FileActionsEnable.ItemToSelect):
-                if (FileActions.ItemToSelect is null)
-                    ExplorerGrid.UnselectAll();
-                else
-                {
-                    ExplorerGrid.ScrollIntoView(FileActions.ItemToSelect);
-                    ExplorerGrid.SelectedItem = FileActions.ItemToSelect;
-                }
-
-                break;
-
             case nameof(FileActionsEnable.PasteEnabled):
-                FilterFileActions();
                 ScheduleExplorerContextMenuRefresh();
 
                 break;
@@ -617,72 +480,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (e.PropertyName == nameof(FileOperationQueue.IsActive))
             {
                 CurrentOperationDetailedDataGrid.UnselectAll();
-                SortFileOps();
+                FileOpQ.RefreshView();
 
-                RuntimeSettings.RefreshFileOpControls = true;
+                AppActions.RaiseCanExecuteChanged();
             }
         }
 
         if (e.PropertyName is nameof(FileOperationQueue.CurrentChanged))
         {
-            ScheduleFileOpViewRefresh();
+            FileOpQ.RefreshView();
             FileActionLogic.UpdateFileOpControls();
         }
 
         if (!FileOpQ.IsActive)
             UpdateSelectedFileOp();
-    }
-
-    private void SortFileOps()
-    {
-        var collectionView = CollectionViewSource.GetDefaultView(CurrentOperationDetailedDataGrid.ItemsSource);
-        if (collectionView is null)
-            return;
-
-        if (collectionView.Filter is not null)
-        {
-            collectionView.Refresh();
-            return;
-        }
-
-        Predicate<object> predicate = op =>
-        {
-            var fileOp = (FileOperation)op;
-
-            if (FileOpQ.IsActive)
-                return fileOp.Filter is FileOpFilter.FilterType.Running;
-
-            return FileOpFilters.List.Find(f => f.Type == fileOp.Filter).IsChecked is true;
-        };
-
-        collectionView.Filter = predicate;
-
-        if (collectionView.SortDescriptions.All(d => d.PropertyName != nameof(FileOperation.Filter)))
-            collectionView.SortDescriptions.Add(new(nameof(FileOperation.Filter), ListSortDirection.Ascending));
-
-    }
-
-    private void ScheduleFileOpViewRefresh()
-    {
-        if (Interlocked.Exchange(ref fileOpViewRefreshScheduled, 1) == 1)
-            return;
-
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(250);
-
-            if (Dispatcher.HasShutdownStarted)
-            {
-                Interlocked.Exchange(ref fileOpViewRefreshScheduled, 0);
-                return;
-            }
-
-            _ = Dispatcher.BeginInvoke(new Action(() =>
-            {
-                Interlocked.Exchange(ref fileOpViewRefreshScheduled, 0);
-                SortFileOps();
-            }), DispatcherPriority.Background);
-        });
     }
 
     private void UpdateFileOp(bool onlyProgress = true)
@@ -717,7 +528,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     pendingLogEntries.Enqueue(item);
                 }
             }
-            else
+            else if (e.Action is NotifyCollectionChangedAction.Reset)
             {
                 pendingLogEntries.Clear();
                 rebuildLogRequested = true;
@@ -732,17 +543,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (Dispatcher.HasShutdownStarted)
             return;
 
-        if (!Dispatcher.CheckAccess())
-        {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleLogUiUpdate), DispatcherPriority.Background);
-            return;
-        }
-
-        if (isLogRefreshScheduled)
-            return;
-
-        isLogRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(ProcessPendingLogUiUpdates), DispatcherPriority.Background);
+        UiScheduler.EnqueueLatest("command-log.view", "command-log.view", ProcessPendingLogUiUpdates);
     }
 
     private void ProcessPendingLogUiUpdates()
@@ -755,17 +556,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         lock (pendingLogEntriesLock)
         {
-            while (pendingLogEntries.Count > 0)
+            while (pendingLogEntries.Count > 0 && logBatch.Count < 8)
             {
                 logBatch.Enqueue(pendingLogEntries.Dequeue());
             }
 
             shouldRebuild = rebuildLogRequested;
             rebuildLogRequested = false;
-            isLogRefreshScheduled = false;
         }
 
-        LogControlsPanel.Items.Refresh();
+        AppActions.RaiseCanExecuteChanged(FileActionType.ClearLogs);
 
         if (shouldRebuild)
         {
@@ -785,7 +585,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         bool shouldScheduleAnotherPass;
         lock (pendingLogEntriesLock)
         {
-            shouldScheduleAnotherPass = !isLogRefreshScheduled && (rebuildLogRequested || pendingLogEntries.Count > 0);
+            shouldScheduleAnotherPass = rebuildLogRequested || pendingLogEntries.Count > 0;
         }
 
         if (shouldScheduleAnotherPass)
@@ -836,15 +636,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 FilterExplorerItems();
                 break;
             case nameof(AppSettings.ShowExtensions):
-                ExplorerGrid.Items.Refresh();
+                CurrentDirectorySession?.RefreshDisplayNames();
                 break;
             case nameof(AppSettings.ShowSystemPackages):
                 if (DevicesObject.Current is null)
                     return;
 
-                if (FileActions.IsExplorerVisible)
-                    FilterExplorerItems();
-                else
+                if (FileActions.IsAppDrive)
+                    FileActionLogic.UpdatePackages(true);
+                else if (!FileActions.IsExplorerVisible)
                     FileActionLogic.UpdatePackages();
                 break;
             case nameof(AppSettings.EnableLog):
@@ -867,91 +667,51 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 FileActionLogic.UpdateFileActions();
 
                 if (NavHistory.Current.Location is Navigation.SpecialLocation.DriveView)
-                    _ = FileActionLogic.RefreshDrives(true);
+                    _ = FileActionLogic.RefreshDrives();
 
                 FilterDrives();
 
                 break;
             case nameof(AppSettings.SaveDevices):
                 if (Settings.SaveDevices && !DevicesObject.HistoryDeviceViewModels.Any())
-                    DevicesObject.RetrieveHistoryDevices();
+                    ((App)Application.Current).LoadHistoryDevices();
 
                 ScheduleFilterDevices();
                 break;
         }
     }
 
-    private void DirectoryLister_PropertyChanged(object sender, PropertyChangedEventArgs e)
-    {
-        if (Dispatcher.HasShutdownStarted || sender is not DirectoryLister lister)
-            return;
-
-        void HandlePropertyChange()
-        {
-            if (!ReferenceEquals(lister, DirList))
-                return;
-
-            switch (e.PropertyName)
-            {
-                case nameof(DirectoryLister.IsProgressVisible):
-                    UnfinishedBlock.Visible(lister.IsProgressVisible);
-                    NavigationBox.IsLoadingProgressVisible = lister.IsProgressVisible;
-                    break;
-
-                case nameof(DirectoryLister.InProgress):
-                {
-                    bool inProgress = lister.InProgress;
-                    FileActions.ListingInProgress = inProgress;
-
-                    if (inProgress)
-                        return;
-
-                    if (FileActions.IsRecycleBin)
-                    {
-                        TrashHelper.EnableRecycleButtons();
-                    }
-
-                    break;
-                }
-                case nameof(DirectoryLister.IsLinkListingFinished) when ExplorerGrid.Items.Count < 1 || !lister.IsLinkListingFinished:
-                    return;
-
-                case nameof(DirectoryLister.IsLinkListingFinished) when bfNavigation
-                    && !string.IsNullOrEmpty(prevPath) && lister.FileList.FirstOrDefault(item => item.FullPath == prevPath) is var prevItem and not null:
-                    FileActions.ItemToSelect = prevItem;
-                    break;
-
-                case nameof(DirectoryLister.IsLinkListingFinished):
-                {
-                    if (ExplorerGrid.Items.Count > 0)
-                        ExplorerGrid.ScrollIntoView(ExplorerGrid.Items[0]);
-                    break;
-                }
-            }
-        }
-
-        if (Dispatcher.CheckAccess())
-            HandlePropertyChange();
-        else
-            _ = Dispatcher.BeginInvoke((Action)HandlePropertyChange, DispatcherPriority.Background);
-    }
-
     private void ThemeService_PropertyChanged(object sender, PropertyChangedEventArgs e) =>
-        Dispatcher.Invoke(SetTheme);
+        UiScheduler.EnqueueLatest("theme.apply", "theme.apply", SetTheme);
 
     private void Window_Closing(object sender, CancelEventArgs e)
     {
-        DirList?.Stop();
-        TerminalControl.Shutdown();
+        DeviceHelper.CancelCurrentDeviceWork();
+        FileOpQ.Stop();
+        if (TerminalControl is not null)
+            _ = TerminalControl.ShutdownAsync();
 
-        dw.Close();
+        Settings.PropertyChanged -= Settings_PropertyChanged;
+        RuntimeSettings.UiChangeRequested -= RuntimeSettings_UiChangeRequested;
+        ThemeService.PropertyChanged -= ThemeService_PropertyChanged;
+        CommandLog.CollectionChanged -= CommandLog_CollectionChanged;
+        FileOpQ.PropertyChanged -= FileOperationQueue_PropertyChanged;
+        FileActions.PropertyChanged -= FileActions_PropertyChanged;
+        DevicesObject.UIList.CollectionChanged -= UIList_CollectionChanged;
+        FileOpFilters.CheckedFilterCount.PropertyChanged -= CheckedFilterCount_PropertyChanged;
+
+        packageViewCancellation?.Cancel();
+        packageViewCancellation?.Dispose();
+        packageViewCancellation = null;
+        ThemeService.Dispose();
+
+        dw?.Close();
         NativeMethods.InterceptClipboard.Close();
-
-        ConnectTimer.Stop();
-        ServerWatchdogTimer.Stop();
-        DiskUsageTimer.Stop();
         StoreClosingValues();
+        ((App)Application.Current).StopRuntime();
     }
+
+    internal void UpdateFileOperationView() => UpdateFileOp();
 
     private void StoreClosingValues()
     {
@@ -1061,7 +821,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (NavigationBox.Mode is NavigationBox.ViewMode.None)
                 return;
 
-            NavigationBox.UnfocusTarget = SettingsSplitView;
             NavigationBox.Mode = NavigationBox.ViewMode.Breadcrumbs;
         }
     }
@@ -1089,8 +848,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             if (!FileActions.ListingInProgress)
             {
-                bfNavigation = false;
-                NavigateToPath(file);
+                ((App)Application.Current).RequestFileNavigation(file);
             }
 
             return;
@@ -1110,6 +868,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void ExplorerGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (suppressExplorerSelectionChanged)
+            return;
+
         if (ExplorerGrid.SelectedItems.Count > 0 && !RuntimeSettings.IsExplorerLoaded)
         {
             ExplorerGrid.UnselectAll();
@@ -1137,10 +898,77 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SelectionTimer.Start();
     }
 
+    internal int BeginExplorerSelectionReset()
+    {
+        var version = unchecked(++explorerSelectionResetVersion);
+        suppressExplorerSelectionChanged = true;
+        SelectionTimer.Stop();
+        SelectionHelper.SetFirstSelectedIndex(ExplorerGrid, -1);
+        SelectionHelper.SetCurrentSelectedIndex(ExplorerGrid, -1);
+        return version;
+    }
+
+    internal bool RemoveLastExplorerSelection(int version)
+    {
+        if (version != explorerSelectionResetVersion || ExplorerGrid.SelectedItems.Count == 0)
+            return false;
+
+        ExplorerGrid.SelectedItems.RemoveAt(ExplorerGrid.SelectedItems.Count - 1);
+        return true;
+    }
+
+    internal bool AddExplorerSelection(int version, object item)
+    {
+        if (version != explorerSelectionResetVersion
+            || item is null
+            || !ExplorerGrid.Items.Contains(item))
+        {
+            return false;
+        }
+
+        ExplorerGrid.SelectedItems.Add(item);
+
+        return true;
+    }
+
+    internal void EndExplorerSelectionReset(int version, bool synchronizeSelection = false)
+    {
+        if (version != explorerSelectionResetVersion)
+            return;
+
+        suppressExplorerSelectionChanged = false;
+        if (synchronizeSelection)
+        {
+            if (ExplorerGrid.SelectedItems.Count > 0)
+            {
+                var firstItem = ExplorerGrid.SelectedItems[0];
+                var lastItem = ExplorerGrid.SelectedItems[ExplorerGrid.SelectedItems.Count - 1];
+                SelectionHelper.SetFirstSelectedIndex(ExplorerGrid, ExplorerGrid.Items.IndexOf(firstItem));
+                SelectionHelper.SetCurrentSelectedIndex(ExplorerGrid, ExplorerGrid.Items.IndexOf(lastItem));
+                ExplorerGrid.ScrollIntoView(firstItem);
+            }
+
+            SelectionTimer.Start();
+            return;
+        }
+
+        SelectedFiles = [];
+        SelectedPackages = [];
+        OnPropertyChanged(nameof(SelectedFilesTotalSize));
+        OnPropertyChanged(nameof(SelectedFilesCount));
+        FileActions.SelectedItemsCount = 0;
+    }
+
     private void ExplorerGrid_LoadingRow(object sender, DataGridRowEventArgs e)
     {
         if (e.Row.Item is FileClass file)
-            file.LoadIcon();
+            file.LoadIconAsync();
+    }
+
+    private void ExplorerGrid_UnloadingRow(object sender, DataGridRowEventArgs e)
+    {
+        if (e.Row.Item is FileClass file)
+            file.CancelIconLoad();
     }
 
     private void SelectionTimer_Tick(object sender, EventArgs e)
@@ -1152,63 +980,75 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FileActions.SelectedItemsCount = FileActions.IsAppDrive ? SelectedPackages.Count() : SelectedFiles.Count();
 
         FileActionLogic.UpdateFileActions();
-        ScheduleMainToolBarRefresh();
         PasteGrid.Visibility = Visibility.Visible;
 
         SelectionTimer.Stop();
     }
-
-    /// <summary>
-    /// Refresh file actions menu to update their ToolTips
-    /// </summary>
-    private void FilterFileActions() => ScheduleMainToolBarRefresh();
 
     private void ScheduleExplorerContextMenuRefresh()
     {
         if (Dispatcher.HasShutdownStarted)
             return;
 
-        if (!Dispatcher.CheckAccess())
+        UiScheduler.EnqueueLatest(
+            "explorer.context-menu.prepare",
+            "explorer.context-menu.prepare",
+            PrepareExplorerContextMenu);
+    }
+
+    private void PrepareExplorerContextMenu()
+    {
+        ExplorerContextMenu.UpdateSeparators();
+        pendingExplorerContextItems = ExplorerContextMenu.List
+            .Where(menu => menu.Children is null
+                ? menu.Action.Command.IsEnabled
+                : menu.Action.Command.IsEnabled
+                    && menu.Children.Any(child => child.Action.Command.IsEnabled))
+            .ToArray();
+        explorerContextVersion++;
+        UiScheduler.EnqueueLatest(
+            "explorer.context-menu.view",
+            "explorer.context-menu.view",
+            ApplyNextExplorerContextItem);
+    }
+
+    private void ApplyNextExplorerContextItem()
+    {
+        if (applyingExplorerContextVersion != explorerContextVersion)
         {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleExplorerContextMenuRefresh), DispatcherPriority.Background);
+            applyingExplorerContextVersion = explorerContextVersion;
+            explorerContextIndex = 0;
+        }
+
+        var visibleItems = ExplorerContextMenu.VisibleList;
+        if (explorerContextIndex < pendingExplorerContextItems.Length)
+        {
+            var expected = pendingExplorerContextItems[explorerContextIndex];
+            if (explorerContextIndex >= visibleItems.Count
+                || !ReferenceEquals(visibleItems[explorerContextIndex], expected))
+            {
+                int existingIndex = visibleItems.IndexOf(expected);
+                if (existingIndex < 0)
+                    visibleItems.Insert(explorerContextIndex, expected);
+                else
+                    visibleItems.Move(existingIndex, explorerContextIndex);
+            }
+
+            explorerContextIndex++;
+        }
+        else if (visibleItems.Count > pendingExplorerContextItems.Length)
+        {
+            visibleItems.RemoveAt(visibleItems.Count - 1);
+        }
+        else
+        {
             return;
         }
 
-        if (isExplorerContextMenuRefreshScheduled)
-            return;
-
-        isExplorerContextMenuRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            try
-            {
-                FilterExplorerContextMenu();
-                ExplorerContextMenu.UpdateSeparators();
-            }
-            finally
-            {
-                isExplorerContextMenuRefreshScheduled = false;
-            }
-        }), DispatcherPriority.Background);
-    }
-
-    private void FilterExplorerContextMenu()
-    {
-        var collectionView = CollectionViewSource.GetDefaultView(ExplorerGrid.ContextMenu.ItemsSource);
-        if (collectionView is null)
-            return;
-
-        Predicate<object> predicate = m =>
-        {
-            var menu = m as SubMenu;
-
-            if (menu.Children is null)
-                return menu.Action.Command.IsEnabled;
-            else
-                return menu.Action.Command.IsEnabled && menu.Children.Any(child => child.Action.Command.IsEnabled);
-        };
-
-        collectionView.Filter = predicate;
+        UiScheduler.EnqueueLatest(
+            "explorer.context-menu.view",
+            "explorer.context-menu.view",
+            ApplyNextExplorerContextItem);
     }
 
     private void Window_MouseDown(object sender, MouseButtonEventArgs e)
@@ -1216,506 +1056,93 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         RuntimeSettings.IsPathBoxFocused = false;
     }
 
-    private void LaunchSequence()
-    {
-        if (!HasSavedWindowBounds)
-            _ = Dispatcher.BeginInvoke(ApplyDefaultLaunchSize);
-
-        LoadSettings();
-        InitFileOpColumns();
-
-        DeviceHelper.UpdateWsaPkgStatus();
-
-        UpdateFileOpFilterCheck();
-
-        FileToIcon = new();
-    }
-
     private void ScheduleFilterDevices()
     {
-        if (Dispatcher.HasShutdownStarted)
+        if (!RuntimeSettings.IsDevicesPaneOpen)
             return;
 
-        if (!Dispatcher.CheckAccess())
+        UiScheduler.EnqueueLatest("devices.filter.snapshot", "devices.filter.snapshot", PrepareVisibleDevices);
+    }
+
+    private void PrepareVisibleDevices()
+    {
+        pendingVisibleDevices = DeviceHelper.GetVisibleDevices(DevicesObject.UIList);
+        visibleDevicesVersion++;
+        UiScheduler.EnqueueLatest("devices.filter", "devices.filter", ApplyNextVisibleDevice);
+    }
+
+    private void ApplyNextVisibleDevice()
+    {
+        if (applyingVisibleDevicesVersion != visibleDevicesVersion)
         {
-            _ = Dispatcher.BeginInvoke(new Action(ScheduleFilterDevices), DispatcherPriority.Background);
+            applyingVisibleDevicesVersion = visibleDevicesVersion;
+            visibleDeviceIndex = 0;
+        }
+
+        var visibleDevices = DevicesObject.VisibleDevices;
+        if (visibleDeviceIndex < pendingVisibleDevices.Length)
+        {
+            var expected = pendingVisibleDevices[visibleDeviceIndex];
+            if (visibleDeviceIndex >= visibleDevices.Count
+                || !ReferenceEquals(visibleDevices[visibleDeviceIndex], expected))
+            {
+                int existingIndex = visibleDevices.IndexOf(expected);
+                if (existingIndex < 0)
+                    visibleDevices.Insert(visibleDeviceIndex, expected);
+                else
+                    visibleDevices.Move(existingIndex, visibleDeviceIndex);
+            }
+
+            visibleDeviceIndex++;
+        }
+        else if (visibleDevices.Count > pendingVisibleDevices.Length)
+        {
+            visibleDevices.RemoveAt(visibleDevices.Count - 1);
+        }
+        else
+        {
             return;
         }
 
-        if (isDeviceFilterRefreshScheduled)
+        UiScheduler.EnqueueLatest("devices.filter", "devices.filter", ApplyNextVisibleDevice);
+    }
+
+    private void ScheduleToggleExplorerSelection()
+    {
+        selectExplorerItems = ExplorerGrid.Items.Count != ExplorerGrid.SelectedItems.Count;
+        pendingExplorerSelection = selectExplorerItems
+            ? (ExplorerGrid.ItemsSource as System.Collections.IEnumerable)?.Cast<object>().ToArray() ?? []
+            : ExplorerGrid.SelectedItems.Cast<object>().ToArray();
+        explorerSelectionVersion++;
+        UiScheduler.EnqueueLatest("explorer.selection", "explorer.selection", ApplyNextExplorerSelection);
+    }
+
+    private void ApplyNextExplorerSelection()
+    {
+        if (applyingExplorerSelectionVersion != explorerSelectionVersion)
+        {
+            applyingExplorerSelectionVersion = explorerSelectionVersion;
+            explorerSelectionIndex = 0;
+        }
+
+        if (explorerSelectionIndex >= pendingExplorerSelection.Length)
             return;
 
-        isDeviceFilterRefreshScheduled = true;
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            isDeviceFilterRefreshScheduled = false;
-            FilterDevices();
-        }), DispatcherPriority.Background);
+        var item = pendingExplorerSelection[explorerSelectionIndex++];
+        if (selectExplorerItems)
+            ExplorerGrid.SelectedItems.Add(item);
+        else
+            ExplorerGrid.SelectedItems.Remove(item);
+
+        UiScheduler.EnqueueLatest("explorer.selection", "explorer.selection", ApplyNextExplorerSelection);
     }
 
-    private void FilterDevices() => DeviceHelper.FilterDevices(CollectionViewSource.GetDefaultView(DevicesList.ItemsSource));
-
-    private void InitLister()
-    {
-        Interlocked.Increment(ref navigationRequestVersion);
-        if (DirList is not null)
-        {
-            DirList.PropertyChanged -= DirectoryLister_PropertyChanged;
-            DirList.Stop();
-        }
-        FileActions.ListingInProgress = false;
-
-        DirList = new(Dispatcher, CurrentADBDevice, FileHelper.ListerFileManipulator);
-        DirList.PropertyChanged += DirectoryLister_PropertyChanged;
-    }
-
-    private void LoadSettings()
-    {
-        Dispatcher.Invoke(SettingsHelper.SetSymbolFont);
-
-        SetRenderMode();
-
-        AdbHelper.EnableMdns();
-
-        UISettings.Init();
-
-        Dispatcher.Invoke(() =>
-        {
-            SettingsList.ItemsSource = UISettings.GroupedSettings;
-            SortedSettings.ItemsSource = UISettings.SortSettings;
-            NotificationsList.ItemsSource = UISettings.Notifications;
-
-            NavigationToolBar.ItemsSource = Services.NavigationToolBar.List;
-            MainToolBar.ItemsSource = Services.MainToolBar.List;
-            FileActionLogic.UpdateFileActions();
-
-            ScheduleFilterDevices();
-
-            FileActions.IsLogToggleVisible.Value = Settings.EnableLog;
-        });
-
-        Settings.UnrootOnDisconnect ??= false;
-
-        RuntimeSettings.DefaultBrowserPath = Network.GetDefaultBrowser();
-    }
-
-    private void SetRenderMode() => Dispatcher.Invoke(() =>
+    private void SetRenderMode()
     {
         if (Settings.SwRender)
             RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
         else if (RenderOptions.ProcessRenderMode == RenderMode.SoftwareOnly)
             RenderOptions.ProcessRenderMode = RenderMode.Default;
-    });
-
-    private void InitFileOpColumns() => Dispatcher.Invoke(() =>
-    {
-        FileOpColumns.Init();
-
-        FileOpColumns.List.ForEach(c => CurrentOperationDetailedDataGrid.Columns.Add(c.Column));
-    });
-
-    private void RefreshLocation()
-    {
-        if (FileActions.IsDriveViewVisible)
-            _ = FileActionLogic.RefreshDrives(true);
-        else
-            _navigateToPath(CurrentPath);
-    }
-
-    private void DriveViewNav()
-    {
-        Interlocked.Increment(ref navigationRequestVersion);
-        DirList?.Stop();
-        FileActionLogic.ClearExplorer(false);
-        FileActions.IsDriveViewVisible = true;
-        FileActions.IsExplorerVisible = false;
-        UpdateFileOp();
-
-        NavigationBox.Mode = NavigationBox.ViewMode.Breadcrumbs;
-        NavigationBox.Path = AdbLocation.StringFromLocation(Navigation.SpecialLocation.DriveView);
-        NavHistory.Navigate(Navigation.SpecialLocation.DriveView);
-        Settings.LastDevicePath = "";
-        Settings.SetLastDevicePath(DevicesObject.Current?.ID, null);
-
-        DriveList.ItemsSource = DevicesObject.Current.Drives;
-        CurrentDrive = null;
-
-        if (DriveList.SelectedIndex > -1)
-            SelectionHelper.GetListViewItemContainer(DriveList).Focus();
-
-        HomeSavedLocationsList.ItemsSource = NavigationBox.SavedItems;
-        if (NavigationBox.SavedItems.Count == 0)
-            Settings.HomeLocationsExpanded = false;
-    }
-
-    private void InitNavigation(string path = "") => NavigateToPath(path, true);
-
-    private static void ListDevices(IEnumerable<LogicalDevice> devices)
-    {
-        if (devices is null)
-            return;
-
-        var deviceList = devices.ToList();
-
-        if (!DevicesObject.DevicesChanged(deviceList))
-            return;
-
-        var deviceVMs = deviceList.Select(d => new LogicalDeviceViewModel(d, false)).ToList();
-        DeviceHelper.DeviceListSetup(deviceVMs);
-
-        if (!Settings.AutoRoot)
-            return;
-
-        foreach (var item in DevicesObject.LogicalDeviceViewModels.Where(device => device.Root is AbstractDevice.RootStatus.Unchecked))
-        {
-            Task.Run(() => item.EnableRoot(true));
-        }
-    }
-
-    private void ScheduleDeviceListUpdate(IEnumerable<LogicalDevice> devices)
-    {
-        var deviceList = devices?.ToList();
-        if (deviceList is null)
-            return;
-
-        lock (DeviceListUpdateLock)
-        {
-            PendingDeviceList = deviceList;
-            if (DeviceListUpdateScheduled)
-                return;
-
-            DeviceListUpdateScheduled = true;
-        }
-
-        _ = Dispatcher.BeginInvoke(new Action(() =>
-        {
-            IReadOnlyList<LogicalDevice> latestDevices;
-            lock (DeviceListUpdateLock)
-            {
-                latestDevices = PendingDeviceList;
-                PendingDeviceList = null;
-                DeviceListUpdateScheduled = false;
-            }
-
-            ListDevices(latestDevices);
-        }), DispatcherPriority.Background);
-    }
-
-    private void ConnectTimer_Tick(object sender, EventArgs e)
-    {
-        if (ConnectTimer.Interval == CONNECT_TIMER_INIT)
-            ConnectTimer.Interval = CONNECT_TIMER_INTERVAL;
-
-        bool deferBackgroundPolling = RuntimeSettings.IsPollingStopped || FileOpQ.HasRunningSyncOperations;
-        bool startedDeviceRefresh = Settings.PollDevices && !deferBackgroundPolling && StartDeviceRefresh();
-
-        Task.Run(() =>
-        {
-            if (!ConnectTimerMutex.Wait(0))
-                return;
-
-            try
-            {
-                if (deferBackgroundPolling || startedDeviceRefresh || DeviceRefreshMutex.CurrentCount == 0)
-                    return;
-
-                if (Settings.PollBattery)
-                {
-                    DeviceHelper.UpdateDevicesBatInfo();
-                }
-
-                if (FileActions.IsDriveViewVisible && Settings.PollDrives)
-                {
-                    _ = Dispatcher.BeginInvoke(
-                        new Action(() => _ = FileActionLogic.RefreshDrives(true)), DispatcherPriority.Background);
-                }
-
-                if (RuntimeSettings.IsDevicesPaneOpen)
-                {
-                    DeviceHelper.UpdateDevicesRootAccess();
-
-                    DeviceHelper.UpdateWsaPkgStatus();
-                }
-            }
-            finally
-            {
-                ConnectTimerMutex.Release();
-            }
-        });
-    }
-
-    private bool StartDeviceRefresh()
-    {
-        if (!DeviceRefreshMutex.Wait(0))
-            return false;
-
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                RefreshDevices();
-            }
-            finally
-            {
-                DeviceRefreshMutex.Release();
-            }
-        });
-
-        return true;
-    }
-
-    private void RefreshDevices()
-    {
-        var devices = ADBService.GetDevices();
-        ScheduleDeviceListUpdate(devices);
-
-        DeviceHelper.ConnectWsaDevice();
-
-        if (!RuntimeSettings.IsDevicesPaneOpen)
-            return;
-
-        _ = Dispatcher.BeginInvoke(
-            new Action(DevicesObject.UpdateLogicalIp), DispatcherPriority.Background);
-
-        if (MdnsService.State is MDNS.MdnsState.Running)
-        {
-            var services = WiFiPairingService.GetServices();
-            _ = Dispatcher.BeginInvoke(
-                new Action(() => DeviceHelper.ListServices(services)), DispatcherPriority.Background);
-        }
-    }
-
-    public bool NavigateToPath(FileClass file)
-    {
-        if (file is null)
-            return false;
-
-        if (!bfNavigation)
-            prevPath = file.FullPath;
-
-        string realPath = !string.IsNullOrEmpty(file.LinkTarget)
-            ? file.LinkTarget
-            : file.FullPath;
-
-        return realPath is not null && _navigateToPath(realPath);
-    }
-
-    public void NavigateToPath(string path) => NavigateToPath(path, false);
-
-    private async void NavigateToPath(string path, bool initialize)
-    {
-        if (path is null)
-            return;
-
-        int requestVersion = Interlocked.Increment(ref navigationRequestVersion);
-        var device = CurrentADBDevice;
-        if (device is null)
-            return;
-
-        string requestedPath = string.IsNullOrEmpty(path) ? DEFAULT_PATH : path;
-        string errorMessage = null;
-        FileActions.ListingInProgress = true;
-
-        string realPath = await Task.Run(() =>
-        {
-            if (requestedPath == AdbLocation.StringFromLocation(Navigation.SpecialLocation.PackageDrive))
-                return requestedPath;
-
-            if (requestedPath == AdbLocation.StringFromLocation(Navigation.SpecialLocation.RecycleBin))
-                return RECYCLE_PATH;
-
-            try
-            {
-                return device.TranslateDevicePath(requestedPath);
-            }
-            catch (Exception e)
-            {
-                errorMessage = e.Message;
-                return null;
-            }
-        });
-
-        if (requestVersion != Volatile.Read(ref navigationRequestVersion)
-            || !ReferenceEquals(CurrentADBDevice, device))
-        {
-            return;
-        }
-
-        if (realPath is null)
-        {
-            FileActions.ListingInProgress = false;
-            if (requestedPath != RECYCLE_PATH)
-            {
-                DialogService.ShowMessage(errorMessage ?? Strings.Resources.S_LS_ERROR, Strings.Resources.S_NAV_ERR_TITLE,
-                    DialogService.DialogIcon.Critical, copyToClipboard: true);
-            }
-
-            if (initialize)
-                DriveViewNav();
-
-            return;
-        }
-
-        if (!bfNavigation)
-            prevPath = path;
-
-        if (initialize)
-        {
-            FileActions.IsDriveViewVisible = false;
-            FileActions.IsExplorerVisible = true;
-            FileActions.HomeEnabled = true;
-            RuntimeSettings.BrowseDrive = null;
-
-            UpdateFileOp();
-
-            _ = Task.Delay(EXPLORER_NAV_DELAY).ContinueWith(task =>
-            {
-                _ = Dispatcher.BeginInvoke(new Action(() => RuntimeSettings.IsExplorerLoaded = true));
-            });
-        }
-
-        _navigateToPath(realPath);
-    }
-
-    private bool _navigateToPath(string realPath)
-    {
-        int requestVersion = Interlocked.Increment(ref navigationRequestVersion);
-        PasteGrid.Visibility = Visibility.Collapsed;
-        FileActions.ListingInProgress = true;
-
-        FileActions.ExplorerFilter = "";
-        NavHistory.Navigate(realPath);
-
-        SelectionHelper.SetFirstSelectedIndex(ExplorerGrid, -1);
-        SelectionHelper.SetCurrentSelectedIndex(ExplorerGrid, -1);
-
-        ExplorerGrid.Focus();
-        CurrentPath = realPath;
-        if (DevicesObject.Current is not null)
-        {
-            Settings.LastDevicePath = realPath;
-            Settings.SetLastDevicePath(DevicesObject.Current.ID, realPath);
-        }
-
-        NavigationBox.Path = realPath == RECYCLE_PATH ? AdbLocation.StringFromLocation(Navigation.SpecialLocation.RecycleBin) : realPath;
-        ParentPath = FileHelper.GetParentPath(CurrentPath);
-        CurrentDrive = DriveHelper.GetCurrentDrive(CurrentPath);
-
-        FileActions.IsRecycleBin = CurrentPath == RECYCLE_PATH;
-        FileActions.IsAppDrive = CurrentPath == AdbLocation.StringFromLocation(Navigation.SpecialLocation.PackageDrive);
-        FileActions.IsTemp = CurrentPath == TEMP_PATH;
-        FileActions.ParentEnabled = CurrentPath != ParentPath && !FileActions.IsRecycleBin && !FileActions.IsAppDrive;
-
-        FileActionLogic.IsPasteEnabled();
-
-        if (!RuntimeSettings.IsRootActive && DevicesObject.Current.Root is AbstractDevice.RootStatus.Enabled)
-            RuntimeSettings.IsRootActive = true;
-
-        FileActions.PushPackageEnabled = Settings.EnableApk && DevicesObject?.Current?.Type is not AbstractDevice.DeviceType.Recovery;
-        FileActions.UninstallPackageEnabled = false;
-
-        FileActions.ContextPushPackagesEnabled =
-        FileActions.IsUninstallVisible.Value = FileActions.IsAppDrive;
-
-        FileActions.PushFilesFoldersEnabled =
-        FileActions.ContextNewEnabled =
-        FileActions.ContextPushEnabled =
-        FileActions.NewEnabled = !FileActions.IsRecycleBin && !FileActions.IsAppDrive;
-
-        OriginalPath.Visibility =
-        OriginalDate.Visibility = Visible(FileActions.IsRecycleBin);
-
-        PackageName.Visibility =
-        PackageType.Visibility =
-        PackageUid.Visibility =
-        PackageVersion.Visibility = Visible(FileActions.IsAppDrive);
-
-        IconColumn.Visibility =
-        NameColumn.Visibility =
-        DateColumn.Visibility =
-        TypeColumn.Visibility =
-        SizeColumn.Visibility = Visible(!FileActions.IsAppDrive);
-
-        FileActions.CopyPathDescription.Value = FileActions.IsAppDrive ? Strings.Resources.S_COPY_APK_NAME : Strings.Resources.S_COPY_PATH;
-        
-        if (FileActions.IsRecycleBin)
-        {
-            _ = NavigateToRecyclePathAsync(
-                realPath,
-                requestVersion,
-                DirList,
-                CurrentADBDevice);
-
-            FileActions.DeleteDescription.Value = Strings.Resources.S_EMPTY_TRASH;
-            FileActions.RestoreDescription.Value = Strings.Resources.S_RESTORE_ALL;
-        }
-        else
-        {
-            if (FileActions.IsAppDrive)
-            {
-                FileActionLogic.UpdatePackages(true);
-                FileActionLogic.UpdateFileActions();
-                return true;
-            }
-
-            DirList.Navigate(realPath);
-
-            FileActions.DeleteDescription.Value = Strings.Resources.S_DELETE_ACTION;
-        }
-
-        RuntimeSettings.ExplorerSource = DirList.FileList;
-        FileActionLogic.UpdateFileActions();
-        return true;
-    }
-
-    private async Task NavigateToRecyclePathAsync(
-        string path,
-        int requestVersion,
-        DirectoryLister lister,
-        ADBService.AdbDevice device)
-    {
-        if (lister is null || device is null)
-            return;
-
-        try
-        {
-            await TrashHelper.ParseIndexersAsync(device);
-        }
-        catch (Exception e)
-        {
-            Data.AddCommandLog($"@ADB Explorer: failed to read recycle index: {e.Message}");
-        }
-
-        if (requestVersion != Volatile.Read(ref navigationRequestVersion)
-            || !ReferenceEquals(DirList, lister)
-            || CurrentADBDevice?.ID != device?.ID)
-        {
-            return;
-        }
-
-        lister.Navigate(path);
-    }
-
-    private void NavigateToLocation(AdbLocation location)
-    {
-        SelectionHelper.SetIsMenuOpen(ExplorerGrid.ContextMenu, false);
-
-        if (location.Location is Navigation.SpecialLocation.DriveView)
-        {
-            FileActions.IsRecycleBin = false;
-            RuntimeSettings.IsPathBoxFocused = false;
-            _ = FileActionLogic.RefreshDrives();
-            DriveViewNav();
-
-            FileActionLogic.UpdateFileActions();
-        }
-        else
-        {
-            if (!FileActions.IsExplorerVisible)
-                InitNavigation(location.DisplayName);
-            else
-                NavigateToPath(location.DisplayName);
-        }
     }
 
     private void Window_MouseUp(object sender, MouseButtonEventArgs e)
@@ -1849,10 +1276,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         switch (key)
         {
             case Key.Down or Key.Up or Key.Home or Key.End:
-                if (bfNavigation)
+                if (((App)Application.Current).ConsumeBackForwardNavigation())
                 {
                     SelectionHelper.SetCurrentSelectedIndex(ExplorerGrid, ExplorerGrid.SelectedIndex);
-                    bfNavigation = false;
                 }
 
                 if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
@@ -1965,10 +1391,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         ResizeDetailedView();
         EnableSplitViewAnimation();
-        SearchBoxMaxWidth();
 
         if (!RuntimeSettings.IsWindowLoaded)
             return;
+
+        SearchBoxMaxWidth();
 
         Size maximizedSize = new(SystemParameters.MaximizedPrimaryScreenWidth, SystemParameters.MaximizedPrimaryScreenHeight);
         if (e.NewSize != maximizedSize && e.PreviousSize != maximizedSize)
@@ -1983,7 +1410,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _ => Width * MAX_SEARCH_WIDTH_RATIO,
         };
 
-        RuntimeSettings.AutoHideSearchBox = true;
         SearchBox.Refresh();
     }
 
@@ -2068,49 +1494,163 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         DriveHelper.ClearSelectedDrives();
     }
 
-    private void FilterExplorerItems(bool refreshOnly = false)
+    private void FilterExplorerItems()
     {
         if (!FileActions.IsExplorerVisible)
             return;
 
-        var collectionView = CollectionViewSource.GetDefaultView(ExplorerGrid.ItemsSource);
-        if (collectionView is null)
-            return;
-
-        if (refreshOnly)
-            collectionView.Refresh();
-
         if (FileActions.IsAppDrive)
         {
-            collectionView.Filter = Settings.ShowSystemPackages
-                ? FileHelper.PkgFilter()
-                : pkg => ((Package)pkg).Type is Package.PackageType.User;
-
-            if (collectionView.SortDescriptions.All(d => d.PropertyName != nameof(Package.Type)))
-            {
-                ExplorerGrid.Columns[8].SortDirection = ListSortDirection.Descending;
-
-                collectionView.SortDescriptions.Add(new(nameof(Package.Type), ListSortDirection.Descending));
-            }
+            ExplorerGrid.Columns[8].SortDirection ??= ListSortDirection.Descending;
+            SchedulePackageViewRefresh();
         }
         else
         {
-            collectionView.Filter = !Settings.ShowHiddenItems
-                ? FileHelper.HideFiles()
-                : file => !FileHelper.IsHiddenRecycleItem((FileClass)file);
-
-            if (!collectionView.SortDescriptions.Any(d => d.PropertyName
-                    is nameof(FileClass.IsTemp)
-                    or nameof(FileClass.IsDirectory)
-                    or nameof(FileClass.SortName)))
-            {
-                ExplorerGrid.Columns[1].SortDirection = ListSortDirection.Ascending;
-
-                collectionView.SortDescriptions.Add(new(nameof(FileClass.IsTemp), ListSortDirection.Descending));
-                collectionView.SortDescriptions.Add(new(nameof(FileClass.IsDirectory), ListSortDirection.Descending));
-                collectionView.SortDescriptions.Add(new(nameof(FileClass.SortName), ListSortDirection.Ascending));
-            }
+            ExplorerGrid.Columns[1].SortDirection ??= ListSortDirection.Ascending;
+            CurrentDirectorySession?.ApplyFilter(Settings.ShowHiddenItems, FileActions.ExplorerFilter);
         }
+    }
+
+    private void SchedulePackageViewRefresh()
+    {
+        var source = App.ExplorerState.Packages;
+        string filter = FileActions.ExplorerFilter ?? "";
+        bool showSystemPackages = Settings.ShowSystemPackages;
+        string sortProperty = packageSortProperty;
+        var sortDirection = packageSortDirection;
+        long version = Interlocked.Increment(ref packageViewVersion);
+        var cancellation = new CancellationTokenSource();
+        var previousCancellation = Interlocked.Exchange(ref packageViewCancellation, cancellation);
+        previousCancellation?.Cancel();
+        previousCancellation?.Dispose();
+        _ = PreparePackageViewAsync(
+            source,
+            filter,
+            showSystemPackages,
+            sortProperty,
+            sortDirection,
+            version,
+            cancellation.Token);
+    }
+
+    private async Task PreparePackageViewAsync(
+        IReadOnlyCollection<Package> source,
+        string filter,
+        bool showSystemPackages,
+        string sortProperty,
+        ListSortDirection sortDirection,
+        long version,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await Task.Run(
+                () => BuildPackageView(
+                    source,
+                    filter,
+                    showSystemPackages,
+                    sortProperty,
+                    sortDirection,
+                    cancellationToken),
+                cancellationToken).ConfigureAwait(false);
+
+            UiScheduler.EnqueueLatest(
+                "packages.view.prepare",
+                "packages.view.prepare",
+                () =>
+                {
+                    if (version != Volatile.Read(ref packageViewVersion))
+                        return;
+
+                    pendingVisiblePackages = result;
+                    UiScheduler.EnqueueLatest(
+                        "packages.view",
+                        "packages.view",
+                        ApplyNextVisiblePackage);
+                });
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        { }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "packages.view");
+        }
+    }
+
+    internal static Package[] BuildPackageView(
+        IReadOnlyCollection<Package> source,
+        string filter,
+        bool showSystemPackages,
+        string sortProperty,
+        ListSortDirection sortDirection,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var packages = source
+            .Where(package => showSystemPackages || package.Type is Package.PackageType.User)
+            .Where(package => string.IsNullOrEmpty(filter)
+                || package.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        Array.Sort(packages, (left, right) =>
+        {
+            int comparison = sortProperty switch
+            {
+                nameof(Package.Name) => string.Compare(
+                    left.Name,
+                    right.Name,
+                    StringComparison.CurrentCultureIgnoreCase),
+                nameof(Package.Uid) => Nullable.Compare(left.Uid, right.Uid),
+                nameof(Package.Version) => Nullable.Compare(left.Version, right.Version),
+                _ => left.Type.CompareTo(right.Type),
+            };
+            if (sortDirection is ListSortDirection.Descending)
+                comparison = -comparison;
+            return comparison != 0
+                ? comparison
+                : string.Compare(left.Name, right.Name, StringComparison.CurrentCultureIgnoreCase);
+        });
+        cancellationToken.ThrowIfCancellationRequested();
+        return packages;
+    }
+
+    private void ApplyNextVisiblePackage()
+    {
+        long version = Volatile.Read(ref packageViewVersion);
+        if (applyingPackageViewVersion != version)
+        {
+            applyingPackageViewVersion = version;
+            packageViewIndex = 0;
+        }
+
+        var visiblePackages = App.ExplorerState.VisiblePackages;
+        if (packageViewIndex < pendingVisiblePackages.Length)
+        {
+            var expected = pendingVisiblePackages[packageViewIndex];
+            if (packageViewIndex >= visiblePackages.Count
+                || !ReferenceEquals(visiblePackages[packageViewIndex], expected))
+            {
+                int existingIndex = visiblePackages.IndexOf(expected);
+                if (existingIndex < 0)
+                    visiblePackages.Insert(packageViewIndex, expected);
+                else
+                    visiblePackages.Move(existingIndex, packageViewIndex);
+            }
+
+            packageViewIndex++;
+        }
+        else if (visiblePackages.Count > pendingVisiblePackages.Length)
+        {
+            visiblePackages.RemoveAt(visiblePackages.Count - 1);
+        }
+        else
+        {
+            return;
+        }
+
+        UiScheduler.EnqueueLatest(
+            "packages.view",
+            "packages.view",
+            ApplyNextVisiblePackage);
     }
 
     private void GridSplitter_DragDelta(object sender, DragDeltaEventArgs e)
@@ -2156,7 +1696,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         ResizeDetailedView();
     }
 
-    private void UpdateMdns()
+    internal void UpdateMdns()
     {
         if (MdnsService.State == MDNS.MdnsState.Disabled)
         {
@@ -2178,7 +1718,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void Window_SourceInitialized(object sender, EventArgs e)
     {
-        _ = TryRestoreWindowBounds();
+        if (!HasSavedWindowBounds || !TryRestoreWindowBounds())
+            ApplyDefaultLaunchSize();
 
         if (Storage.RetrieveBool(AppSettings.SystemVals.windowMaximized) == true)
             WindowState = WindowState.Maximized;
@@ -2197,9 +1738,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void RestartAdbButton_Click(object sender, RoutedEventArgs e)
     {
-        await Task.Run(() => ADBService.KillAdbServer());
-        MdnsService.State = MDNS.MdnsState.Disabled;
-        UpdateMdns();
+        await ((App)Application.Current).RestartAdbServerAsync();
     }
 
     private void Border_MouseDown(object sender, MouseButtonEventArgs e)
@@ -2240,7 +1779,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             var name = FileHelper.DisplayName(textBox);
             if (string.IsNullOrEmpty(name))
             {
-                DirList.FileList.Remove(ExplorerGrid.SelectedItem as FileClass);
+                CurrentDirectorySession.RemoveItem(ExplorerGrid.SelectedItem as FileClass);
             }
             else
             {
@@ -2344,17 +1883,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ? StringComparison.InvariantCultureIgnoreCase
             : StringComparison.InvariantCulture;
 
-        FileActions.IsRenameUnique = !DirList.FileList.Except([file]).Any(f => f.FullName.Equals(fullName, comparison));
+        FileActions.IsRenameUnique = !CurrentDirectorySession.FileList.Except([file]).Any(f => f.FullName.Equals(fullName, comparison));
     }
 
     private void NewItem(bool isFolder)
     {
-        var fileName = FileHelper.DuplicateFile(DirList.FileList, isFolder
+        var fileName = FileHelper.DuplicateFile(CurrentDirectorySession.FileList, isFolder
             ? Strings.Resources.S_NEW_FOLDER
             : Strings.Resources.S_NEW_ITEM);
 
         FileClass newItem = new(fileName, FileHelper.ConcatPaths(CurrentPath, fileName), isFolder ? FileType.Folder : FileType.File, isTemp: true);
-        DirList.FileList.Insert(0, newItem);
+        CurrentDirectorySession.InsertItem(0, newItem);
 
         ExplorerGrid.ScrollIntoView(newItem);
         ExplorerGrid.SelectedItem = newItem;
@@ -2371,7 +1910,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     }
 
     private void RefreshDevicesButton_Click(object sender, RoutedEventArgs e)
-        => StartDeviceRefresh();
+        => ((App)Application.Current).RefreshDevices();
 
     private void AndroidRobotLicense_Click(object sender, RoutedEventArgs e)
         => SettingsHelper.ShowAndroidRobotLicense();
@@ -2379,20 +1918,29 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void ExplorerGrid_Sorting(object sender, DataGridSortingEventArgs e)
     {
         if (FileActions.IsAppDrive)
+        {
+            packageSortDirection = ListHelper.Invert(e.Column.SortDirection);
+            packageSortProperty = ReferenceEquals(e.Column, PackageName)
+                ? nameof(Package.Name)
+                : ReferenceEquals(e.Column, PackageUid)
+                    ? nameof(Package.Uid)
+                    : ReferenceEquals(e.Column, PackageVersion)
+                        ? nameof(Package.Version)
+                        : nameof(Package.Type);
+            foreach (var column in new[] { PackageName, PackageType, PackageUid, PackageVersion })
+            {
+                if (!ReferenceEquals(column, e.Column))
+                    column.SortDirection = null;
+            }
+            e.Column.SortDirection = packageSortDirection;
+            SchedulePackageViewRefresh();
+            e.Handled = true;
             return;
+        }
 
-        var collectionView = CollectionViewSource.GetDefaultView(ExplorerGrid.ItemsSource);
         var sortDirection = ListHelper.Invert(e.Column.SortDirection);
         e.Column.SortDirection = sortDirection;
-
-        collectionView.SortDescriptions.Clear();
-        collectionView.SortDescriptions.Add(new(nameof(FileClass.IsTemp), ListSortDirection.Descending));
-        collectionView.SortDescriptions.Add(new(nameof(FileClass.IsDirectory), ListHelper.Invert(sortDirection)));
-
-        if (e.Column.SortMemberPath != nameof(FileClass.FullName))
-            collectionView.SortDescriptions.Add(new(e.Column.SortMemberPath, sortDirection));
-
-        collectionView.SortDescriptions.Add(new(nameof(FileClass.SortName), sortDirection));
+        CurrentDirectorySession?.Sort(e.Column.SortMemberPath, sortDirection);
 
         e.Handled = true;
     }
@@ -2419,7 +1967,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void MainWin_StateChanged(object sender, EventArgs e)
     {
-        SearchBoxMaxWidth();
+        if (RuntimeSettings.IsWindowLoaded)
+            SearchBoxMaxWidth();
     }
 
     private void SortedSettings_MouseMove(object sender, MouseEventArgs e)
@@ -2487,7 +2036,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 if (vfdo is not null)
                 {
                     CopyPaste.UpdateSelfVFDO(true);
-                    RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(selectedItems.First(), GetDragPreviewIconSize());
+                    var previewItem = selectedItems.First();
+                    RuntimeSettings.DragBitmap = previewItem.Icon;
+                    LoadDragPreview(previewItem);
 
                     vfdo.SendObjectToShell(VirtualFileDataObject.DataObjectMethod.DragDrop, cell, vfdo.PreferredDropEffect.Value);
                 }
@@ -2599,7 +2150,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void KillAdbButton_Click(object sender, RoutedEventArgs e)
     {
-        await Task.Run(ADBService.KillAdbProcess);
+        await ((App)Application.Current).KillAdbProcessAsync();
     }
 
     private async void DisconnectCurrentDeviceButton_Click(object sender, RoutedEventArgs e)
@@ -2680,7 +2231,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return true;
     }
 
-    private void MouseUpOnName(DataGridCell cell)
+    private async void MouseUpOnName(DataGridCell cell)
     {
         if (cell.IsReadOnly
             || (DevicesObject.Current.Root is not AbstractDevice.RootStatus.Enabled
@@ -2691,28 +2242,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         if (ExplorerGrid.SelectedItems.Count == 1 && WasSelected && !WasEditing)
         {
-            _ = Task.Run(async () =>
+            var start = DateTime.Now;
+
+            while (true)
             {
-                var start = DateTime.Now;
+                await Task.Delay(100);
 
-                while (true)
-                {
-                    await Task.Delay(100);
+                if (DateTime.Now - start > RENAME_CLICK_DELAY)
+                    break;
 
-                    if (DateTime.Now - start > RENAME_CLICK_DELAY)
-                        break;
+                var currentPath = ((FileClass)ExplorerGrid.SelectedItem)?.FullPath;
+                if (ClickCount > 1 || currentPath != path)
+                    return;
+            }
 
-                    var currentPath = await Dispatcher.InvokeAsync(() => ((FileClass)ExplorerGrid.SelectedItem)?.FullPath);
-                    if (ClickCount > 1 || currentPath != path)
-                        return;
-                }
-
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    cell.IsEditing = true;
-                    FileActions.IsExplorerEditing = true;
-                });
-            });
+            cell.IsEditing = true;
+            FileActions.IsExplorerEditing = true;
         }
     }
 
@@ -2791,16 +2336,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         CopyPaste.DropEffect =
         CopyPaste.CurrentDropEffect = e.Effects;
 
-        if (RuntimeSettings.DragBitmap is null && CopyPaste.CurrentFiles.Any())
-            RuntimeSettings.DragBitmap = FileToIconConverter.GetBitmapSource(CopyPaste.CurrentFiles.First(), GetDragPreviewIconSize());
+        var previewItem = RuntimeSettings.DragBitmap is null
+            ? CopyPaste.GetPreviewFile()
+            : null;
+        if (previewItem is not null)
+        {
+            RuntimeSettings.DragBitmap = previewItem.Icon;
+            LoadDragPreview(previewItem);
+        }
 
         e.Handled = true;
-    }
-
-    private void MainWin_LocationChanged(object sender, EventArgs e)
-    {
-        if (!RuntimeSettings.IsWindowLoaded)
-            return;
     }
 
     private int GetDragPreviewIconSize()
@@ -2811,6 +2356,45 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             : 1d;
 
         return (int)Math.Clamp(Math.Round(logicalSize * dpiScale), 32, 64);
+    }
+
+    private void LoadDragPreview(FilePath file)
+    {
+        if (Application.Current is not App app)
+            return;
+
+        int version = Interlocked.Increment(ref dragIconVersion);
+        string fullPath = file.FullPath;
+        _ = LoadAsync();
+
+        async Task LoadAsync()
+        {
+            try
+            {
+                var icon = await app.GetPreviewIconAsync(
+                    file.FullName,
+                    file.SpecialType,
+                    GetDragPreviewIconSize()).ConfigureAwait(false);
+                if (icon is null)
+                    return;
+
+                app.EnqueueUiLatest("drag.preview-icon", "drag.preview-icon", () =>
+                {
+                    if (version == Volatile.Read(ref dragIconVersion)
+                        && CopyPaste.IsDrag
+                        && CopyPaste.GetPreviewFile()?.FullPath == fullPath)
+                    {
+                        RuntimeSettings.DragBitmap = icon;
+                    }
+                });
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+            { }
+            catch (Exception ex)
+            {
+                App.ReportBackgroundFailure(ex, "drag.preview-icon");
+            }
+        }
     }
 
     private void MainWin_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -2879,8 +2463,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         FlyoutBase.ShowAttachedFlyout(menuitem);
     }
 
-    private static string CurrentTerminalDeviceId => DevicesObject.Current?.Status is AbstractDevice.DeviceStatus.Ok
-        ? DevicesObject.Current.ID
+    private static string CurrentTerminalDeviceId => App.ActiveDevices.Current?.Status is AbstractDevice.DeviceStatus.Ok
+        ? App.ActiveDevices.Current.ID
         : "";
 
     private bool IsTerminalFocused() => TerminalControl.IsTerminalFocused;

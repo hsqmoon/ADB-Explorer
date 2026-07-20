@@ -75,54 +75,67 @@ public class FileMoveOperation : AbstractShellFileOperation
         if (OperationName is OperationType.Copy or OperationType.Recycle)
             DateModified = DateTime.Now;
 
-        var operationTask = ADBService.ExecuteVoidShellCommand(Device.ID, CancelTokenSource.Token, cmd, flag,
+        _ = RunAsync(ADBService.ExecuteVoidShellCommand(Device.ID, CancelTokenSource.Token, cmd, flag,
             ADBService.EscapeAdbShellString(FilePath.FullPath),
-            ADBService.EscapeAdbShellString(TargetPath.FullPath));
+            ADBService.EscapeAdbShellString(TargetPath.FullPath)),
+            Children.Count > 0);
+    }
 
-        operationTask.ContinueWith((t) =>
+    private async Task RunAsync(Task<string> operationTask, bool hasChildren)
+    {
+        try
         {
-            if (t.Result == "")
+            string result = await operationTask.ConfigureAwait(false);
+            if (CancelTokenSource?.IsCancellationRequested is true)
             {
-                Status = OperationStatus.Completed;
-                StatusInfo = new CompletedShellProgressViewModel();
-            }
-            else
-            {
-                Status = OperationStatus.Failed;
-
-                var res = AdbRegEx.RE_SHELL_ERROR().Matches(t.Result);
-                var updates = res.Where(m => m.Success).Select(m => new ShellErrorInfo(m, FilePath.FullPath));
-                AddUpdates(updates);
-
-                var message = updates.Any() ? updates.Last().Message : t.Result;
-                if (message.Contains(':'))
-                    message = message.Split(':').Last().TrimStart();
-
-                var errorString = FileOpStatusConverter.StatusString(typeof(ShellErrorInfo),
-                                                   failed: Children.Count > 0 ? updates.Count() : -1,
-                                                   message: message,
-                                                   total: true);
-
-                StatusInfo = new FailedOpProgressViewModel(errorString);
-
-                if (OperationName is OperationType.Recycle)
-                {
-                    ShellFileOperation.SilentDelete(Device, TargetPath.FullPath, IndexerPath);
-                }
+                await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+                return;
             }
 
-        }, TaskContinuationOptions.OnlyOnRanToCompletion);
+            if (string.IsNullOrEmpty(result))
+            {
+                await CompleteAsync(OperationStatus.Completed, new CompletedShellProgressViewModel()).ConfigureAwait(false);
+                return;
+            }
 
-        operationTask.ContinueWith((t) =>
-        {
-            Status = OperationStatus.Canceled;
-            StatusInfo = new CanceledOpProgressViewModel();
-        }, TaskContinuationOptions.OnlyOnCanceled);
+            var updates = AdbRegEx.RE_SHELL_ERROR()
+                .Matches(result)
+                .Where(match => match.Success)
+                .Select(match => new ShellErrorInfo(match, FilePath.FullPath))
+                .ToArray();
+            string message = updates.LastOrDefault()?.Message ?? result;
+            if (message.Contains(':'))
+                message = message.Split(':').Last().TrimStart();
 
-        operationTask.ContinueWith((t) =>
+            var errorString = FileOpStatusConverter.StatusString(
+                typeof(ShellErrorInfo),
+                failed: hasChildren ? updates.Length : -1,
+                message: message,
+                total: true);
+
+            if (OperationName is OperationType.Recycle)
+            {
+                await ADBService.ExecuteVoidShellCommand(
+                    Device.ID,
+                    CancellationToken.None,
+                    "rm",
+                    "-rf",
+                    ADBService.EscapeAdbShellString(TargetPath.FullPath),
+                    ADBService.EscapeAdbShellString(IndexerPath)).ConfigureAwait(false);
+            }
+
+            await CompleteAsync(
+                OperationStatus.Failed,
+                new FailedOpProgressViewModel(errorString),
+                () => AddUpdates(updates)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(t.Exception.InnerException.Message);
-        }, TaskContinuationOptions.OnlyOnFaulted);
+            await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await CompleteAsync(OperationStatus.Failed, new FailedOpProgressViewModel(ex.GetBaseException().Message)).ConfigureAwait(false);
+        }
     }
 }

@@ -1,6 +1,5 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.ViewModels;
-using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Models;
 
@@ -97,34 +96,21 @@ public class FilePath : AbstractFile, IBaseFile
             {
                 noExtName = $"{NoExtName}{TextHelper.RTL_MARK}";
             }
-            return Data.Settings.ShowExtensions ? $"{noExtName}{Extension}" : noExtName;
+            return App.Settings.ShowExtensions ? $"{noExtName}{Extension}" : noExtName;
         }
     }
 
     public bool IsRtlName => TextHelper.ContainsRtl(FullName);
 
-    public ShellItem ShellItem { get; set; }
-
     public bool IsHidden => FullName.StartsWith('.');
+
+    public void RefreshDisplayName() => OnPropertyChanged(nameof(DisplayName));
 
     /// <summary>
     /// Returns the extension (including the period ".").<br />
     /// Returns an empty string if file has no extension.
     /// </summary>
     public virtual string Extension => FileHelper.GetExtension(FullName);
-
-    public FilePath(ShellItem windowsPath)
-    {
-        ShellItem = windowsPath;
-        PathType = FilePathType.Windows;
-
-        FullPath = windowsPath.ParsingName;
-        FullName = windowsPath.GetDisplayName(ShellItemDisplayString.ParentRelativeParsing);
-
-        SpecialType = windowsPath.IsNonArchiveFolder()
-            ? SpecialFileType.Folder
-            : SpecialFileType.Regular;
-    }
 
     public FilePath(string androidPath,
                     string fullName = "",

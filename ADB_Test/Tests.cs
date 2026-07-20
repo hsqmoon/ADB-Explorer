@@ -565,47 +565,6 @@ namespace ADB_Test
         }
 
         [TestMethod]
-        public void DeviceDataValueComparisonTest()
-        {
-            DeviceData current = new()
-            {
-                Serial = "device-1",
-                State = DeviceState.Online,
-                Model = "model",
-                Product = "product",
-                Name = "device",
-                Features = ["shell_v2", "cmd"],
-                Usb = "1-1",
-                TransportId = "7",
-            };
-            DeviceData unchanged = new()
-            {
-                Serial = "device-1",
-                State = DeviceState.Online,
-                Model = "model",
-                Product = "product",
-                Name = "device",
-                Features = ["shell_v2", "cmd"],
-                Usb = "1-1",
-                TransportId = "7",
-            };
-            DeviceData changed = new()
-            {
-                Serial = "device-1",
-                State = DeviceState.Online,
-                Model = "model",
-                Product = "product",
-                Name = "device",
-                Features = ["shell_v2", "cmd", "abb"],
-                Usb = "1-1",
-                TransportId = "7",
-            };
-
-            Assert.IsTrue(Devices.DeviceDataEquals(current, unchanged));
-            Assert.IsFalse(Devices.DeviceDataEquals(current, changed));
-        }
-
-        [TestMethod]
         public void LogicalDeviceFromDeviceDataTest()
         {
             DeviceData source = new()
@@ -625,6 +584,30 @@ namespace ADB_Test
             Assert.AreEqual("Test Model", device.Name);
             Assert.AreEqual(AbstractDevice.DeviceStatus.Ok, device.Status);
             Assert.AreSame(source, device.DeviceData);
+        }
+
+        [TestMethod]
+        public void VisibleDeviceSnapshotIsFilteredAndSorted()
+        {
+            var newDevice = new NewDeviceViewModel(new());
+            var hiddenConnectService = new ConnectServiceViewModel(
+                new ConnectService("service", "192.168.0.2", "5555"), false);
+            var logicalDevice = new LogicalDeviceViewModel(LogicalDevice.New(new DeviceData
+            {
+                Serial = "device-1",
+                State = DeviceState.Online,
+                Model = "Device",
+            }), false);
+            DeviceViewModel[] source = [newDevice, hiddenConnectService, logicalDevice];
+
+            var visible = DeviceHelper.GetVisibleDevices(source);
+
+            CollectionAssert.AreEqual(
+                new DeviceViewModel[] { logicalDevice, newDevice },
+                visible);
+            CollectionAssert.AreEqual(
+                new DeviceViewModel[] { newDevice, hiddenConnectService, logicalDevice },
+                source);
         }
 
         [TestMethod]
@@ -715,7 +698,7 @@ namespace ADB_Test
                 .ToArray();
 
             var stopwatch = Stopwatch.StartNew();
-            root.AddUpdates(updates, executeInDispatcher: false);
+            root.AddUpdates(updates);
             stopwatch.Stop();
 
             Console.WriteLine($"Applied {fileCount:N0} progress updates in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
@@ -769,7 +752,6 @@ namespace ADB_Test
                 Assert.IsLessThan(2_000d, stopwatch.Elapsed.TotalMilliseconds);
                 Assert.AreEqual(directoryCount * filesPerDirectory, descendants.Count(file => !file.IsDirectory));
                 Assert.IsTrue(descendants.All(file => file.PathType is AbstractFile.FilePathType.Windows));
-                Assert.IsTrue(descendants.All(file => file.ShellItem is null));
             }
             finally
             {
@@ -927,43 +909,6 @@ namespace ADB_Test
             Assert.HasCount(serviceCount, current);
         }
 
-        [STATestMethod]
-        [TestCategory("Performance")]
-        public async Task DeviceLogicalIpMergePerformanceTest()
-        {
-            const int deviceCount = 5_000;
-            ObservableList<DeviceViewModel> devices = [];
-            List<LogicalDeviceViewModel> logicalDevices = new(deviceCount);
-            for (int i = 0; i < deviceCount; i++)
-            {
-                string id = $"service_{i}._adb-tls-connect._tcp.";
-                var logical = new LogicalDeviceViewModel(LogicalDevice.New(
-                    AdbRegEx.RE_DEVICE_NAME().Match($"{id} device model:model_{i} device:device_{i}")), false);
-                logicalDevices.Add(logical);
-                devices.Add(logical);
-                devices.Add(new PairingServiceViewModel(
-                    new PairingService(id, $"10.0.{i / 256}.{i % 256}", "37000"), false));
-            }
-
-            var stopwatch = Stopwatch.StartNew();
-            bool updated = await Devices.UpdateLogicalIp(devices);
-            stopwatch.Stop();
-
-            Console.WriteLine($"Merged IP addresses for {deviceCount:N0} logical devices in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
-            Assert.IsLessThan(500d, stopwatch.Elapsed.TotalMilliseconds);
-            Assert.IsTrue(updated);
-            Assert.IsTrue(logicalDevices.All(device => device.IsIpAddressValid));
-
-            stopwatch.Restart();
-            var predicate = DeviceHelper.CreateDevicePredicate(devices);
-            int visibleCount = devices.Count(device => predicate(device));
-            stopwatch.Stop();
-
-            Console.WriteLine($"Filtered {devices.Count:N0} device rows in {stopwatch.Elapsed.TotalMilliseconds:F1} ms");
-            Assert.IsLessThan(500d, stopwatch.Elapsed.TotalMilliseconds);
-            Assert.AreEqual(deviceCount, visibleCount);
-        }
-
         [TestMethod]
         public void FileOperationQueueConcurrencyGateTest()
         {
@@ -972,6 +917,8 @@ namespace ADB_Test
                 false, FileOperation.OperationType.Move, 1));
             Assert.IsFalse(FileOperationQueue.ShouldWaitForRunningGroup(
                 true, FileOperation.OperationType.Move, 1));
+            Assert.IsTrue(FileOperationQueue.ShouldWaitForRunningGroup(
+                true, FileOperation.OperationType.Move, 4));
             Assert.IsFalse(FileOperationQueue.ShouldWaitForRunningGroup(true, null, 0));
         }
     }

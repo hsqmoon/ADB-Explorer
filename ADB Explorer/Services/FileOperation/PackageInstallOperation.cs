@@ -75,34 +75,35 @@ public class PackageInstallOperation : AbstractShellFileOperation
             ? ADBService.EscapeAdbString(args[index])
             : ADBService.EscapeAdbShellString(args[index]);
 
-        var operationTask = PushPackage
-                ? ADBService.ExecuteDeviceAdbCommand(Device.ID, CancelTokenSource.Token, "install", args)
-                : ADBService.ExecuteVoidShellCommand(Device.ID, CancelTokenSource.Token, "pm", args);
+        _ = RunAsync(PushPackage
+            ? ADBService.ExecuteDeviceAdbCommand(Device.ID, CancelTokenSource.Token, "install", args)
+            : ADBService.ExecuteVoidShellCommand(Device.ID, CancelTokenSource.Token, "pm", args));
+    }
 
-        operationTask.ContinueWith((t) =>
+    private async Task RunAsync(Task<string> operationTask)
+    {
+        try
         {
-            if (t.Result == "")
+            string result = await operationTask.ConfigureAwait(false);
+            if (CancelTokenSource?.IsCancellationRequested is true)
             {
-                Status = OperationStatus.Completed;
-                StatusInfo = new CompletedShellProgressViewModel();
+                await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+                return;
             }
-            else
-            {
-                Status = OperationStatus.Failed;
-                StatusInfo = new FailedOpProgressViewModel(t.Result);
-            }
-        }, TaskContinuationOptions.OnlyOnRanToCompletion);
 
-        operationTask.ContinueWith((t) =>
+            await CompleteAsync(
+                string.IsNullOrEmpty(result) ? OperationStatus.Completed : OperationStatus.Failed,
+                string.IsNullOrEmpty(result)
+                    ? new CompletedShellProgressViewModel()
+                    : new FailedOpProgressViewModel(result)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
-            Status = OperationStatus.Canceled;
-            StatusInfo = new CanceledOpProgressViewModel();
-        }, TaskContinuationOptions.OnlyOnCanceled);
-
-        operationTask.ContinueWith((t) =>
+            await CompleteAsync(OperationStatus.Canceled, new CanceledOpProgressViewModel()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
         {
-            Status = OperationStatus.Failed;
-            StatusInfo = new FailedOpProgressViewModel(t.Exception.InnerException.Message);
-        }, TaskContinuationOptions.OnlyOnFaulted);
+            await CompleteAsync(OperationStatus.Failed, new FailedOpProgressViewModel(ex.GetBaseException().Message)).ConfigureAwait(false);
+        }
     }
 }

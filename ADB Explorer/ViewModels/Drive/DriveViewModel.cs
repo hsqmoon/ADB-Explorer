@@ -6,8 +6,6 @@ namespace ADB_Explorer.ViewModels;
 
 public class DriveViewModel : AbstractDrive
 {
-    private bool runtimeSettingsSubscribed;
-
     #region Full properties
 
     private Drive drive;
@@ -70,36 +68,9 @@ public class DriveViewModel : AbstractDrive
     {
         Drive = drive;
 
-        BrowseCommand = new(() => true, () => Data.RuntimeSettings.BrowseDrive = this);
+        BrowseCommand = new(() => true, () => (Application.Current as App)?.RequestDriveNavigation(this));
         SelectCommand = new(() => true, () => DriveSelected = true);
 
-        AttachRuntimeSettings();
-    }
-
-    internal void AttachRuntimeSettings()
-    {
-        if (runtimeSettingsSubscribed)
-            return;
-
-        Data.RuntimeSettings.PropertyChanged += RuntimeSettings_PropertyChanged;
-        runtimeSettingsSubscribed = true;
-    }
-
-    internal void DetachRuntimeSettings()
-    {
-        if (!runtimeSettingsSubscribed)
-            return;
-
-        Data.RuntimeSettings.PropertyChanged -= RuntimeSettings_PropertyChanged;
-        runtimeSettingsSubscribed = false;
-    }
-
-    private void RuntimeSettings_PropertyChanged(object sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName == nameof(AppRuntimeSettings.CollapseDrives) && Data.RuntimeSettings.CollapseDrives)
-        {
-            DriveSelected = false;
-        }
     }
 
     public void SetType(DriveType type)

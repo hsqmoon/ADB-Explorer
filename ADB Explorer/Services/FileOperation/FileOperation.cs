@@ -54,22 +54,16 @@ public abstract class FileOperation : ViewModelBase
         get => status;
         protected set
         {
-            void applyStatus()
+            if (Set(ref status, value))
             {
-                if (Set(ref status, value))
-                {
-                    CancelTokenSource = value is OperationStatus.InProgress ? new() : null;
+                var previousCancellation = CancelTokenSource;
+                CancelTokenSource = value is OperationStatus.InProgress ? new() : null;
+                previousCancellation?.Dispose();
 
-                    OnPropertyChanged(nameof(ValidationAllowed));
+                OnPropertyChanged(nameof(ValidationAllowed));
 
-                    LastProgress = 0;
-                }
+                LastProgress = 0;
             }
-
-            if (Dispatcher.CheckAccess())
-                applyStatus();
-            else
-                Dispatcher.Invoke(applyStatus);
         }
     }
 
@@ -77,13 +71,7 @@ public abstract class FileOperation : ViewModelBase
     public FileOpProgressViewModel StatusInfo
     {
         get => statusInfo;
-        set
-        {
-            if (Dispatcher.CheckAccess())
-                Set(ref statusInfo, value);
-            else
-                Dispatcher.Invoke(() => Set(ref statusInfo, value));
-        }
+        set => Set(ref statusInfo, value);
     }
 
     private bool isPastOp = false;
@@ -164,20 +152,6 @@ public abstract class FileOperation : ViewModelBase
             if (OperationName is OperationType.Rename)
                 return FileHelper.ConcatPaths(FilePath.ParentPath, FilePath.DisplayName);
             
-            // Display the original path instead of the temp folder for virtual items
-            if (this is FileSyncOperation sync && sync.OriginalShellItem is not null)
-            {
-                var originalPath = sync.OriginalShellItem.GetDisplayName(Vanara.Windows.Shell.ShellItemDisplayString.DesktopAbsoluteEditing);
-                if (originalPath is not null)
-                {
-                    originalPath = FileHelper.GetParentPath(originalPath);
-                    if (originalPath.StartsWith("This PC"))
-                        originalPath = originalPath[(originalPath.IndexOf('\\') + 1)..];
-
-                    return originalPath;
-                }
-            }
-
             return FilePath.ParentPath;
         }
     }
@@ -264,11 +238,11 @@ public abstract class FileOperation : ViewModelBase
         FilePath = filePath;
 
         SourceAction = new(
-            () => IsSourceNavigable && !Data.FileActions.ListingInProgress,
+            () => IsSourceNavigable && !App.FileActions.ListingInProgress,
             () => OpenLocation(false));
 
         TargetAction = new(
-            () => IsTargetNavigable && !Data.FileActions.ListingInProgress,
+            () => IsTargetNavigable && !App.FileActions.ListingInProgress,
             () => OpenLocation(true));
     }
 
@@ -284,25 +258,22 @@ public abstract class FileOperation : ViewModelBase
         {
             if (file.PathType is AbstractFile.FilePathType.Windows)
             {
-                if (this is FileSyncOperation sync && sync.OriginalShellItem is not null)
-                    sync.OriginalShellItem.ViewInExplorer();
-                else
-                    Process.Start("explorer.exe", file.ParentPath);
+                Process.Start("explorer.exe", file.ParentPath);
             }
             else
             {
                 if (!Device.Device.IsOpen)
-                    DeviceHelper.OpenDevice(Device.Device);
-
-                Data.RuntimeSettings.LocationToNavigate = new(file.ParentPath);
+                    DeviceHelper.OpenDevice(Device.Device, new(file.ParentPath));
+                else
+                    (Application.Current as App)?.RequestNavigation(new(file.ParentPath));
             }
         }
         else if (location is AdbLocation loc)
         {
-            if (!Device.Device.IsOpen)
-                DeviceHelper.OpenDevice(Device.Device);
-
-            Data.RuntimeSettings.LocationToNavigate = loc;
+                if (!Device.Device.IsOpen)
+                    DeviceHelper.OpenDevice(Device.Device, loc);
+                else
+                    (Application.Current as App)?.RequestNavigation(loc);
         }
         else
             throw new NotSupportedException();
@@ -316,11 +287,52 @@ public abstract class FileOperation : ViewModelBase
         StatusInfo.IsValidationInProgress = value;
         OnPropertyChanged(nameof(ValidationAllowed));
 
-        if (Data.FileActions.SelectedFileOps.Value.Contains(this))
-            Data.RuntimeSettings.RefreshFileOpControls = true;
+        if (App.FileActions.SelectedFileOps.Value.Contains(this))
+            AppActions.RaiseCanExecuteChanged(FileActionType.FileOpValidate);
     }
 
     public abstract void Start();
+
+    protected async Task CompleteAsync(
+        OperationStatus finalStatus,
+        FileOpProgressViewModel finalStatusInfo,
+        Action applyBeforeStatus = null)
+    {
+        void applyStatusInfo()
+        {
+            applyBeforeStatus?.Invoke();
+            StatusInfo = finalStatusInfo;
+        }
+
+        void applyStatus()
+        {
+            Status = finalStatus;
+        }
+
+        try
+        {
+            if (Application.Current is App app)
+            {
+                await app.EnqueueUiAsync("file-operation.complete.info", applyStatusInfo).ConfigureAwait(false);
+                await app.EnqueueUiAsync("file-operation.complete.status", applyStatus).ConfigureAwait(false);
+                return;
+            }
+
+            if (Dispatcher.CheckAccess())
+            {
+                applyStatusInfo();
+                applyStatus();
+                return;
+            }
+
+        }
+        catch (OperationCanceledException) when (Dispatcher.HasShutdownStarted)
+        { }
+        catch (Exception ex)
+        {
+            App.ReportBackgroundFailure(ex, "file-operation.complete");
+        }
+    }
 
     /// <summary>
     /// Changes the operation status from None to Waiting.

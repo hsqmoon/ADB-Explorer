@@ -3,8 +3,6 @@ using ADB_Explorer.Helpers;
 using ADB_Explorer.Services;
 using ADB_Explorer.Services.AppInfra;
 using ADB_Explorer.ViewModels;
-using Vanara.PInvoke;
-using Vanara.Windows.Shell;
 
 namespace ADB_Explorer.Models;
 
@@ -121,6 +119,10 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
 
     public FileNameSort SortName { get; private set; }
     private bool iconLoaded;
+    private int iconLoadScheduled;
+    private int iconLoadVersion;
+    private CancellationToken sessionIconCancellationToken;
+    private CancellationTokenSource iconRequestCancellation;
 
     public IEnumerable<FileDescriptor> Descriptors { get; private set; }
 
@@ -172,7 +174,7 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
 
         TypeName = GetTypeName();
         if (loadIcon)
-            LoadIcon();
+            LoadIconAsync();
         IsTemp = isTemp;
         
         SortName = new(fileName);
@@ -195,20 +197,6 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
                other.DateModified,
                loadIcon: false)
     { }
-
-    public FileClass(ShellItem windowsPath)
-        : base(windowsPath)
-    {
-        Type = IsDirectory ? FileType.Folder : FileType.File;
-        IsLink = windowsPath.IsLink;
-
-        (Size, ModifiedTime) = FileHelper.GetShellSizeDate(windowsPath, IsDirectory);
-
-        TypeName = GetTypeName();
-        LoadIcon();
-
-        SortName = new(FullName);
-    }
 
     public FileClass(FileDescriptor fileDescriptor)
         : base(fileDescriptor.SourcePath, fileDescriptor.Name, fileDescriptor.IsDirectory ? FileType.Folder : FileType.File)
@@ -239,19 +227,101 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
     public void UpdateType()
     {
         TypeName = GetTypeName();
-        if (iconLoaded)
-            GetIcon();
+        if (iconLoaded || Volatile.Read(ref iconLoadScheduled) == 1)
+        {
+            iconLoaded = false;
+            CancelIconLoad();
+
+            if (Application.Current is App)
+                LoadIconAsync();
+        }
         OnPropertyChanged(nameof(ExtensionIsGlyph));
         OnPropertyChanged(nameof(ExtensionIsFontIcon));
     }
 
-    public void LoadIcon()
+    public void LoadIconAsync()
     {
-        if (iconLoaded)
+        if (iconLoaded || Interlocked.Exchange(ref iconLoadScheduled, 1) == 1)
             return;
 
-        GetIcon();
-        iconLoaded = true;
+        var requestCancellation = sessionIconCancellationToken.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(sessionIconCancellationToken)
+            : new CancellationTokenSource();
+        var previousCancellation = Interlocked.Exchange(ref iconRequestCancellation, requestCancellation);
+        previousCancellation?.Cancel();
+        previousCancellation?.Dispose();
+        int version = Volatile.Read(ref iconLoadVersion);
+        string fileName = FullName;
+        SpecialFileType specialType = SpecialType;
+
+        _ = LoadAsync();
+
+        async Task LoadAsync()
+        {
+            try
+            {
+                if (Application.Current is not App app)
+                {
+                    if (version == Volatile.Read(ref iconLoadVersion))
+                        Interlocked.Exchange(ref iconLoadScheduled, 0);
+                    return;
+                }
+
+                var icons = await app.GetFileIconsAsync(
+                    fileName,
+                    specialType,
+                    requestCancellation.Token).ConfigureAwait(false);
+
+                app.EnqueueUiLatest(
+                    $"file.icon.{RuntimeHelpers.GetHashCode(this)}",
+                    "file.icon",
+                    () =>
+                    {
+                        if (version != Volatile.Read(ref iconLoadVersion))
+                            return;
+
+                        Interlocked.Exchange(ref iconLoadScheduled, 0);
+                        ApplyIcons(icons);
+                        iconLoaded = true;
+                    });
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+            {
+                if (version == Volatile.Read(ref iconLoadVersion))
+                    Interlocked.Exchange(ref iconLoadScheduled, 0);
+            }
+            catch (Exception ex)
+            {
+                if (version == Volatile.Read(ref iconLoadVersion))
+                    Interlocked.Exchange(ref iconLoadScheduled, 0);
+                App.ReportBackgroundFailure(ex, "file.icon");
+            }
+            finally
+            {
+                if (ReferenceEquals(
+                    Interlocked.CompareExchange(ref iconRequestCancellation, null, requestCancellation),
+                    requestCancellation))
+                {
+                    requestCancellation.Dispose();
+                }
+            }
+
+        }
+    }
+
+    internal void SetIconCancellationToken(CancellationToken cancellationToken)
+    {
+        sessionIconCancellationToken = cancellationToken;
+        CancelIconLoad();
+    }
+
+    internal void CancelIconLoad()
+    {
+        var cancellation = Interlocked.Exchange(ref iconRequestCancellation, null);
+        cancellation?.Cancel();
+        cancellation?.Dispose();
+        Interlocked.Increment(ref iconLoadVersion);
+        Interlocked.Exchange(ref iconLoadScheduled, 0);
     }
 
     public void UpdateSpecialType()
@@ -365,33 +435,11 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
                 if (!includeContent)
                     return null;
 
-                var operations = vfdo.Operations;
-
-                // When a VFDO that does not contain folders is sent to the clipboard, the shell immediately requests the file contents.
-                // To prevent this, we refuse to give data when the app is focused.
-                // When a legitimate request for data is made, the app can't be focused during the first file, but it can become focused again for the next files.
-                lock (operations)
-                {
-                    var uninitiated = operations.Where(op => op.Status is FileOperation.OperationStatus.None).ToList();
-                    if (Data.CopyPaste.IsClipboard
-                        && uninitiated.Count > 0
-                        && App.Current.Dispatcher.Invoke(() => App.Current.MainWindow.IsActive))
-                    {
-                        return null;
-                    }
-
-#if !DEPLOY
-                    DebugLog.PrintLine($"Total uninitiated operations: {uninitiated.Count}");
-#endif
-
-                    // Add all uninitiated operations to the queue.
-                    // For all consecutive files this list will be empty.
-                    if (uninitiated.Count > 0)
-                        App.Current.Dispatcher.Invoke(() => Data.FileOpQ.AddOperations(uninitiated));
-                }
+                var queueCompletion = vfdo.EnsureOperationsQueued();
 
                 // Wait for the operation to complete
-                fileOp.WaitForCompletion();
+                if (!fileOp.WaitForShellStreamCompletion(queueCompletion, vfdo))
+                    return null;
 
                 if (fileOp.Status is not FileOperation.OperationStatus.Completed)
                     return null;
@@ -447,37 +495,49 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
                 var sourcePath = op.FilePath.FullPath;
                 var dispatcher = op.Dispatcher;
 
-                _ = Task.Run(() =>
+                _ = DeleteMovedSourceAsync();
+
+                async Task DeleteMovedSourceAsync()
                 {
-                    op.WaitForCompletion();
+                    await op.Completion.ConfigureAwait(false);
 
                     try
                     {
-                        ShellFileOperation.SilentDelete(device, sourcePath);
+                        await ADBService.ExecuteVoidShellCommand(
+                            device.ID,
+                            CancellationToken.None,
+                            "rm",
+                            "-rf",
+                            ADBService.EscapeAdbShellString(sourcePath)).ConfigureAwait(false);
                     }
                     catch
                     {
                         return;
                     }
 
-                    if (dispatcher.HasShutdownStarted)
+                    if (dispatcher.HasShutdownStarted || Application.Current is not App app)
                         return;
 
-                    _ = dispatcher.BeginInvoke(new Action(() =>
+                    app.EnqueueUiLatest("virtual-files.source-removed", "virtual-files.source-removed", () =>
                     {
-                        if (device.ID == Data.CurrentADBDevice?.ID
-                            && FileHelper.GetParentPath(sourcePath) == Data.CurrentPath
-                            && Data.DirList is not null)
+                        var session = App.ActiveDirectorySession;
+                        if (device.ID == App.ActiveAdbDevice?.ID
+                            && FileHelper.GetParentPath(sourcePath) == App.ExplorerState.CurrentPath
+                            && session is not null)
                         {
-                            Data.DirList.FileList.RemoveAll(f => f.FullPath == sourcePath);
+                            session.RemoveItems(session.FileList.Where(f => f.FullPath == sourcePath));
                             FileActionLogic.ScheduleUpdateFileActions();
                         }
-                    }), DispatcherPriority.Background);
-                });
+                    });
+                }
 
-                if (vfdo.Operations.All(operation => operation.Status is FileOperation.OperationStatus.Completed))
-                    _ = op.Dispatcher.BeginInvoke(
-                        new Action(Data.CopyPaste.Clear), DispatcherPriority.Background);
+                if (vfdo.AreOperationsCompleted && Application.Current is App app)
+                {
+                    app.EnqueueUiLatest(
+                        "virtual-files.clipboard-complete",
+                        "virtual-files.clipboard-complete",
+                        App.CopyPaste.Clear);
+                }
             }
         }
         finally
@@ -487,16 +547,14 @@ public class FileClass : FilePath, IFileStat, IBrowserItem
         }
     }
 
-    public void GetIcon()
+    private void ApplyIcons(IReadOnlyList<BitmapSource> icons)
     {
-        var icons = FileToIconConverter.GetImage(this, true).ToArray();
-        
-        if (icons.Length > 0 && icons[0] is BitmapSource icon)
+        if (icons.Count > 0 && icons[0] is BitmapSource icon)
             Icon = icon;
         else
             Icon = null;
 
-        if (icons.Length > 1 && icons[1] is BitmapSource icon2)
+        if (icons.Count > 1 && icons[1] is BitmapSource icon2)
             IconOverlay = icon2;
         else
             IconOverlay = null;

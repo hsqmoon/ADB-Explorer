@@ -1,6 +1,7 @@
 ﻿using ADB_Explorer.Helpers;
 using ADB_Explorer.Models;
 using ADB_Explorer.Services;
+using ADB_Explorer.ViewModels;
 
 namespace ADB_Explorer;
 
@@ -9,12 +10,38 @@ namespace ADB_Explorer;
 /// </summary>
 public partial class App : Application
 {
+    private const int MAX_COMMAND_LOG_ENTRIES = 2000;
     private static string SettingsFilePath;
     private static string AppRootPath => AppContext.BaseDirectory;
     private static string ConfigDirectoryPath => Path.Combine(AppRootPath, "config");
     private static string LogDirectoryPath => Path.Combine(AppRootPath, "log");
     private static string CrashLogPath => Path.Combine(LogDirectoryPath, "crash.log");
     private static readonly JsonSerializerSettings JsonSettings = new() { TypeNameHandling = TypeNameHandling.None };
+    private static readonly object commandLogLock = new();
+    private static readonly Queue<Log> pendingCommandLogs = new();
+    private static readonly AppSettings settings = new();
+    private static readonly AppRuntimeSettings runtimeSettings = new(settings);
+    private static readonly CopyPasteService copyPaste = new();
+    private static readonly ObservableCollection<Log> commandLog = [];
+    private static readonly FileActionsEnable fileActions = new();
+    private static readonly MDNS mdnsService = new();
+    private AppRuntime appRuntime;
+    private Task<SettingsLoadResult> settingsLoadTask = Task.FromResult(
+        new SettingsLoadResult(new Dictionary<string, object>(), null));
+    private int settingsInitialized;
+    private long startupTimestamp;
+
+    public static AppSettings Settings => settings;
+    public static AppRuntimeSettings RuntimeSettings => runtimeSettings;
+    public static CopyPasteService CopyPaste => copyPaste;
+    internal static ObservableCollection<Log> CommandLog => commandLog;
+    public static FileActionsEnable FileActions => fileActions;
+    public static MDNS MdnsService => mdnsService;
+    public static PairingQrClass QrClass { get; internal set; }
+    public static Version AppVersion => new(ADB_Explorer.Properties.AppGlobal.AppVersion);
+    public static string AppDataPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        AdbExplorerConst.APP_DATA_FOLDER);
 
     public App()
     {
@@ -28,71 +55,32 @@ public partial class App : Application
 
     private void Application_Startup(object sender, StartupEventArgs e)
     {
-        // Read to force it to be set to Windows' culture
-        _ = Data.Settings.OriginalCulture;
-
+        startupTimestamp = Stopwatch.GetTimestamp();
         AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
         TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
 
-        // Runtime app data used for transient cleanup only.
-        Data.AppDataPath = Path.Combine(Environment.GetEnvironmentVariable("USERPROFILE"), "AppData", "Local", AdbExplorerConst.APP_DATA_FOLDER);
-
-        if (e.Args.Length > 0)
+        string settingsPathError = null;
+        bool customSettingsPath = e.Args.Length > 0;
+        if (customSettingsPath)
         {
-            // verify that the provided path is valid - it should not exist as a directory, but its parent directory should exist
-            if (!Directory.Exists(FileHelper.GetParentPath(e.Args[0])) || Directory.Exists(e.Args[0]))
+            try
             {
-                MessageBox.Show($"{Strings.Resources.S_PATH_INVALID}\n\n{e.Args[0]}", Strings.Resources.S_CUSTOM_DATA_PATH, MessageBoxButton.OK, MessageBoxImage.Error);
-                
-                Current.Shutdown(1);
-                return;
+                SettingsFilePath = Path.GetFullPath(e.Args[0]);
             }
-
-            SettingsFilePath = Path.GetFullPath(e.Args[0]);
+            catch (Exception ex)
+            {
+                settingsPathError = ex.Message;
+                SettingsFilePath = Path.Combine(ConfigDirectoryPath, AdbExplorerConst.APP_SETTINGS_FILE);
+            }
         }
         else
             SettingsFilePath = Path.Combine(ConfigDirectoryPath, AdbExplorerConst.APP_SETTINGS_FILE);
-        
-        try
-        {
-            // if settings file exists in local app data - try to read it from there, otherwise try to read it from the isolated storage (old method)
-            if (File.Exists(SettingsFilePath))
-            {
-                using StreamReader appDataReader = new(SettingsFilePath);
-                ReadSettingsFile(appDataReader);
-            }
-            else
-            {
-                EnsurePersistenceDirectories();
 
-                using IsolatedStorageFileStream stream = new(AdbExplorerConst.APP_SETTINGS_FILE,
-                                                             FileMode.Open,
-                                                             IsolatedStorageFile.GetUserStoreForDomain());
-                using StreamReader reader = new(stream);
-                ReadSettingsFile(reader);
-            }
-
-            if (!Data.Settings.UICulture.Equals(CultureInfo.InvariantCulture))
-            {
-                Thread.CurrentThread.CurrentUICulture =
-                Thread.CurrentThread.CurrentCulture = Data.Settings.UICulture;
-            }
-            
-#if !DEPLOY
-            DebugLog.Initialize();
-#endif
-
-        }
-        catch
-        {
-            // in any case of failing to read the settings, try to write them instead
-            // will happen on first ever launch, or after resetting app settings
-
-            WriteSettings();
-        }
-
-        // Complete the one-time emoji and font parsing before the main window becomes visible.
-        _ = Emoji.Wpf.EmojiData.AllGroups.Count;
+        settingsLoadTask = settingsPathError is null
+            ? Task.Run(() => LoadSettings(SettingsFilePath, customSettingsPath))
+            : Task.FromResult(new SettingsLoadResult(
+                new Dictionary<string, object>(),
+                settingsPathError));
 
         //Select the text in a TextBox when it receives focus.
         EventManager.RegisterClassHandler(typeof(TextBox), TextBox.PreviewMouseLeftButtonDownEvent,
@@ -102,36 +90,344 @@ public partial class App : Application
         EventManager.RegisterClassHandler(typeof(TextBox), TextBox.MouseDoubleClickEvent,
             new RoutedEventHandler(SelectAllText));
 
+        ScheduleDragCleanup();
 
-        void ReadSettingsFile(StreamReader reader)
+        var mainWindow = new MainWindow();
+        MainWindow = mainWindow;
+        _ = InitializeApplicationAsync(mainWindow);
+    }
+
+    private async Task InitializeApplicationAsync(MainWindow mainWindow)
+    {
+        try
         {
-            while (!reader.EndOfStream)
+            await System.Windows.Threading.Dispatcher.Yield(DispatcherPriority.Input);
+            if (mainWindow.Dispatcher.HasShutdownStarted)
+                return;
+
+            var settings = await settingsLoadTask.ConfigureAwait(true);
+            if (mainWindow.Dispatcher.HasShutdownStarted)
+                return;
+
+            if (settings.Error is not null)
             {
-                string[] keyValue = reader.ReadLine().TrimEnd(';').Split(':', 2);
-                try
-                {
-                    var jObj = JsonConvert.DeserializeObject(keyValue[1], JsonSettings);
-                    Properties[keyValue[0]] = jObj;
-                }
-                catch (Exception)
-                {
-                    Properties[keyValue[0]] = keyValue[1];
-                }
+                MessageBox.Show(
+                    $"{Strings.Resources.S_PATH_INVALID}\n\n{settings.Error}",
+                    Strings.Resources.S_CUSTOM_DATA_PATH,
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                Shutdown(1);
+                return;
+            }
+
+            foreach (var item in settings.Values)
+                Properties[item.Key] = item.Value;
+
+            Volatile.Write(ref settingsInitialized, 1);
+            PerformanceTrace.Log.StartupStage(
+                "startup.settings",
+                Stopwatch.GetElapsedTime(startupTimestamp).Ticks / 10);
+
+            if (!App.Settings.UICulture.Equals(CultureInfo.InvariantCulture))
+            {
+                Thread.CurrentThread.CurrentUICulture =
+                Thread.CurrentThread.CurrentCulture = App.Settings.UICulture;
+            }
+
+#if DEBUG
+            await Task.Run(() => DebugLog.Initialize()).ConfigureAwait(true);
+#endif
+
+            var settingsModelTask = Task.Run(UISettings.Init);
+            var notificationsTask = SettingsHelper.GetNotificationsAsync();
+            mainWindow.InitializeTheme();
+            mainWindow.InitializeFont();
+            mainWindow.InitializeRenderMode();
+
+            long viewStart = Stopwatch.GetTimestamp();
+            mainWindow.InitializeView();
+            var viewDuration = Stopwatch.GetElapsedTime(viewStart);
+            PerformanceTrace.Log.StartupStage(
+                "startup.view",
+                Stopwatch.GetElapsedTime(startupTimestamp).Ticks / 10);
+            PerformanceTrace.Log.StartupStage("startup.view-build", viewDuration.Ticks / 10);
+
+            await settingsModelTask.ConfigureAwait(true);
+            if (mainWindow.Dispatcher.HasShutdownStarted)
+                return;
+
+            mainWindow.InitializeSettingsSources();
+            mainWindow.InitializeToolbars();
+            mainWindow.InitializeSettingsState();
+            mainWindow.InitializeFileOperationModel();
+            mainWindow.InitializeFileOperationColumns();
+            mainWindow.InitializeFileOperationFilter();
+            mainWindow.ActivateRuntime();
+
+            long firstFrameStart = Stopwatch.GetTimestamp();
+            mainWindow.Show();
+            appRuntime?.NotifyUiReady();
+            PerformanceTrace.Log.StartupStage(
+                "startup.first-frame",
+                Stopwatch.GetElapsedTime(startupTimestamp).Ticks / 10);
+            var firstFrameDuration = Stopwatch.GetElapsedTime(firstFrameStart);
+            PerformanceTrace.Log.StartupStage("startup.window-show", firstFrameDuration.Ticks / 10);
+
+            mainWindow.ShowAuxiliaryWindows();
+            _ = PublishNotificationsAsync(notificationsTask);
+        }
+        catch (Exception ex)
+        {
+            WriteCrashLog(ex, "startup.initialize-window");
+            MessageBox.Show(ex.Message, "ADB Explorer", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown(1);
+        }
+    }
+
+    private async Task PublishNotificationsAsync(Task<IReadOnlyList<Notification>> notificationsTask)
+    {
+        try
+        {
+            var notifications = await notificationsTask.ConfigureAwait(false);
+            foreach (var notification in notifications)
+            {
+                await EnqueueUiAsync(
+                    "startup.notification",
+                    () => UISettings.Notifications.Add(notification)).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            ReportBackgroundFailure(ex, "startup.notifications");
+        }
+    }
+
+    private static SettingsLoadResult LoadSettings(string settingsFilePath, bool customSettingsPath)
+    {
+        if (customSettingsPath
+            && (!Directory.Exists(FileHelper.GetParentPath(settingsFilePath))
+                || Directory.Exists(settingsFilePath)))
+        {
+            return new(new Dictionary<string, object>(), settingsFilePath);
+        }
+
+        try
+        {
+            if (File.Exists(settingsFilePath))
+            {
+                using StreamReader appDataReader = new(settingsFilePath);
+                return new(ReadSettingsFile(appDataReader), null);
+            }
+
+            EnsurePersistenceDirectories();
+            using IsolatedStorageFileStream stream = new(
+                AdbExplorerConst.APP_SETTINGS_FILE,
+                FileMode.Open,
+                IsolatedStorageFile.GetUserStoreForDomain());
+            using StreamReader reader = new(stream);
+            return new(ReadSettingsFile(reader), null);
+        }
+        catch
+        {
+            return new(new Dictionary<string, object>(), null);
+        }
+    }
+
+    private static Dictionary<string, object> ReadSettingsFile(StreamReader reader)
+    {
+        Dictionary<string, object> values = [];
+        while (reader.ReadLine() is string line)
+        {
+            string[] keyValue = line.TrimEnd(';').Split(':', 2);
+            if (keyValue.Length != 2 || string.IsNullOrWhiteSpace(keyValue[0]))
+                continue;
+
+            try
+            {
+                values[keyValue[0]] = JsonConvert.DeserializeObject(keyValue[1], JsonSettings);
+            }
+            catch (JsonException)
+            {
+                values[keyValue[0]] = keyValue[1];
             }
         }
 
-        ScheduleDragCleanup();
+        return values;
     }
 
     private void Application_Exit(object sender, ExitEventArgs e)
     {
-        Data.FileOpQ.Stop();
-        WriteSettings();
+        appRuntime?.FileOperations.Stop();
+        StopRuntime();
+        if (Volatile.Read(ref settingsInitialized) != 0)
+            WriteSettings();
 
-        if (Data.Settings.UnrootOnDisconnect is true)
-            ADBService.Unroot(Data.CurrentADBDevice);
+        if (Volatile.Read(ref settingsInitialized) != 0
+            && App.Settings.UnrootOnDisconnect is true)
+            ADBService.Unroot(ActiveAdbDevice);
 
         ScheduleDragCleanup();
+    }
+
+    internal IUiWorkScheduler AttachRuntime(MainWindow mainWindow)
+    {
+        if (appRuntime is not null)
+            throw new InvalidOperationException("The application runtime is already attached.");
+
+        appRuntime = new(mainWindow);
+        return appRuntime.UiScheduler;
+    }
+
+    internal void StartRuntime() => appRuntime?.Start();
+
+    internal void RefreshDevices() => appRuntime?.RefreshDevices();
+
+    internal Task RestartAdbServerAsync() =>
+        appRuntime?.RestartAdbServerAsync() ?? Task.CompletedTask;
+
+    internal Task KillAdbProcessAsync() =>
+        appRuntime?.KillAdbProcessAsync() ?? Task.CompletedTask;
+
+    internal void LoadHistoryDevices() => appRuntime?.LoadHistoryDevices();
+
+    internal void RequestUi(UiCommand command) => appRuntime?.RequestUi(command);
+
+    internal void RequestNavigation(AdbLocation location) => appRuntime?.RequestNavigation(location);
+
+    internal void RequestPathNavigation(string path) => appRuntime?.RequestPathNavigation(path);
+
+    internal void RequestDriveNavigation(DriveViewModel drive) => appRuntime?.RequestDriveNavigation(drive);
+
+    internal void RequestFileNavigation(FileClass file) => appRuntime?.RequestFileNavigation(file);
+
+    internal bool ConsumeBackForwardNavigation() => appRuntime?.ConsumeBackForwardNavigation() is true;
+
+    internal DirectorySession CurrentDirectorySession => appRuntime?.CurrentDirectorySession;
+
+    internal static DirectorySession ActiveDirectorySession =>
+        (Current as App)?.CurrentDirectorySession;
+
+    public static FileOperationQueue ActiveFileOperations =>
+        (Current as App)?.appRuntime?.FileOperations;
+
+    public static Devices ActiveDevices =>
+        (Current as App)?.appRuntime?.Devices;
+
+    public static ADBService.AdbDevice ActiveAdbDevice
+    {
+        get => (Current as App)?.appRuntime?.CurrentAdbDevice;
+        internal set
+        {
+            if ((Current as App)?.appRuntime is AppRuntime runtime)
+                runtime.CurrentAdbDevice = value;
+        }
+    }
+
+    public static ExplorerState ExplorerState =>
+        (Current as App)?.appRuntime?.ExplorerState;
+
+    internal void CloseDirectorySession() => appRuntime?.CloseDirectorySession();
+
+    internal void FollowLink(string target) => appRuntime?.FollowLink(target);
+
+    internal void SetExplorerSource(System.Collections.IEnumerable source) => appRuntime?.SetExplorerSource(source);
+
+    internal void SelectExplorerItem(object item) => appRuntime?.SelectExplorerItem(item);
+
+    internal void SelectExplorerItems(IEnumerable<FileClass> items, DirectorySession expectedSession) =>
+        appRuntime?.SelectExplorerItems(items, expectedSession);
+
+    internal void RefreshPackages() => appRuntime?.RefreshPackages();
+
+    internal Task<IReadOnlyList<BitmapSource>> GetFileIconsAsync(
+        string fileName,
+        AbstractFile.SpecialFileType specialType,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.ShellIcons.GetIconsAsync(fileName, specialType, cancellationToken)
+        ?? Task.FromResult<IReadOnlyList<BitmapSource>>([]);
+
+    internal Task<BitmapSource> GetPreviewIconAsync(
+        string fileName,
+        AbstractFile.SpecialFileType specialType,
+        int iconSize,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.ShellIcons.GetPreviewIconAsync(fileName, specialType, iconSize, cancellationToken)
+        ?? Task.FromResult<BitmapSource>(null);
+
+    internal void EnqueueUiLatest(string key, string workName, Action action) =>
+        appRuntime?.UiScheduler.EnqueueLatest(key, workName, action);
+
+    internal ValueTask EnqueueUiAsync(
+        string workName,
+        Action action,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.UiScheduler.EnqueueAsync(workName, action, cancellationToken) ?? ValueTask.CompletedTask;
+
+    internal Task<ClipboardSnapshot> ReadClipboardAsync(
+        string currentDeviceId,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.ReadClipboardAsync(currentDeviceId, cancellationToken)
+        ?? Task.FromResult(ClipboardSnapshot.Empty);
+
+    internal Task SetClipboardAsync(
+        VirtualFileDataObject dataObject,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.SetClipboardAsync(dataObject, cancellationToken) ?? Task.CompletedTask;
+
+    internal Task ClearClipboardAsync(
+        bool clearSystemClipboard,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.ClearClipboardAsync(clearSystemClipboard, cancellationToken) ?? Task.CompletedTask;
+
+    internal Task<bool> SetClipboardTextAsync(
+        string text,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.SetClipboardTextAsync(text, cancellationToken) ?? Task.FromResult(false);
+
+    internal Task<string> ReadClipboardTextAsync(CancellationToken cancellationToken = default) =>
+        appRuntime?.ReadClipboardTextAsync(cancellationToken) ?? Task.FromResult("");
+
+    internal Task<DropSnapshot> ReadDropAsync(
+        IDataObject dataObject,
+        string currentDeviceId,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.ReadDropAsync(dataObject, currentDeviceId, cancellationToken)
+        ?? Task.FromResult(DropSnapshot.Empty);
+
+    internal Task<ShellMaterializationSnapshot> MaterializeDropAsync(
+        IDataObject dataObject,
+        FileDescriptor[] descriptors,
+        bool hasShellIdList,
+        bool hasFileContents,
+        string targetDirectory,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.MaterializeDropAsync(
+            dataObject,
+            descriptors,
+            hasShellIdList,
+            hasFileContents,
+            targetDirectory,
+            cancellationToken)
+        ?? Task.FromResult(ShellMaterializationSnapshot.Empty);
+
+    internal Task<ShellMaterializationSnapshot> MaterializeClipboardAsync(
+        FileDescriptor[] descriptors,
+        bool hasShellIdList,
+        bool hasFileContents,
+        string targetDirectory,
+        CancellationToken cancellationToken = default) =>
+        appRuntime?.MaterializeClipboardAsync(
+            descriptors,
+            hasShellIdList,
+            hasFileContents,
+            targetDirectory,
+            cancellationToken)
+        ?? Task.FromResult(ShellMaterializationSnapshot.Empty);
+
+    internal void StopRuntime()
+    {
+        appRuntime?.Dispose();
+        appRuntime = null;
     }
 
     private static void ScheduleDragCleanup()
@@ -141,7 +437,7 @@ public partial class App : Application
             string[] directories;
             try
             {
-                directories = Directory.GetDirectories(Data.AppDataPath, "drag-*");
+                directories = Directory.GetDirectories(App.AppDataPath, "drag-*");
             }
             catch
             {
@@ -166,7 +462,7 @@ public partial class App : Application
 
     private void WriteSettings()
     {
-        if (Data.RuntimeSettings.ResetAppSettings)
+        if (App.RuntimeSettings.ResetAppSettings)
         {
             try
             {
@@ -275,6 +571,53 @@ public partial class App : Application
         catch
         { }
     }
+
+    internal static void ReportBackgroundFailure(Exception exception, string source) => WriteCrashLog(exception, source);
+
+    internal static void AddCommandLog(string content)
+    {
+        if (!Settings.EnableLog || RuntimeSettings.IsLogPaused)
+            return;
+
+        var log = new Log(content);
+        lock (commandLogLock)
+        {
+            while (pendingCommandLogs.Count >= MAX_COMMAND_LOG_ENTRIES)
+                pendingCommandLogs.Dequeue();
+
+            pendingCommandLogs.Enqueue(log);
+        }
+
+        if (Current is App app)
+            app.EnqueueUiLatest("command-log.collection", "command-log.collection", FlushPendingCommandLogs);
+    }
+
+    private static void FlushPendingCommandLogs()
+    {
+        List<Log> logsToAdd = [];
+        lock (commandLogLock)
+        {
+            while (pendingCommandLogs.Count > 0 && logsToAdd.Count < 8)
+                logsToAdd.Add(pendingCommandLogs.Dequeue());
+        }
+
+        foreach (var log in logsToAdd)
+            CommandLog.Add(log);
+
+        int overflow = CommandLog.Count - MAX_COMMAND_LOG_ENTRIES;
+        for (int index = 0; index < overflow; index++)
+            CommandLog.RemoveAt(0);
+
+        lock (commandLogLock)
+        {
+            if (pendingCommandLogs.Count > 0 && Current is App app)
+                app.EnqueueUiLatest("command-log.collection", "command-log.collection", FlushPendingCommandLogs);
+        }
+    }
+
+    private sealed record SettingsLoadResult(
+        IReadOnlyDictionary<string, object> Values,
+        string Error);
 
     private static void EnsurePersistenceDirectories()
     {

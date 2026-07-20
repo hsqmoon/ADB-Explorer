@@ -107,7 +107,7 @@ namespace ADB_Explorer.Models
         {
             get
             {
-                if (Data.CurrentDisplayNames.TryGetValue(DisplayName, out var name))
+                if (App.ExplorerState.CurrentDisplayNames.TryGetValue(DisplayName, out var name))
                     return name;
 
                 return DisplayName;
@@ -118,10 +118,10 @@ namespace ADB_Explorer.Models
         {
             get
             {
-                if (Data.CurrentDisplayNames.TryGetValue(StringFromLocation(Location), out var name))
+                if (App.ExplorerState.CurrentDisplayNames.TryGetValue(StringFromLocation(Location), out var name))
                     return name;
 
-                if (Data.CurrentDisplayNames.TryGetValue(DisplayName, out var display))
+                if (App.ExplorerState.CurrentDisplayNames.TryGetValue(DisplayName, out var display))
                     return display;
 
                 return FileHelper.GetFullName(DisplayName);
@@ -135,19 +135,19 @@ namespace ADB_Explorer.Models
                 if (Location is SpecialLocation.DriveView)
                     return AppActions.Icons[FileAction.FileActionType.Home];
 
-                return Data.DevicesObject.Current?.Drives.FirstOrDefault(d => d.Path == Path)?.DriveIcon
+                return App.ActiveDevices.Current?.Drives.FirstOrDefault(d => d.Path == Path)?.DriveIcon
                     ?? null;
             }
         }
 
         public SubMenu IconSubMenu =>
-            new SubMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => Data.RuntimeSettings.LocationToNavigate = this), HistoryName), Icon);
+            new SubMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => (Application.Current as App)?.RequestNavigation(this)), HistoryName), Icon);
 
         public SubMenu ExcessSubMenu =>
-            new SubMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => Data.RuntimeSettings.LocationToNavigate = this), NavigationName), Icon);
+            new SubMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => (Application.Current as App)?.RequestNavigation(this)), NavigationName), Icon);
 
         public TextMenu NameSubMenu =>
-            new TextMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => Data.RuntimeSettings.LocationToNavigate = this), NavigationName));
+            new TextMenu(new FileAction(FileAction.FileActionType.None, new(() => true, () => (Application.Current as App)?.RequestNavigation(this)), NavigationName));
 
         public override bool Equals(object other)
         {
@@ -197,7 +197,7 @@ namespace ADB_Explorer.Models
 
             if (!NavigationAvailable(direction))
             {
-                if (Data.FileActions.IsDriveViewVisible)
+                if (App.FileActions.IsDriveViewVisible)
                     DriveHelper.ClearSelectedDrives();
 
                 return false;
@@ -208,7 +208,7 @@ namespace ADB_Explorer.Models
                 : FileAction.FileActionType.Back;
             var command = AppActions.List.First(action => action.Name == fileAction).Command.Command as CommandHandler;
 
-            Data.RuntimeSettings.LocationToNavigate = new(direction);
+            (Application.Current as App)?.RequestNavigation(new(direction));
             command.OnExecute.Value ^= true;
 
             return true;

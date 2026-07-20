@@ -164,7 +164,7 @@ public class Battery : ViewModelBase
             else
             {
                 if (ChargeState is not ChargingState.Charging)
-                    return Data.RuntimeSettings.IsRTL
+                    return App.RuntimeSettings.IsRTL
                         ? $"%{Level}"
                         : $"{Level}%";
 
@@ -229,9 +229,9 @@ public class Battery : ViewModelBase
         get
         {
             if (ChargeState == ChargingState.Unknown || Level is null)
-                return Data.RuntimeSettings.Is22H2 ? "\uEC02" : "\uF608";
+                return App.RuntimeSettings.Is22H2 ? "\uEC02" : "\uF608";
 
-            var level = Data.RuntimeSettings.Is22H2 ? 0xEBA0 : 0xF5F2;
+            var level = App.RuntimeSettings.Is22H2 ? 0xEBA0 : 0xF5F2;
             if (ChargeState == ChargingState.Charging)
                 level += 11;
 

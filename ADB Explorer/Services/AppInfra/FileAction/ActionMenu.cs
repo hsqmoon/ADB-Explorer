@@ -66,6 +66,11 @@ public abstract class ActionBase : ViewModelBase, IMenuItem
             StyleHelper.VerifyIcon(icon);
 
         Action = action;
+        Action.PropertyChanged += (sender, e) =>
+        {
+            if (e.PropertyName == nameof(FileAction.Description))
+                OnPropertyChanged(nameof(Tooltip));
+        };
         Icon = icon;
         IconSize = iconSize;
         Animation = animation;
@@ -92,15 +97,28 @@ public abstract class ActionBase : ViewModelBase, IMenuItem
 
     private void OnExecute_PropertyChanged(object sender, PropertyChangedEventArgs<bool> e)
     {
-        if (!Data.Settings.IsAnimated)
+        if (!App.Settings.IsAnimated)
             return;
 
         ActivateAnimation = true;
-        _ = Task.Run(async () =>
+        ScheduleAnimationReset(200);
+    }
+
+    protected void ScheduleAnimationReset(int delayMilliseconds)
+    {
+        _ = ResetAnimationAsync(delayMilliseconds);
+
+        async Task ResetAnimationAsync(int delay)
         {
-            await Task.Delay(200);
-            _ = App.Current.Dispatcher.BeginInvoke(new Action(() => ActivateAnimation = false));
-        });
+            await Task.Delay(delay).ConfigureAwait(false);
+            if (Application.Current is App app)
+            {
+                app.EnqueueUiLatest(
+                    $"action.animation.{RuntimeHelpers.GetHashCode(this)}",
+                    "action.animation",
+                    () => ActivateAnimation = false);
+            }
+        }
     }
 }
 
@@ -136,14 +154,10 @@ public class AltTextMenu : ActionMenu
         get => altText;
         set
         {
-            if (Set(ref altText, value) && Data.Settings.IsAnimated && ActionAnimationSource is AnimationSource.External)
+            if (Set(ref altText, value) && App.Settings.IsAnimated && ActionAnimationSource is AnimationSource.External)
             {
                 ActivateAnimation = true;
-                _ = Task.Run(async () =>
-                {
-                    await Task.Delay(Animation is StyleHelper.ContentAnimation.Pulsate ? 500 : 200);
-                    _ = App.Current.Dispatcher.BeginInvoke(new Action(() => ActivateAnimation = false));
-                });
+                ScheduleAnimationReset(Animation is StyleHelper.ContentAnimation.Pulsate ? 500 : 200);
             }
         }
     }
